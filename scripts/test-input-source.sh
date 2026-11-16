@@ -7,3 +7,5 @@ swiftc MonitorControl/Model/DDCInputSource.swift MonitorControl/Support/LGUSBInp
 "$test_dir/protocol-tests"
 swiftc MonitorControl/Model/DDCInputSource.swift MonitorControl/Enums/PrefKey.swift MonitorControl/Support/InputSourceMenu.swift Tests/InputSourceMenuTests.swift -o "$test_dir/menu-tests"
 "$test_dir/menu-tests"
+swiftc Companion/Sources/CompanionConfig.swift Companion/Sources/TriggerPolicy.swift Companion/Sources/InputCommandExecutor.swift Companion/Sources/KeyboardIdentity.swift MonitorControl/Model/DDCInputSource.swift Tests/CompanionPolicyTests.swift -o "$test_dir/companion-tests"
+"$test_dir/companion-tests"
