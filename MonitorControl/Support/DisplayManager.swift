@@ -345,6 +345,8 @@ class DisplayManager {
       }
       for serviceMatch in Arm64DDC.getServiceMatches(displayIDs: displayIDs) {
         for otherDisplay in self.getOtherDisplays() where otherDisplay.identifier == serviceMatch.displayID && serviceMatch.service != nil {
+          otherDisplay.inputSourceSession.invalidate()
+          otherDisplay.inputSourceSession = DDCInputSourceSession()
           otherDisplay.arm64avService = serviceMatch.service
           otherDisplay.lgUSBInputControl = LGUSBInputControl(serialNumber: serviceMatch.serviceDetails.alphanumericSerialNumber)
           os_log("Display service match successful for display %{public}@", type: .info, String(serviceMatch.displayID))

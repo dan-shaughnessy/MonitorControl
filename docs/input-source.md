@@ -54,3 +54,11 @@ Tests use a fake display; they never send monitor commands. The built applicatio
 - HDMI through a dock behaves differently from the USB-C video route. On an M4 Pro MacBook Pro (macOS 26.6.2) connected through a HyperDrive Thunderbolt 3 Mobile Dock's HDMI port to the same LG's HDMI 1, the LG USB interface is not visible (no `043E` USB device), so the menu defaults to Standard DDC. The production `Arm64DDC.write` sent **LG alternate** `0xF4` = `0xD1` and the LG switched to USB-C, then `0xF4` = `0x90` over the now-inactive HDMI link and it switched back to HDMI 1 (both visually confirmed by the user). On this route choose **Input Protocol → LG alternate** once; the choice is saved per display. The HDMI EDID reports product `0x7845`; the USB-C route reports `0x7847`. Standard input writes were not tried over HDMI.
 - Over that HDMI route, reads that use upstream's request checksum (seed `0x6E` without the `0x51` source byte) return capabilities-string fragments instead of a VCP reply, so upstream brightness reads fail there. The spec checksum (`0x6E ^ 0x51`) returns valid replies: brightness `100/100`, input `0x0F` (max `0x12`). Input writes already use the spec checksum.
 - The isolated production USB writer switched to HDMI 1 without the diagnostic read commands (user visually confirmed); its return-to-USB-C write was sent afterward. The diagnostic USB writer had already completed a user-confirmed round trip. This is tested separately from the native menu. Intel has no hardware validation. Computer-use inspection exposed only the app's invisible gamma helper; live menu appearance remains unverified.
+
+## Automatic switching
+
+To switch inputs when a chosen Bluetooth keyboard connects or disconnects, see [LG Input Companion](lg-input-companion.md).
+
+## Integrated Bluetooth automation
+
+The former LG Input Companion is now part of this app, using the same DDC queue and input transport. See [Automation settings and migration](lg-input-companion.md). There is no separate companion app target in this branch. Earlier standalone hardware results above are retained as history and do not establish merged-app acceptance.

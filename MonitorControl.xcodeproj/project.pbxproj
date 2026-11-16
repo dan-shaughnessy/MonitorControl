@@ -61,6 +61,15 @@
 		BA0000000000000000000002 /* DDCInputSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000001 /* DDCInputSource.swift */; };
 		BA0000000000000000000004 /* InputSourceMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000003 /* InputSourceMenu.swift */; };
 		BA0000000000000000000006 /* LGUSBInputControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000005 /* LGUSBInputControl.swift */; };
+		BB0000000000000000000002 /* AutomationConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000001 /* AutomationConfig.swift */; };
+		BB0000000000000000000004 /* KeyboardIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000003 /* KeyboardIdentity.swift */; };
+		BB0000000000000000000006 /* LegacyCompanion.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000005 /* LegacyCompanion.swift */; };
+		BB0000000000000000000008 /* SystemSources.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000007 /* SystemSources.swift */; };
+		BB000000000000000000000A /* InputCommandExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000009 /* InputCommandExecutor.swift */; };
+		BB000000000000000000000C /* TriggerPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000000000000000000000B /* TriggerPolicy.swift */; };
+		BB000000000000000000000E /* AutomationController.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000000000000000000000D /* AutomationController.swift */; };
+		BB0000000000000000000010 /* AutomationPrefsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000000000000000000000F /* AutomationPrefsViewController.swift */; };
+		BB00000000000000000000F2 /* IOBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BB00000000000000000000F1 /* IOBluetooth.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -191,6 +200,15 @@
 		BA0000000000000000000001 /* DDCInputSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DDCInputSource.swift; sourceTree = "<group>"; };
 		BA0000000000000000000003 /* InputSourceMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputSourceMenu.swift; sourceTree = "<group>"; };
 		BA0000000000000000000005 /* LGUSBInputControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LGUSBInputControl.swift; sourceTree = "<group>"; };
+		BB0000000000000000000001 /* AutomationConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationConfig.swift; sourceTree = "<group>"; };
+		BB0000000000000000000003 /* KeyboardIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardIdentity.swift; sourceTree = "<group>"; };
+		BB0000000000000000000005 /* LegacyCompanion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyCompanion.swift; sourceTree = "<group>"; };
+		BB0000000000000000000007 /* SystemSources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemSources.swift; sourceTree = "<group>"; };
+		BB0000000000000000000009 /* InputCommandExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputCommandExecutor.swift; sourceTree = "<group>"; };
+		BB000000000000000000000B /* TriggerPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TriggerPolicy.swift; sourceTree = "<group>"; };
+		BB000000000000000000000D /* AutomationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationController.swift; sourceTree = "<group>"; };
+		BB000000000000000000000F /* AutomationPrefsViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../View Controllers/Preferences/AutomationPrefsViewController.swift"; sourceTree = "<group>"; };
+		BB00000000000000000000F1 /* IOBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOBluetooth.framework; path = System/Library/Frameworks/IOBluetooth.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -205,6 +223,7 @@
 				AA9AE86F26B5BF3D00B6CA65 /* OSD.framework in Frameworks */,
 				AAD7DD342CAFF3D90062822F /* Settings in Frameworks */,
 				AADB625A26BC196900DFFAA5 /* DisplayServices.framework in Frameworks */,
+				BB00000000000000000000F2 /* IOBluetooth.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -224,6 +243,7 @@
 				AA9AE86E26B5BF3D00B6CA65 /* OSD.framework */,
 				AA9AE87026B5BFB700B6CA65 /* CoreDisplay.framework */,
 				AADB625926BC196900DFFAA5 /* DisplayServices.framework */,
+				BB00000000000000000000F1 /* IOBluetooth.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -269,6 +289,7 @@
 				56754EB01D9A4016007BCDC5 /* Assets.xcassets */,
 				56754EAE1D9A4016007BCDC5 /* main.swift */,
 				6C6C34F423DB25BF00C0E9CB /* Model */,
+				BB00000000000000000000F0 /* Automation */,
 				F01B067F228221B6008E64DB /* Support */,
 				AA9D231226EE0B25007E22E7 /* Enums */,
 				28D1DDEB227FB8E9004CB494 /* Extensions */,
@@ -382,6 +403,21 @@
 				F0A489C3279C71B200BEDFD6 /* OnboardingViewController.swift */,
 			);
 			path = Onboarding;
+			sourceTree = "<group>";
+		};
+		BB00000000000000000000F0 /* Automation */ = {
+			isa = PBXGroup;
+			children = (
+				BB0000000000000000000001 /* AutomationConfig.swift */,
+				BB0000000000000000000003 /* KeyboardIdentity.swift */,
+				BB0000000000000000000005 /* LegacyCompanion.swift */,
+				BB0000000000000000000007 /* SystemSources.swift */,
+				BB0000000000000000000009 /* InputCommandExecutor.swift */,
+				BB000000000000000000000B /* TriggerPolicy.swift */,
+				BB000000000000000000000D /* AutomationController.swift */,
+				BB000000000000000000000F /* AutomationPrefsViewController.swift */,
+			);
+			path = Automation;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -642,6 +678,14 @@
 				AA25F6D726E68C160087F3A2 /* MediaKeyTapManager.swift in Sources */,
 				FE4E0896249D584C003A50BB /* OSDUtils.swift in Sources */,
 				6CBFE27A23DB266000D1BC41 /* Display.swift in Sources */,
+				BB0000000000000000000010 /* AutomationPrefsViewController.swift in Sources */,
+				BB000000000000000000000E /* AutomationController.swift in Sources */,
+				BB000000000000000000000C /* TriggerPolicy.swift in Sources */,
+				BB000000000000000000000A /* InputCommandExecutor.swift in Sources */,
+				BB0000000000000000000008 /* SystemSources.swift in Sources */,
+				BB0000000000000000000006 /* LegacyCompanion.swift in Sources */,
+				BB0000000000000000000004 /* KeyboardIdentity.swift in Sources */,
+				BB0000000000000000000002 /* AutomationConfig.swift in Sources */,
 				BA0000000000000000000004 /* InputSourceMenu.swift in Sources */,
 				BA0000000000000000000006 /* LGUSBInputControl.swift in Sources */,
 				BA0000000000000000000002 /* DDCInputSource.swift in Sources */,

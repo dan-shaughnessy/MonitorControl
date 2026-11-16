@@ -1,4 +1,4 @@
-> **Personal fork:** Adds a per-display DDC input selector with standard DDC, LG alternate, and LG USB commands. See [usage, build instructions and verification limits](docs/input-source.md).
+> **Personal fork:** Adds a per-display DDC input selector with standard DDC, LG alternate, and LG USB commands. See [manual input selection](docs/input-source.md) and [Bluetooth automation and migration](docs/lg-input-companion.md).
 
 <img src=".github/Icon-cropped.png" width="200" alt="App icon" align="left"/>
 
