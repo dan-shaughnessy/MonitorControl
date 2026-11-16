@@ -2,6 +2,14 @@
 
 import Foundation
 
+/// One Bluetooth device whose presence counts toward switching.
+struct SelectedDevice: Codable, Equatable {
+  var address: String
+  var name: String
+  var vendorID: Int?
+  var productID: Int?
+}
+
 /// User settings, saved as JSON. Effective runtime state is never stored here.
 struct CompanionConfig: Codable, Equatable {
   static let supportedProtocols: [DDCInputSource.InputProtocol] = [.lgAlternate, .standard]
@@ -10,10 +18,8 @@ struct CompanionConfig: Codable, Equatable {
   static let disconnectDelayRange: ClosedRange<Double> = 0 ... 300
 
   var enabled = false
-  var keyboardAddress = ""
-  var keyboardName = ""
-  var keyboardVendorID: Int?
-  var keyboardProductID: Int?
+  /// Connected input when all are connected; disconnected input when all are disconnected.
+  var devices: [SelectedDevice] = []
   var displayName = ""
   var displaySerial = ""
   var displayVendorID: Int?
@@ -31,10 +37,14 @@ struct CompanionConfig: Codable, Equatable {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     let d = CompanionConfig()
     self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? d.enabled
-    self.keyboardAddress = try c.decodeIfPresent(String.self, forKey: .keyboardAddress) ?? d.keyboardAddress
-    self.keyboardName = try c.decodeIfPresent(String.self, forKey: .keyboardName) ?? d.keyboardName
-    self.keyboardVendorID = try c.decodeIfPresent(Int.self, forKey: .keyboardVendorID)
-    self.keyboardProductID = try c.decodeIfPresent(Int.self, forKey: .keyboardProductID)
+    if let devices = try c.decodeIfPresent([SelectedDevice].self, forKey: .devices) {
+      self.devices = devices
+    } else if let address = try c.decodeIfPresent(String.self, forKey: .keyboardAddress), !address.isEmpty {
+      // Single-keyboard settings from the first release.
+      self.devices = [SelectedDevice(address: address, name: try c.decodeIfPresent(String.self, forKey: .keyboardName) ?? address,
+                                     vendorID: try c.decodeIfPresent(Int.self, forKey: .keyboardVendorID),
+                                     productID: try c.decodeIfPresent(Int.self, forKey: .keyboardProductID))]
+    }
     self.displayName = try c.decodeIfPresent(String.self, forKey: .displayName) ?? d.displayName
     self.displaySerial = try c.decodeIfPresent(String.self, forKey: .displaySerial) ?? d.displaySerial
     self.displayVendorID = try c.decodeIfPresent(Int.self, forKey: .displayVendorID)
@@ -50,10 +60,7 @@ struct CompanionConfig: Codable, Equatable {
   func encode(to encoder: Encoder) throws {
     var c = encoder.container(keyedBy: CodingKeys.self)
     try c.encode(self.enabled, forKey: .enabled)
-    try c.encode(self.keyboardAddress, forKey: .keyboardAddress)
-    try c.encode(self.keyboardName, forKey: .keyboardName)
-    try c.encode(self.keyboardVendorID, forKey: .keyboardVendorID)
-    try c.encode(self.keyboardProductID, forKey: .keyboardProductID)
+    try c.encode(self.devices, forKey: .devices)
     try c.encode(self.displayName, forKey: .displayName)
     try c.encode(self.displaySerial, forKey: .displaySerial)
     try c.encode(self.displayVendorID, forKey: .displayVendorID)
@@ -66,7 +73,7 @@ struct CompanionConfig: Codable, Equatable {
   }
 
   enum CodingKeys: String, CodingKey {
-    case enabled, keyboardAddress, keyboardName, keyboardVendorID, keyboardProductID
+    case enabled, devices, keyboardAddress, keyboardName, keyboardVendorID, keyboardProductID
     case displayName, displaySerial, displayVendorID, displayProductID
     case inputProtocol, connectedInput, disconnectedInput, connectDelay, disconnectDelay
   }
@@ -90,7 +97,7 @@ struct CompanionConfig: Codable, Equatable {
     switch presence {
     case .connected: value = self.connectedInput
     case .disconnected: value = self.disconnectedInput
-    case .unknown: value = nil
+    case .mixed, .unknown: value = nil
     }
     guard let value = value else { return nil }
     return p.sources.first { Int($0.value) == value }
@@ -99,7 +106,10 @@ struct CompanionConfig: Codable, Equatable {
   /// Reasons this configuration cannot act. Empty means it is complete.
   var problems: [String] {
     var result: [String] = []
-    if Self.normalizedAddress(self.keyboardAddress) == nil { result.append("No Bluetooth keyboard selected") }
+    let addresses = self.devices.map { Self.normalizedAddress($0.address) }
+    if addresses.isEmpty { result.append("No Bluetooth device selected") }
+    if addresses.contains(nil) { result.append("A selected device has an invalid address") }
+    if Set(addresses.compactMap { $0 }).count != addresses.compactMap({ $0 }).count { result.append("A device is selected twice") }
     if self.displaySerial.isEmpty || self.displayProductID == nil || self.displayVendorID == nil { result.append("No monitor selected") }
     if self.protocolValue == nil { result.append("Unsupported input protocol") }
     if self.connectedInput != nil, self.input(for: .connected) == nil { result.append("Connected input is not valid for this protocol") }
@@ -107,6 +117,10 @@ struct CompanionConfig: Codable, Equatable {
     if !Self.connectDelayRange.contains(self.connectDelay) { result.append("Connect delay out of range") }
     if !Self.disconnectDelayRange.contains(self.disconnectDelay) { result.append("Disconnect delay out of range") }
     return result
+  }
+
+  var devicesSummary: String {
+    self.devices.isEmpty ? "No device selected" : self.devices.map(\.name).joined(separator: " + ")
   }
 
   var timing: PolicyTiming {

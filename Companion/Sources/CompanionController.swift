@@ -15,6 +15,7 @@ final class CompanionController {
   private(set) var config: CompanionConfig
   private(set) var configError: String?
   private(set) var observed: KeyboardPresence = .unknown
+  private(set) var deviceStates: [(name: String, presence: KeyboardPresence)] = []
   private(set) var lastResult: String = "No command sent since launch"
   private var policy: TriggerPolicy
   private lazy var watcher = HIDRegistryWatcher { [weak self] in self?.reconcile(reason: "registry change") }
@@ -77,24 +78,40 @@ final class CompanionController {
   private func applyCurrentConfig(reason: String) {
     self.decisionTimer?.invalidate()
     self.policy = TriggerPolicy(timing: self.config.timing, after: self.policy.generation)
-    if let address = CompanionConfig.normalizedAddress(self.config.keyboardAddress) {
-      self.watcher.start(address: address)
-    } else {
-      self.watcher.stop()
-    }
+    let addresses = self.config.devices.compactMap { CompanionConfig.normalizedAddress($0.address) }
+    if addresses.isEmpty { self.watcher.stop() } else { self.watcher.start(addresses: addresses) }
     self.lastPowerOn = BluetoothState.powerOn()
     self.observed = self.evaluate()
     self.policy.baseline(self.observed)
     self.syncGeneration()
     let problems = self.config.problems
-    companionLog("\(reason): keyboard \"\(self.config.keyboardName)\" \(self.observed.rawValue) (baseline, no command); "
+    companionLog("\(reason): \(self.describeStates()) (baseline, no command); "
       + "automation \(self.config.enabled ? "enabled" : "paused")" + (problems.isEmpty ? "" : "; incomplete: " + problems.joined(separator: ", ")))
     self.onStatusChange?()
   }
 
+  /// Per-device states and their combined state. Read-only.
+  func evaluateDevices() -> (states: [(name: String, presence: KeyboardPresence)], combined: KeyboardPresence) {
+    let entries = HIDRegistryWatcher.bluetoothEntries()
+    let power = BluetoothState.powerOn()
+    let paired = BluetoothState.pairedDevices()?.map(\.address)
+    let states = self.config.devices.map { device -> (name: String, presence: KeyboardPresence) in
+      guard let entries = entries, let address = CompanionConfig.normalizedAddress(device.address) else { return (device.name, .unknown) }
+      return (device.name, KeyboardIdentity.presence(powerOn: power, paired: paired.map { $0.contains(address) }, entries: entries, device: device))
+    }
+    return (states, KeyboardIdentity.aggregate(states.map(\.presence)))
+  }
+
   func evaluate() -> KeyboardPresence {
-    guard let address = CompanionConfig.normalizedAddress(self.config.keyboardAddress), let entries = HIDRegistryWatcher.bluetoothEntries() else { return .unknown }
-    return KeyboardIdentity.presence(powerOn: BluetoothState.powerOn(), paired: BluetoothState.isPaired(address), entries: entries, config: self.config)
+    let result = self.evaluateDevices()
+    self.deviceStates = result.states
+    return result.combined
+  }
+
+  private func describeStates() -> String {
+    guard !self.deviceStates.isEmpty else { return "no device selected" }
+    let each = self.deviceStates.map { "\"\($0.name)\" \($0.presence.rawValue)" }.joined(separator: ", ")
+    return self.deviceStates.count == 1 ? each : "\(each) → \(self.observed.rawValue)"
   }
 
   private func reconcile(reason: String?) {
@@ -111,10 +128,10 @@ final class CompanionController {
       self.lastPowerOn = power
       self.syncGeneration()
     }
-    let previous = self.observed
+    let previous = self.deviceStates.map(\.presence)
     self.observed = self.evaluate()
-    if self.observed != previous {
-      companionLog("keyboard \"\(self.config.keyboardName)\" \(self.observed.rawValue)" + (reason.map { " (\($0))" } ?? ""))
+    if self.deviceStates.map(\.presence) != previous {
+      companionLog(self.describeStates() + (reason.map { " (\($0))" } ?? ""))
     }
     self.handle(self.policy.observe(self.observed, now: Date().timeIntervalSince1970))
   }

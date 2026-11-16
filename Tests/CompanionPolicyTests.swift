@@ -5,13 +5,13 @@ import Foundation
 struct CompanionPolicyTests {
   static let timing = PolicyTiming(connectDelay: 2, disconnectDelay: 10, resumeGrace: 20)
 
+  static let k5Device = SelectedDevice(address: "D9:27:29:C0:EB:C9", name: "Keychron K5 Max", vendorID: 0x3434, productID: 0x0A53)
+  static let mouseDevice = SelectedDevice(address: "df-c8-2d-1b-44-89", name: "G604 LIGHTSPEED", vendorID: 0x046D, productID: 0xB024)
+
   static func k5Config() -> CompanionConfig {
     var c = CompanionConfig()
     c.enabled = true
-    c.keyboardAddress = "D9:27:29:C0:EB:C9"
-    c.keyboardName = "Keychron K5 Max"
-    c.keyboardVendorID = 0x3434
-    c.keyboardProductID = 0x0A53
+    c.devices = [k5Device]
     c.displayName = "LG ULTRAGEAR+"
     c.displaySerial = "601INAR7V264"
     c.displayVendorID = 0x1E6D
@@ -23,6 +23,7 @@ struct CompanionPolicyTests {
     self.testPolicy()
     self.testSleepAndPower()
     self.testIdentity()
+    self.testMultipleDevices()
     self.testConfig()
     self.testExecutor()
     print("Companion policy, identity, config and executor tests passed")
@@ -141,25 +142,28 @@ struct CompanionPolicyTests {
     let k5 = HIDEntry(address: "d9-27-29-c0-eb-c9", transport: "Bluetooth Low Energy", vendorID: 0x3434, productID: 0x0A53)
     let k10 = HIDEntry(address: "e3-22-b7-00-9b-4a", transport: "Bluetooth Low Energy", vendorID: 0x02E5, productID: 0xA1B2)
     let mouse = HIDEntry(address: "df-c8-2d-1b-44-89", transport: "Bluetooth Low Energy", vendorID: 0x046D, productID: 0xB024)
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k10, mouse, k5], config: c) == .connected)
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k10, mouse], config: c) == .disconnected, "other keyboards never count")
-    precondition(KeyboardIdentity.presence(powerOn: false, paired: true, entries: [], config: c) == .unknown)
-    precondition(KeyboardIdentity.presence(powerOn: nil, paired: true, entries: [], config: c) == .unknown)
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: false, entries: [], config: c) == .unknown)
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: nil, entries: [k5], config: c) == .unknown)
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k10, mouse, k5], device: c.devices[0]) == .connected)
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k10, mouse], device: c.devices[0]) == .disconnected, "other keyboards never count")
+    precondition(KeyboardIdentity.presence(powerOn: false, paired: true, entries: [], device: c.devices[0]) == .unknown)
+    precondition(KeyboardIdentity.presence(powerOn: nil, paired: true, entries: [], device: c.devices[0]) == .unknown)
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: false, entries: [], device: c.devices[0]) == .unknown)
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: nil, entries: [k5], device: c.devices[0]) == .unknown)
     var wrongIDs = k5
     wrongIDs.productID = 0x0001
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [wrongIDs], config: c) == .unknown)
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [wrongIDs], device: c.devices[0]) == .unknown)
     var usb = k5
     usb.transport = "USB"
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [usb], config: c) == .unknown)
-    var noAddress = c
-    noAddress.keyboardAddress = ""
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5], config: noAddress) == .unknown)
-    var addressOnly = c
-    addressOnly.keyboardVendorID = nil
-    addressOnly.keyboardProductID = nil
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5], config: addressOnly) == .connected)
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [usb], device: c.devices[0]) == .unknown)
+    var noAddress = k5Device
+    noAddress.address = ""
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5], device: noAddress) == .unknown)
+    var addressOnly = k5Device
+    addressOnly.vendorID = nil
+    addressOnly.productID = nil
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5], device: addressOnly) == .connected)
+    // The mouse is judged on its own identity, never the keyboard's.
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5, mouse], device: mouseDevice) == .connected)
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5], device: mouseDevice) == .disconnected)
 
     precondition(CompanionConfig.normalizedAddress("D9:27:29:C0:EB:C9") == "d9-27-29-c0-eb-c9")
     precondition(CompanionConfig.normalizedAddress("d9-27-29-c0-eb") == nil)
@@ -174,6 +178,56 @@ struct CompanionPolicyTests {
     precondition(DisplayIdentity.uniqueMatch([hdmi, hdmi], identity: { $0 }, expected: hdmi) == nil, "ambiguous")
     let blank = DisplayIdentity(serial: "", vendorID: 0x1E6D, productID: 0x7845)
     precondition(DisplayIdentity.uniqueMatch([blank], identity: { $0 }, expected: blank) == nil)
+  }
+
+  static func testMultipleDevices() {
+    // All must agree; partial is mixed; any unknown makes the set unknown.
+    precondition(KeyboardIdentity.aggregate([.connected, .connected]) == .connected)
+    precondition(KeyboardIdentity.aggregate([.disconnected, .disconnected]) == .disconnected)
+    precondition(KeyboardIdentity.aggregate([.connected, .disconnected]) == .mixed)
+    precondition(KeyboardIdentity.aggregate([.connected, .unknown]) == .unknown)
+    precondition(KeyboardIdentity.aggregate([]) == .unknown)
+    precondition(KeyboardIdentity.aggregate([.connected]) == .connected)
+
+    // All connected → one disconnects (hold) → both gone (USB-C) → one back (hold) → both back (HDMI 1).
+    let p = TriggerPolicy(timing: PolicyTiming(connectDelay: 0, disconnectDelay: 0, resumeGrace: 20))
+    p.baseline(.connected)
+    precondition(p.observe(.mixed, now: 1) == .none && p.settled == .connected)
+    precondition(p.observe(.disconnected, now: 2) == .schedule(at: 2))
+    precondition(p.fire(observed: .disconnected, now: 2) == .edge(.disconnected))
+    precondition(p.observe(.mixed, now: 3) == .none && p.settled == .disconnected)
+    precondition(p.observe(.connected, now: 4) == .schedule(at: 4))
+    precondition(p.fire(observed: .connected, now: 4) == .edge(.connected))
+    // Mixed cancels a pending change and holds.
+    let slow = TriggerPolicy(timing: timing)
+    slow.baseline(.connected)
+    precondition(slow.observe(.disconnected, now: 0) == .schedule(at: 10))
+    precondition(slow.observe(.mixed, now: 5) == .none && slow.pendingTarget == nil)
+    precondition(slow.fire(observed: .mixed, now: 10) == .none && slow.settled == .connected)
+    // Mixed at launch is the baseline; the first full match then acts.
+    let launch = TriggerPolicy(timing: timing)
+    launch.baseline(.mixed)
+    precondition(launch.observe(.mixed, now: 0) == .none)
+    precondition(launch.observe(.connected, now: 1) == .schedule(at: 3))
+    precondition(launch.fire(observed: .connected, now: 3) == .edge(.connected))
+    precondition(k5Config().input(for: .mixed) == nil)
+
+    // Settings validation for device sets.
+    var c = k5Config()
+    c.devices.append(mouseDevice)
+    precondition(c.problems.isEmpty && c.devicesSummary == "Keychron K5 Max + G604 LIGHTSPEED")
+    c.devices.append(SelectedDevice(address: "d9-27-29-c0-eb-c9", name: "dup", vendorID: nil, productID: nil))
+    precondition(c.problems.contains("A device is selected twice"))
+    c.devices = []
+    precondition(c.problems.contains("No Bluetooth device selected"))
+    c.devices = [SelectedDevice(address: "bad", name: "x", vendorID: nil, productID: nil)]
+    precondition(c.problems.contains("A selected device has an invalid address"))
+
+    // First-release single-keyboard settings migrate to a one-device list.
+    let legacy = try! JSONDecoder().decode(CompanionConfig.self, from: Data(#"{"enabled":true,"keyboardAddress":"d9-27-29-c0-eb-c9","keyboardName":"Keychron K5 Max","keyboardVendorID":13364,"keyboardProductID":2643}"#.utf8))
+    precondition(legacy.devices == [SelectedDevice(address: "d9-27-29-c0-eb-c9", name: "Keychron K5 Max", vendorID: 0x3434, productID: 0x0A53)])
+    let reencoded = String(data: try! JSONEncoder().encode(legacy), encoding: .utf8)!
+    precondition(reencoded.contains("\"devices\"") && !reencoded.contains("keyboardAddress"))
   }
 
   static func testConfig() {
@@ -207,7 +261,7 @@ struct CompanionPolicyTests {
     saved.disconnectedInput = nil
     try! store.save(saved)
     precondition(try! store.load() == saved)
-    let partial = try! JSONDecoder().decode(CompanionConfig.self, from: Data(#"{"keyboardAddress":"d9-27-29-c0-eb-c9"}"#.utf8))
+    let partial = try! JSONDecoder().decode(CompanionConfig.self, from: Data(#"{"devices":[{"address":"d9-27-29-c0-eb-c9","name":"K5"}]}"#.utf8))
     precondition(partial.connectedInput == 0x90 && partial.disconnectedInput == 0xD1 && !partial.enabled)
     try! Data("{not json".utf8).write(to: store.url)
     precondition((try? store.load()) == nil, "corrupt config must be reported")

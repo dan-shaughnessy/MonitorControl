@@ -21,8 +21,12 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     menu.removeAllItems()
     let c = self.controller.config
     func info(_ text: String) { menu.addItem(withTitle: text, action: nil, keyEquivalent: "").isEnabled = false }
-    let name = c.keyboardName.isEmpty ? "No keyboard selected" : c.keyboardName
-    info("Keyboard: \(name) — \(self.controller.observed.rawValue)")
+    if c.devices.isEmpty { info("No Bluetooth device selected") }
+    for state in self.controller.deviceStates { info("\(state.name): \(state.presence.rawValue)") }
+    if c.devices.count > 1 {
+      let combined = self.controller.observed
+      info("All selected: \(combined == .mixed ? "mixed, holding current input" : combined.rawValue)")
+    }
     let display = DisplayCandidate.find(c)
     info("Monitor: \(c.displayName.isEmpty ? "none selected" : c.displayName) — \(display == nil ? "not found" : "available")")
     info("Connected → \(c.input(for: .connected)?.title ?? "do nothing"); disconnected → \(c.input(for: .disconnected)?.title ?? "do nothing")")
@@ -60,7 +64,8 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
 final class SettingsWindowController: NSObject {
   private let controller: CompanionController
   private var window: NSWindow?
-  private let keyboardPopup = NSPopUpButton()
+  private let deviceStack = NSStackView()
+  private var deviceChecks: [NSButton] = []
   private let displayPopup = NSPopUpButton()
   private let protocolPopup = NSPopUpButton()
   private let connectedPopup = NSPopUpButton()
@@ -100,10 +105,13 @@ final class SettingsWindowController: NSObject {
     }
     self.protocolPopup.target = self
     self.protocolPopup.action = #selector(self.protocolChanged)
-    let note = NSTextField(wrappingLabelWithString: "Only the selected keyboard triggers a switch. Changes start from the current state without sending a command. Monitors do not confirm input commands.")
+    self.deviceStack.orientation = .vertical
+    self.deviceStack.alignment = .leading
+    self.deviceStack.spacing = 4
+    let note = NSTextField(wrappingLabelWithString: "Only selected devices count. With several selected, the connected input is used once all are connected and the disconnected input once all are disconnected; in between, the input is left alone. Changes start from the current state without sending a command. Monitors do not confirm input commands.")
     note.textColor = .secondaryLabelColor
     let grid = NSGridView(views: [
-      [label("Bluetooth keyboard:"), self.keyboardPopup],
+      [label("Bluetooth devices:"), self.deviceStack],
       [label("Monitor:"), self.displayPopup],
       [label("Input protocol:"), self.protocolPopup],
       [label("When connected:"), self.connectedPopup],
@@ -135,7 +143,7 @@ final class SettingsWindowController: NSObject {
       stack.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
       buttons.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
       note.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-      self.keyboardPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
+      self.displayPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
     ])
     window.center()
     return window
@@ -144,16 +152,18 @@ final class SettingsWindowController: NSObject {
   /// Saved choices stay visible, marked unavailable, when the device is not present now.
   private func load(_ c: CompanionConfig) {
     self.keyboards = BluetoothState.pairedDevices() ?? []
-    let savedAddress = CompanionConfig.normalizedAddress(c.keyboardAddress)
-    if let savedAddress = savedAddress, !self.keyboards.contains(where: { $0.address == savedAddress }) {
-      self.keyboards.append(PairedDevice(name: c.keyboardName + " (unavailable: not paired)", address: savedAddress, connected: false))
+    let saved = Set(c.devices.compactMap { CompanionConfig.normalizedAddress($0.address) })
+    for device in c.devices {
+      guard let address = CompanionConfig.normalizedAddress(device.address), !self.keyboards.contains(where: { $0.address == address }) else { continue }
+      self.keyboards.append(PairedDevice(name: device.name + " (unavailable: not paired)", address: address, connected: false))
     }
-    self.keyboardPopup.removeAllItems()
-    self.keyboardPopup.addItem(withTitle: "None")
-    for device in self.keyboards {
-      self.keyboardPopup.addItem(withTitle: "\(device.name) — \(device.connected ? "connected" : "not connected") — \(device.address.uppercased())")
+    self.deviceChecks.forEach { $0.removeFromSuperview() }
+    self.deviceChecks = self.keyboards.map { device in
+      let check = NSButton(checkboxWithTitle: "\(device.name) — \(device.connected ? "connected" : "not connected") — \(device.address.uppercased())", target: nil, action: nil)
+      check.state = saved.contains(device.address) ? .on : .off
+      return check
     }
-    self.keyboardPopup.selectItem(at: (self.keyboards.firstIndex { $0.address == savedAddress } ?? -1) + 1)
+    self.deviceChecks.forEach { self.deviceStack.addArrangedSubview($0) }
 
     self.displays = DisplayCandidate.all().map { ($0.label, $0.name, $0.identity) }
     if let vendor = c.displayVendorID, let product = c.displayProductID {
@@ -217,22 +227,12 @@ final class SettingsWindowController: NSObject {
 
   private func collect() -> CompanionConfig {
     var c = self.controller.config
-    let keyboardIndex = self.keyboardPopup.indexOfSelectedItem - 1
-    if self.keyboards.indices.contains(keyboardIndex) {
-      let device = self.keyboards[keyboardIndex]
-      if device.address != CompanionConfig.normalizedAddress(c.keyboardAddress) {
-        // Learn vendor/product IDs only from the live HID entry of the chosen address.
-        let entry = HIDRegistryWatcher.bluetoothEntries()?.first { CompanionConfig.normalizedAddress($0.address) == device.address }
-        c.keyboardVendorID = entry?.vendorID
-        c.keyboardProductID = entry?.productID
-        c.keyboardName = device.name
-      }
-      c.keyboardAddress = device.address
-    } else {
-      c.keyboardAddress = ""
-      c.keyboardName = ""
-      c.keyboardVendorID = nil
-      c.keyboardProductID = nil
+    let entries = HIDRegistryWatcher.bluetoothEntries()
+    c.devices = zip(self.keyboards, self.deviceChecks).filter { $0.1.state == .on }.map { device, _ in
+      // Keep saved identity; learn vendor/product IDs only from the live HID entry of a newly chosen address.
+      if let existing = self.controller.config.devices.first(where: { CompanionConfig.normalizedAddress($0.address) == device.address }) { return existing }
+      let entry = entries?.first { CompanionConfig.normalizedAddress($0.address) == device.address }
+      return SelectedDevice(address: device.address, name: device.name, vendorID: entry?.vendorID, productID: entry?.productID)
     }
     let displayIndex = self.displayPopup.indexOfSelectedItem - 1
     if self.displays.indices.contains(displayIndex) {

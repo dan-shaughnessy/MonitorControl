@@ -18,8 +18,8 @@ final class HIDRegistryWatcher {
 
   deinit { self.stop() }
 
-  /// Matched/terminated notifications for HID devices with this Bluetooth address.
-  func start(address: String) {
+  /// Matched/terminated notifications for HID devices with these Bluetooth addresses.
+  func start(addresses: [String]) {
     self.stop()
     guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
     self.port = port
@@ -30,6 +30,7 @@ final class HIDRegistryWatcher {
       guard let context = context else { return }
       Unmanaged<HIDRegistryWatcher>.fromOpaque(context).takeUnretainedValue().onChange()
     }
+    for address in addresses {
     for type in [kIOMatchedNotification, kIOTerminatedNotification] {
       let matching = IOServiceMatching("IOHIDDevice") as NSMutableDictionary
       matching[kIOPropertyMatchKey] = ["DeviceAddress": address]
@@ -38,6 +39,7 @@ final class HIDRegistryWatcher {
         Self.drain(iterator) // Arms the notification.
         self.iterators.append(iterator)
       }
+    }
     }
   }
 

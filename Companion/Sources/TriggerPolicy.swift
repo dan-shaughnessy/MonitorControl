@@ -2,8 +2,9 @@
 
 import Foundation
 
+/// For several devices: connected or disconnected only when all agree, otherwise mixed.
 enum KeyboardPresence: String {
-  case connected, disconnected, unknown
+  case connected, disconnected, mixed, unknown
 }
 
 struct PolicyTiming: Equatable {
@@ -17,6 +18,8 @@ struct PolicyTiming: Equatable {
 ///
 /// - The first known observation is a baseline and never acts.
 /// - A change acts only after it stays stable for its delay. A bounce back cancels it.
+/// - `mixed` (some selected devices connected, some not) holds: it cancels a pending change and
+///   keeps the baseline. Only a launch baseline can be mixed, so the next full match acts.
 /// - `unknown` (Bluetooth off, unpaired, query failure, identity mismatch) cancels and never acts.
 /// - Sleep or Bluetooth power-off suspends and cancels. After resume plus a grace period, the
 ///   state is compared with the pre-suspend baseline, so a disconnect caused only by sleep is not an edge.
@@ -59,6 +62,10 @@ final class TriggerPolicy {
     }
     guard let settled = self.settled else {
       self.settled = observed
+      return .none
+    }
+    if observed == .mixed {
+      if self.pendingTarget != nil { self.cancelPending() }
       return .none
     }
     if observed == settled {
