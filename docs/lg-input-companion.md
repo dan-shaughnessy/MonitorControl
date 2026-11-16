@@ -1,67 +1,42 @@
-# LG Input Companion
+# Bluetooth input automation in MonitorControl
 
-A small menu-bar app that switches an LG monitor's input when chosen Bluetooth devices connect to or disconnect from this Mac. It is separate from MonitorControl: it builds with Command Line Tools only (no Xcode), runs without the MonitorControl app, and does not change MonitorControl's startup behavior.
+Bluetooth-triggered switching now runs inside the MonitorControl app. There is one menu-bar icon and one settings window; the standalone companion target, entry point and install scripts have been removed from this fork.
 
-## Install, status, disable, uninstall
+Open **Settings → Automation** to select Bluetooth devices, monitor, protocol, connected/disconnected input (or Do nothing), delays and enable state. The original menu retains manual input selection and brightness/volume controls. **Automatic Switching** pauses/resumes automation; **Automation Status** shows per-device, combined, pending and last-command status.
+
+With several devices selected, all connected selects the connected input, all disconnected selects the disconnected input, and mixed or unknown state holds the input. Zero delays act as soon as a change is recognized. Real Bluetooth reconnection and monitor switching still take time. Device addresses and HID vendor/product IDs must be verified; connect a newly selected device once and refresh the list to learn its identity. Saved unavailable devices remain selectable.
+
+## Migration from LG Input Companion
+
+1. Install the signed merged app in `~/Applications/MonitorControl.app` using `scripts/install-monitorcontrol.sh /path/to/MonitorControl.app`. The installer keeps a dated backup of an existing app and leaves the companion running until you are ready.
+2. Open MonitorControl. It imports the old `~/Library/Application Support/LGInputCompanion/config.json` into `~/Library/Application Support/MonitorControl/automation.json` only if the new file is absent. The original is preserved; a corrupt new file is reported and never replaced with older settings. The new app needs its own Bluetooth permission. Automation does not need Input Monitoring or Accessibility; MonitorControl's optional media-key controls may separately request Accessibility.
+3. In **Settings → Automation**, check the migrated selections and click **Retire Old Companion**. This unloads the exact old per-user LaunchAgent, verifies it is unloaded, and moves its plist and known app bundle to Trash. It keeps the old JSON and log. Automation stays blocked while the old job or process is present, preventing two input controllers. Existing login behavior is carried over through MonitorControl's own login helper when the old LaunchAgent existed; check **General → Start at Login** after migration.
+4. Save any changes. Launch, migration, settings save, wake and display reconnect establish a baseline without switching. Verify by making a later real Bluetooth change.
+
+Do not disable Jamf/MDM, remove quarantine flags, or bypass Gatekeeper to install a build. An ad-hoc signed development build is not notarized; use the system's normal approval flow where permitted. Keep the old app/config backups until the merged workflow is confirmed. The separate `lg-input-companion` GitHub repository is unchanged; archiving it requires Dan's agreement.
+
+## Runtime behavior
+
+- Detection uses IOKit HID registry arrival/removal for selected Bluetooth addresses plus five-second reconciliation. HID devices are never opened and no key data is read. Bluetooth power or pairing/query failure, missing identity, or an identity mismatch is unknown and never acts.
+- Launch, settings changes, resuming from pause, wake after its 20-second grace period and display reconnect establish a no-action baseline. Only subsequent Bluetooth state changes may switch inputs. Pending work is cancelled by sleep, configuration changes, pause, device changes and display reconfiguration.
+- Input writes use MonitorControl's global DDC queue, also used for brightness/volume. Every job captures its configuration; it never waits for the main thread. Failed writes retry at most twice, without blocking brightness work between attempts. Unavailable monitors are not queued for later. The selected monitor must uniquely match serial, vendor and port-specific product.
+- Standard DDC, LG alternate and LG USB are supported. LG USB uses the same serial-matched USB transport as the manual selector. Display discovery currently depends on the Apple Silicon display-service mapping.
+- Status reports **command sent**, not physical confirmation. The tested LG's input readback is unreliable. With zero delays, transient Bluetooth drops and keyboard idle auto-sleep can count as disconnects. Raise the disconnect delay if necessary.
+- New settings are in `~/Library/Application Support/MonitorControl/automation.json`. Runtime status is in the app menu; diagnostic messages also go to process stdout/Console. Pause using the menu toggle. Quit MonitorControl to stop both manual controls and automation.
+
+## Build and validation
+
+Full Xcode is required for MonitorControl's storyboards/assets. This integrated candidate is built for Apple Silicon on macOS 12 or later. With Xcode 27, use the local deployment-target override:
 
 ```sh
-scripts/install-companion.sh        # build, install, load the per-user LaunchAgent (no sudo)
-"$HOME/Library/Application Support/LGInputCompanion/LGInputCompanion.app/Contents/MacOS/LGInputCompanion" --status
-"$HOME/Library/Application Support/LGInputCompanion/LGInputCompanion.app/Contents/MacOS/LGInputCompanion" --list
-launchctl print "gui/$(id -u)/io.github.dan-shaughnessy.lg-input-companion" | grep state
-scripts/uninstall-companion.sh      # remove app and LaunchAgent, keep settings
-scripts/uninstall-companion.sh --purge
+xcodebuild -project MonitorControl.xcodeproj -scheme MonitorControl \
+  -configuration Release -derivedDataPath /tmp/monitorcontrol-integrated-build \
+  CODE_SIGNING_ALLOWED=NO MACOSX_DEPLOYMENT_TARGET=12.0 ARCHS=arm64 build
+codesign --force --deep --sign - --timestamp=none \
+  /tmp/monitorcontrol-integrated-build/Build/Products/Release/MonitorControl.app
+./scripts/test-input-source.sh
 ```
 
-`--status` and `--list` are read-only and never send a monitor command.
+The hardware-free tests cover original input protocols, byte framing, exact identity and multi-device aggregation; debounce/instant edges, stale work, settings migration/persistence, new wake baselines, bounded retries, shared-queue progress and the real controller's no-action baseline/pause/reconnect lifecycle. The debug-only native UI preview uses synthetic data, isolated settings and an always-false write gate; it does not query Bluetooth or send display commands.
 
-The app asks for Bluetooth permission on first launch, to read paired devices and Bluetooth power. Each rebuild is ad-hoc signed with a new code hash, so macOS asks again after every reinstall. Until you answer, the app waits and does nothing.
-
-| Item | Path |
-|---|---|
-| App | `~/Library/Application Support/LGInputCompanion/LGInputCompanion.app` |
-| Settings | `~/Library/Application Support/LGInputCompanion/config.json` |
-| LaunchAgent | `~/Library/LaunchAgents/io.github.dan-shaughnessy.lg-input-companion.plist` |
-| Log | `~/Library/Logs/LGInputCompanion.log` |
-
-To pause, uncheck **Automatic Switching** in the menu. To stop it until next login, choose **Quit** (the agent only restarts after a crash). Reinstalling keeps the saved settings.
-
-## Settings
-
-Open the menu-bar keyboard icon → **Settings…**. Every choice is saved to `config.json`:
-
-- **Bluetooth devices**: tick one or more paired devices. With several, the connected input is sent once **all** are connected and the disconnected input once **all** are disconnected. While only some are connected, the input is left alone. Saved choices that are no longer paired stay listed as unavailable. When a device is ticked while it is connected, its HID vendor and product IDs are saved too and must match later.
-- **Monitor**: an external display, identified by alphanumeric serial, vendor ID and EDID product ID. The LG reports a different product ID per port (`0x7845` over HDMI, `0x7847` over USB-C), so the monitor must be selected over the port this Mac uses.
-- **Input protocol**: LG alternate (VCP `0xF4`, source `0x50`) or Standard DDC (VCP `0x60`). LG USB is not offered.
-- **When connected / When disconnected**: an input, or **Do nothing**.
-- **Connect / disconnect delay**: how long the new state must hold before acting. `0` acts as soon as macOS reports the change.
-- **Switch automatically**: on or off.
-
-Saving restarts tracking from the current state and sends nothing.
-
-## Behavior
-
-- **Detection.** IOKit matched/terminated notifications for `IOHIDDevice` entries with each selected device's `DeviceAddress`, plus a 5-second reconciliation poll. Bluetooth LE keyboards appear here; the device is never opened, so no key data is read and no Input Monitoring permission is needed. A device is *connected* when Bluetooth is on, it is paired, and a Bluetooth HID entry with its address and IDs exists. It is *disconnected* when paired and absent. Anything else (Bluetooth off, not paired, query failure, lookalike with the same address but other IDs) is *unknown* and never acts. If any selected device is unknown, the whole set is unknown. A set with some devices connected and some not is *mixed*: it cancels a pending change and holds the input. If the companion starts while mixed, the first full match acts.
-- **Edges only.** Launch and every settings change take the current state as a baseline without sending a command; there is no initial synchronization. A command is sent only when the state changes and holds for its delay. A change that reverts first is cancelled.
-- **Sleep and Bluetooth power.** On system sleep or Bluetooth power-off, pending work is cancelled and observations are ignored. After wake or power-on, the companion waits 20 seconds, then compares the state with the pre-sleep baseline. A keyboard that drops during sleep and reconnects after wake causes no switch. A keyboard that stays gone after the grace period produces one disconnect edge.
-- **Stale work.** Every state change, sleep, power change or settings change invalidates queued commands. Each attempt checks this first, so an older input is never sent after a newer one. A failed write is retried at most twice, 1.5 seconds apart. If the monitor is not found, nothing is queued.
-- **Pause.** While paused, edges are logged but not acted on. Resuming does not replay them.
-- **Logging.** The log records device names, per-device and combined states, and command results. It never contains key data.
-
-Write success means the command was sent. The LG does not report its input, so the log cannot confirm a switch.
-
-With 0-second delays, a Bluetooth dropout of any length switches the monitor. If the link drops before macOS posts its sleep notification, a disconnect command can be sent as the Mac goes to sleep. Increase the disconnect delay if that happens. Keychron keyboards also disconnect when they auto-sleep from inactivity, which counts as a disconnect.
-
-## Tests
-
-`scripts/test-input-source.sh` also runs `Tests/CompanionPolicyTests.swift`. It covers baseline-without-action, debounce and bounce cancellation, zero delays, unknown states, sleep/wake and Bluetooth power, other keyboards and lookalikes, display identity per port, settings validation and persistence, bounded retries, and supersession of stale commands. These tests use no hardware.
-
-## Validation on 2026-11-16 (RESML laptop)
-
-M4 Pro MacBook Pro, macOS 26.6.2, Command Line Tools only (Swift 6.3.1), HyperDrive Thunderbolt 3 Mobile Dock HDMI → LG ULTRAGEAR+ HDMI 1 (`601INAR7V264`, product `0x7845`).
-
-- The configured keyboard is the Keychron K5 Max: address `d9-27-29-c0-eb-c9`, HID `3434:0A53`, Bluetooth Low Energy, confirmed from its live registry entry. The also-connected Keychron K10 Pro (`02E5:A1B2`) and G604 mouse are ignored.
-- With 10 s / 2 s delays, two full disconnect → USB-C and connect → HDMI 1 cycles were logged at the expected delays, and the user saw the switches.
-- With 0 s delays, both edges logged a command in the same second as detection, and the user saw both switches as fast.
-- With the K5 Max and an EM01 NL (`ee-b6-0f-f7-43-69`, HID `25A7:FAA0`) both selected: when one disconnected the state went to mixed and the input was held; when both were gone USB-C was sent; with one reconnected it held again; with both connected HDMI 1 was sent. The user saw both switches and both holds. Settings from the single-keyboard release migrated to the device list.
-- System sleep/wake and Bluetooth power-off were tested with simulated transitions only, not on hardware.
+Prior standalone RESML evidence remains valid for the reused HID detection/input transport: user-confirmed K5 Max → HDMI 1 / USB-C switching, zero-delay switching, and K5 Max + EM01 NL all-match switching with mixed-state holds. **The merged app needs a fresh RESML installation and physical acceptance test.** A passing test suite or visual preview is not proof of that migration. Sleep/wake hardware testing remains outstanding.

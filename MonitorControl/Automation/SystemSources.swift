@@ -132,9 +132,14 @@ struct DisplayCandidate {
   }
 
   /// Resolves the display at write time, so a dock or monitor change is never written to a stale service.
-  static func write(_ source: DDCInputSource, config: CompanionConfig) -> WriteAttempt {
+  static func write(_ source: DDCInputSource, config: CompanionConfig, isCurrent: () -> Bool = { true }) -> WriteAttempt {
     guard let proto = config.protocolValue, proto.sources.contains(source) else { return .failed }
     guard let display = self.find(config) else { return .displayUnavailable }
+    guard isCurrent() else { return .superseded }
+    if proto == .lgUSB {
+      guard let control = LGUSBInputControl(serialNumber: display.identity.serial) else { return .displayUnavailable }
+      return control.write(value: source.value, canWrite: isCurrent) ? .sent : (isCurrent() ? .failed : .superseded)
+    }
     let ok = Arm64DDC.write(service: display.service, command: proto.command, value: source.value,
                             sourceAddress: proto.sourceAddress, numOfWriteCycles: 1, numOfRetryAttemps: 0)
     return ok ? .sent : .failed

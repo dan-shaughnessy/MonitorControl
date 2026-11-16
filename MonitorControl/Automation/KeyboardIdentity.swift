@@ -16,6 +16,7 @@ enum KeyboardIdentity {
   /// - An entry with the address but the wrong transport or IDs: unknown (never act on a lookalike).
   static func presence(powerOn: Bool?, paired: Bool?, entries: [HIDEntry], device: SelectedDevice) -> KeyboardPresence {
     guard powerOn == true, paired == true, let address = CompanionConfig.normalizedAddress(device.address) else { return .unknown }
+    guard device.vendorID != nil, device.productID != nil else { return .unknown }
     let sameAddress = entries.filter { CompanionConfig.normalizedAddress($0.address) == address }
     if sameAddress.isEmpty { return .disconnected }
     let exact = sameAddress.contains { entry in

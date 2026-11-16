@@ -12,7 +12,7 @@ struct SelectedDevice: Codable, Equatable {
 
 /// User settings, saved as JSON. Effective runtime state is never stored here.
 struct CompanionConfig: Codable, Equatable {
-  static let supportedProtocols: [DDCInputSource.InputProtocol] = [.lgAlternate, .standard]
+  static let supportedProtocols: [DDCInputSource.InputProtocol] = [.lgAlternate, .standard, .lgUSB]
   /// 0 acts as soon as the registry reports the change.
   static let connectDelayRange: ClosedRange<Double> = 0 ... 30
   static let disconnectDelayRange: ClosedRange<Double> = 0 ... 300
@@ -108,6 +108,7 @@ struct CompanionConfig: Codable, Equatable {
     var result: [String] = []
     let addresses = self.devices.map { Self.normalizedAddress($0.address) }
     if addresses.isEmpty { result.append("No Bluetooth device selected") }
+    if self.devices.contains(where: { $0.vendorID == nil || $0.productID == nil }) { result.append("Connect selected devices once and refresh to verify their identity") }
     if addresses.contains(nil) { result.append("A selected device has an invalid address") }
     if Set(addresses.compactMap { $0 }).count != addresses.compactMap({ $0 }).count { result.append("A device is selected twice") }
     if self.displaySerial.isEmpty || self.displayProductID == nil || self.displayVendorID == nil { result.append("No monitor selected") }
@@ -130,14 +131,26 @@ struct CompanionConfig: Codable, Equatable {
 
 struct ConfigStore {
   let url: URL
+  var legacyURL: URL? = nil
 
   static var defaultDirectory: URL {
-    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("LGInputCompanion", isDirectory: true)
+    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("MonitorControl", isDirectory: true)
+  }
+
+  static var monitorControl: ConfigStore {
+    ConfigStore(url: self.defaultDirectory.appendingPathComponent("automation.json"),
+                legacyURL: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                  .appendingPathComponent("LGInputCompanion/config.json"))
   }
 
   /// A missing file gives a disabled, unconfigured default. A corrupt file is reported, never silently replaced.
   func load() throws -> CompanionConfig {
-    guard FileManager.default.fileExists(atPath: self.url.path) else { return CompanionConfig() }
+    guard FileManager.default.fileExists(atPath: self.url.path) else {
+      guard let legacy = self.legacyURL, FileManager.default.fileExists(atPath: legacy.path) else { return CompanionConfig() }
+      let config = try JSONDecoder().decode(CompanionConfig.self, from: Data(contentsOf: legacy))
+      try self.save(config)
+      return config
+    }
     return try JSONDecoder().decode(CompanionConfig.self, from: Data(contentsOf: self.url))
   }
 

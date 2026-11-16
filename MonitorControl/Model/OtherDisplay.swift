@@ -6,7 +6,7 @@ import os.log
 
 class OtherDisplay: Display {
   // Main-thread input state is separate from brightness restore/coalescing.
-  let inputSourceSession = DDCInputSourceSession()
+  var inputSourceSession = DDCInputSourceSession()
   var inputSourceBusy = false
   var lgUSBInputControl: LGUSBInputControl?
   var supportsLGUSBInput: Bool { self.lgUSBInputControl != nil }
@@ -28,9 +28,10 @@ class OtherDisplay: Display {
       return
     }
     self.inputSourceBusy = true
+    let session = self.inputSourceSession
     DisplayManager.shared.globalDDCQueue.async {
       // A menu can outlive a disconnect or reconfiguration while waiting behind other DDC work.
-      let valid = self.inputSourceSession.isValid && !self.readPrefAsBool(key: .forceSw)
+      let valid = session.isValid && !self.readPrefAsBool(key: .forceSw)
       var sent = false
       if valid {
         if inputProtocol == .lgUSB {
@@ -58,8 +59,9 @@ class OtherDisplay: Display {
       completion(nil)
       return
     }
+    let session = self.inputSourceSession
     DisplayManager.shared.globalDDCQueue.async {
-      let valid = self.inputSourceSession.isValid && !self.readPrefAsBool(key: .forceSw)
+      let valid = session.isValid && !self.readPrefAsBool(key: .forceSw)
       var value: UInt16?
       if valid {
         if Arm64DDC.isArm64 {

@@ -2,15 +2,17 @@
 
 import AppKit
 import Foundation
+import os.log
 
 func companionLog(_ message: String) {
   let stamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
+  os_log("%{public}@", type: .default, message)
   print("\(stamp) \(message)")
   fflush(stdout)
 }
 
 /// Connects the pure policy to IOKit, Bluetooth, sleep/wake and the DDC executor. Main thread only.
-final class CompanionController {
+final class AutomationController {
   let store: ConfigStore
   private(set) var config: CompanionConfig
   private(set) var configError: String?
@@ -25,7 +27,22 @@ final class CompanionController {
   private var lastPowerOn: Bool?
   var onStatusChange: (() -> Void)?
 
-  init(store: ConfigStore) {
+  private let writer: (DDCInputSource, CompanionConfig, () -> Bool) -> WriteAttempt
+  private let canAct: () -> Bool
+  private let observationProvider: (() -> (states: [(name: String, presence: KeyboardPresence)], combined: KeyboardPresence))?
+  private let powerProvider: () -> Bool?
+  private var started = false
+  private var displayChanging = false
+
+  init(store: ConfigStore, commandQueue: DispatchQueue = DispatchQueue(label: "monitorcontrol.automation.ddc"),
+       canAct: @escaping () -> Bool = { true },
+       writer: @escaping (DDCInputSource, CompanionConfig, () -> Bool) -> WriteAttempt = DisplayCandidate.write,
+       observationProvider: (() -> (states: [(name: String, presence: KeyboardPresence)], combined: KeyboardPresence))? = nil,
+       powerProvider: @escaping () -> Bool? = BluetoothState.powerOn) {
+    self.observationProvider = observationProvider
+    self.powerProvider = powerProvider
+    self.writer = writer
+    self.canAct = canAct
     self.store = store
     do {
       self.config = try store.load()
@@ -35,10 +52,7 @@ final class CompanionController {
       companionLog("config error: \(error.localizedDescription)")
     }
     self.policy = TriggerPolicy(timing: self.config.timing)
-    self.executor = InputCommandExecutor(write: { [weak self] source in
-      guard let config = DispatchQueue.main.sync(execute: { self?.config }) else { return .failed }
-      return DisplayCandidate.write(source, config: config)
-    })
+    self.executor = InputCommandExecutor(queue: commandQueue, write: { _ in .failed })
   }
 
   var pending: (target: KeyboardPresence, due: Date)? {
@@ -50,6 +64,8 @@ final class CompanionController {
   var isSuspended: Bool { self.policy.suspended || self.policy.resumeAt != nil }
 
   func start() {
+    guard !self.started else { return }
+    self.started = true
     let center = NSWorkspace.shared.notificationCenter
     center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in self?.systemWillSleep() }
     center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.systemDidWake() }
@@ -62,7 +78,7 @@ final class CompanionController {
     try self.store.save(newConfig)
     self.config = newConfig
     self.configError = nil
-    self.applyCurrentConfig(reason: "settings saved")
+    if self.started { self.applyCurrentConfig(reason: "settings saved") } else if newConfig.enabled { self.start() }
   }
 
   func setEnabled(_ enabled: Bool) throws {
@@ -70,6 +86,10 @@ final class CompanionController {
     c.enabled = enabled
     try self.store.save(c)
     self.config = c
+    self.cancelDecisionTimer()
+    self.policy.baseline(self.observed)
+    self.syncGeneration()
+    if enabled && !self.started { self.start() }
     // Pausing keeps tracking the keyboard, so resuming never replays an earlier edge.
     companionLog(enabled ? "automation enabled" : "automation paused")
     self.onStatusChange?()
@@ -79,8 +99,10 @@ final class CompanionController {
     self.decisionTimer?.invalidate()
     self.policy = TriggerPolicy(timing: self.config.timing, after: self.policy.generation)
     let addresses = self.config.devices.compactMap { CompanionConfig.normalizedAddress($0.address) }
-    if addresses.isEmpty { self.watcher.stop() } else { self.watcher.start(addresses: addresses) }
-    self.lastPowerOn = BluetoothState.powerOn()
+    if self.observationProvider == nil {
+      if addresses.isEmpty { self.watcher.stop() } else { self.watcher.start(addresses: addresses) }
+    }
+    self.lastPowerOn = self.powerProvider()
     self.observed = self.evaluate()
     self.policy.baseline(self.observed)
     self.syncGeneration()
@@ -92,8 +114,9 @@ final class CompanionController {
 
   /// Per-device states and their combined state. Read-only.
   func evaluateDevices() -> (states: [(name: String, presence: KeyboardPresence)], combined: KeyboardPresence) {
+    if let observe = self.observationProvider { return observe() }
     let entries = HIDRegistryWatcher.bluetoothEntries()
-    let power = BluetoothState.powerOn()
+    let power = self.powerProvider()
     let paired = BluetoothState.pairedDevices()?.map(\.address)
     let states = self.config.devices.map { device -> (name: String, presence: KeyboardPresence) in
       guard let entries = entries, let address = CompanionConfig.normalizedAddress(device.address) else { return (device.name, .unknown) }
@@ -114,8 +137,30 @@ final class CompanionController {
     return self.deviceStates.count == 1 ? each : "\(each) → \(self.observed.rawValue)"
   }
 
-  private func reconcile(reason: String?) {
-    let power = BluetoothState.powerOn()
+  func displayWillChange() {
+    self.displayChanging = true
+    self.cancelDecisionTimer()
+    self.policy.suspend()
+    self.syncGeneration()
+  }
+
+  func displayDidChange() {
+    self.displayChanging = false
+    guard self.started else { return }
+    self.applyCurrentConfig(reason: "display changed")
+  }
+
+  func stop() {
+    self.cancelDecisionTimer()
+    self.reconcileTimer?.invalidate()
+    self.watcher.stop()
+    self.policy.suspend()
+    self.syncGeneration()
+  }
+
+  func reconcile(reason: String? = nil) {
+    guard !self.displayChanging else { return }
+    let power = self.powerProvider()
     if power != self.lastPowerOn {
       if self.lastPowerOn == true {
         companionLog("Bluetooth is off or unavailable; pending work cancelled")
@@ -163,7 +208,7 @@ final class CompanionController {
   }
 
   private func act(on presence: KeyboardPresence) {
-    guard self.config.enabled else {
+    guard self.config.enabled && self.canAct() else {
       companionLog("edge \(presence.rawValue): automation paused, no command")
       return
     }
@@ -177,7 +222,9 @@ final class CompanionController {
     }
     let generation = self.policy.generation
     companionLog("edge \(presence.rawValue): sending \(source.title) (0x\(String(source.value, radix: 16, uppercase: true)))")
-    self.executor.submit(source, generation: generation) { result in
+    let config = self.config
+    let writer = self.writer
+    self.executor.submit(source, generation: generation, write: { [executor = self.executor!] source in writer(source, config, { executor.isCurrent(generation) }) }) { result in
       DispatchQueue.main.async {
         let text: String
         switch result {

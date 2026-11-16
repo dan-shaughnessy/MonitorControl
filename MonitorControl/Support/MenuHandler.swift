@@ -21,6 +21,7 @@ class MenuHandler: NSMenu, NSMenuDelegate {
 
   func menuWillOpen(_: NSMenu) {
     self.updateMenuRelevantDisplay()
+    self.refreshAutomationStatus()
     app.keyboardShortcuts.disengage()
   }
 
@@ -71,6 +72,7 @@ class MenuHandler: NSMenu, NSMenuDelegate {
         self.addCombinedDisplayMenuBlock()
       }
     }
+    self.addAutomationOptions()
     self.addDefaultMenuOptions()
   }
 
@@ -233,6 +235,43 @@ class MenuHandler: NSMenu, NSMenuDelegate {
         self.updateMenus(dontClose: true)
       }
     }
+  }
+
+  private var automationStatusItem: NSMenuItem? { self.items.first { $0.identifier?.rawValue == "automation-status" } }
+
+  private func addAutomationOptions() {
+    self.addItem(.separator())
+    let toggle = self.addItem(withTitle: NSLocalizedString("Automatic Switching", comment: "Automation toggle"), action: #selector(app.automaticSwitchingClicked), keyEquivalent: "")
+    toggle.target = app
+    toggle.identifier = NSUserInterfaceItemIdentifier("automation-toggle")
+    toggle.state = app.automationController.config.enabled ? .on : .off
+    let status = self.addItem(withTitle: NSLocalizedString("Automation Status", comment: "Automation submenu"), action: nil, keyEquivalent: "")
+    status.identifier = NSUserInterfaceItemIdentifier("automation-status")
+    status.submenu = NSMenu()
+    self.refreshAutomationStatus()
+  }
+
+  private func refreshAutomationStatus() {
+    guard let submenu = self.automationStatusItem?.submenu else { return }
+    submenu.removeAllItems()
+    submenu.autoenablesItems = false
+    let controller = app.automationController
+    self.items.first { $0.identifier?.rawValue == "automation-toggle" }?.state = controller.config.enabled ? .on : .off
+    func info(_ text: String) { submenu.addItem(withTitle: text, action: nil, keyEquivalent: "").isEnabled = false }
+    for device in controller.deviceStates { info("\(device.name): \(device.presence.rawValue)") }
+    if controller.config.devices.isEmpty { info("No Bluetooth devices selected") }
+    info("Combined state: \(controller.observed.rawValue)")
+    info("Monitor: \(controller.config.displayName.isEmpty ? "none selected" : controller.config.displayName)")
+    if let pending = controller.pending { info("Pending: \(pending.target.rawValue) in \(max(0, Int(pending.due.timeIntervalSinceNow.rounded(.up)))) s") }
+    if controller.isSuspended { info("Waiting for a new baseline after wake") }
+    if LegacyCompanion.isPresent { info("Paused: retire the old companion in Automation settings") }
+    if app.safeMode { info("Paused in safe mode") }
+    info(controller.lastResult)
+    if let error = controller.configError { info(error) }
+    for problem in controller.config.problems { info(problem) }
+    submenu.addItem(.separator())
+    let settings = submenu.addItem(withTitle: "Automation Settings…", action: #selector(app.automationSettingsClicked), keyEquivalent: "")
+    settings.target = app
   }
 
   func addDefaultMenuOptions() {

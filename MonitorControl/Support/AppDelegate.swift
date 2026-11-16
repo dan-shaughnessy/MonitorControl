@@ -17,6 +17,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     return item
   }()
 
+  lazy var automationController: AutomationController = {
+    #if DEBUG
+    if ProcessInfo.processInfo.environment["MONITORCONTROL_UI_PREVIEW"] == "1" {
+      return AutomationController(store: ConfigStore(url: URL(fileURLWithPath: "/tmp/monitorcontrol-automation-preview.json")),
+        canAct: { false }, observationProvider: { ([("Preview keyboard", .connected)], .connected) }, powerProvider: { true })
+    }
+    #endif
+    return AutomationController(store: .monitorControl, commandQueue: DisplayManager.shared.globalDDCQueue,
+    canAct: { [weak self] in
+      guard let self = self else { return false }
+      return !self.safeMode && self.sleepID == 0 && self.reconfigureID == 0 && !LegacyCompanion.isPresent
+    })
+  }()
+  lazy var automationPrefs: AutomationPrefsViewController = {
+    #if DEBUG
+    if ProcessInfo.processInfo.environment["MONITORCONTROL_UI_PREVIEW"] == "1" {
+      return AutomationPrefsViewController(controller: self.automationController,
+        pairedDevices: { [PairedDevice(name: "Preview keyboard", address: "11-22-33-44-55-66", connected: true),
+                          PairedDevice(name: "Preview mouse", address: "22-33-44-55-66-77", connected: false)] },
+        displays: { [DisplayCandidate(displayID: 0, name: "Preview LG", identity: DisplayIdentity(serial: "PREVIEW", vendorID: 1, productID: 1), service: nil)] },
+        hidEntries: { [HIDEntry(address: "11-22-33-44-55-66", transport: "Bluetooth", vendorID: 1, productID: 2)] })
+    }
+    #endif
+    return AutomationPrefsViewController(controller: self.automationController)
+  }()
+
   var mediaKeyTap = MediaKeyTapManager()
   var keyboardShortcuts = KeyboardShortcutsManager()
   let coreAudio = SimplyCoreAudio()
@@ -45,6 +71,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       menuslidersPrefsVc!,
       keyboardPrefsVc!,
       displaysPrefsVc!,
+      self.automationPrefs,
       aboutPrefsVc!,
     ],
     style: self.settingsPaneStyle,
@@ -53,6 +80,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationDidFinishLaunching(_: Notification) {
     app = self
+    #if DEBUG
+    if ProcessInfo.processInfo.environment["MONITORCONTROL_UI_PREVIEW"] == "1" {
+      self.setMenu()
+      let main = NSMenu()
+      let appMenu = NSMenu()
+      appMenu.addItem(withTitle: "Quit Preview", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+      let item = main.addItem(withTitle: "Preview", action: nil, keyEquivalent: "")
+      item.submenu = appMenu
+      NSApp.mainMenu = main
+      DispatchQueue.main.async { self.settingsWindowController.show(pane: .automation) }
+      return
+    }
+    #endif
     self.subscribeEventListeners()
     self.showSafeModeAlertIfNeeded()
     if !prefs.bool(forKey: PrefKey.appAlreadyLaunched.rawValue) {
@@ -67,6 +107,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     self.configure(firstrun: true)
     DisplayManager.shared.createGammaActivityEnforcer()
     self.updaterController.startUpdater()
+    if !self.safeMode && self.automationController.config.enabled { self.automationController.start() }
   }
 
   @objc func quitClicked(_: AnyObject) {
@@ -80,6 +121,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   @objc func prefsClicked(_: AnyObject) {
     os_log("Settings clicked", type: .info)
     self.settingsWindowController.show()
+  }
+
+  @objc func automationSettingsClicked(_: AnyObject) {
+    self.settingsWindowController.show(pane: .automation)
+  }
+
+  @objc func automaticSwitchingClicked(_: AnyObject) {
+    do {
+      try self.automationController.setEnabled(!self.automationController.config.enabled)
+      menu.updateMenus()
+    } catch { NSAlert(error: error).runModal() }
   }
 
   private func currentReopenSenderBundleIdentifier() -> String? {
@@ -106,6 +158,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationWillTerminate(_: Notification) {
+    self.automationController.stop()
     os_log("Goodbye!", type: .info)
     DisplayManager.shared.resetSwBrightnessForAllDisplays(noPrefSave: true)
     self.updateStatusItemVisibility(true)
@@ -142,6 +195,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
   @objc func displayReconfigured() {
     self.invalidateInputSourceSessions()
+    self.automationController.displayWillChange()
     DisplayManager.shared.resetSwBrightnessForAllDisplays(noPrefSave: true)
     CGDisplayRestoreColorSyncSettings()
     self.reconfigureID += 1
@@ -171,6 +225,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       DisplayManager.shared.resetSwBrightnessForAllDisplays(prefsOnly: true)
     }
     DisplayManager.shared.setupOtherDisplays(firstrun: firstrun)
+    self.automationController.displayDidChange()
     self.updateMenusAndKeys()
     if !firstrun || prefs.integer(forKey: PrefKey.startupAction.rawValue) == StartupAction.write.rawValue {
       if !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue) {
@@ -298,6 +353,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func settingsReset() {
+    do { try self.automationController.update(CompanionConfig()) } catch { NSAlert(error: error).runModal(); return }
     os_log("Resetting all settings.")
     if !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue) {
       DisplayManager.shared.resetSwBrightnessForAllDisplays(async: false)
@@ -325,9 +381,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     self.mediaKeyTap.updateMediaKeyTap()
   }
 
-  func setStartAtLogin(enabled: Bool) {
+  @discardableResult
+  func setStartAtLogin(enabled: Bool) -> Bool {
     let identifier = "\(Bundle.main.bundleIdentifier!)Helper" as CFString
-    SMLoginItemSetEnabled(identifier, enabled)
+    return SMLoginItemSetEnabled(identifier, enabled)
   }
 
   func getSystemSettings() -> [String: AnyObject]? {

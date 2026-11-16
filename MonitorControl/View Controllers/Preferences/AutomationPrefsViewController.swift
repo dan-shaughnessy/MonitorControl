@@ -1,69 +1,22 @@
 //  Copyright © MonitorControl contributors
 
 import AppKit
+import Settings
 
-final class StatusMenuController: NSObject, NSMenuDelegate {
-  private let controller: CompanionController
-  private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-  private lazy var settings = SettingsWindowController(controller: self.controller)
-
-  init(controller: CompanionController) {
-    self.controller = controller
-    super.init()
-    self.item.button?.image = NSImage(systemSymbolName: "keyboard.badge.eye", accessibilityDescription: "LG Input Companion")
-      ?? NSImage(systemSymbolName: "keyboard", accessibilityDescription: "LG Input Companion")
-    let menu = NSMenu()
-    menu.delegate = self
-    self.item.menu = menu
+final class AutomationPrefsViewController: NSViewController, SettingsPane {
+  let paneIdentifier = Settings.PaneIdentifier.automation
+  let paneTitle = NSLocalizedString("Automation", comment: "Settings pane")
+  var toolbarItemIcon: NSImage {
+    if #available(macOS 11.0, *) { return NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: self.paneTitle)! }
+    return NSImage(named: NSImage.actionTemplateName)!
   }
-
-  func menuNeedsUpdate(_ menu: NSMenu) {
-    menu.removeAllItems()
-    let c = self.controller.config
-    func info(_ text: String) { menu.addItem(withTitle: text, action: nil, keyEquivalent: "").isEnabled = false }
-    if c.devices.isEmpty { info("No Bluetooth device selected") }
-    for state in self.controller.deviceStates { info("\(state.name): \(state.presence.rawValue)") }
-    if c.devices.count > 1 {
-      let combined = self.controller.observed
-      info("All selected: \(combined == .mixed ? "mixed, holding current input" : combined.rawValue)")
-    }
-    let display = DisplayCandidate.find(c)
-    info("Monitor: \(c.displayName.isEmpty ? "none selected" : c.displayName) — \(display == nil ? "not found" : "available")")
-    info("Connected → \(c.input(for: .connected)?.title ?? "do nothing"); disconnected → \(c.input(for: .disconnected)?.title ?? "do nothing")")
-    if let pending = self.controller.pending {
-      let seconds = max(0, Int(pending.due.timeIntervalSinceNow.rounded(.up)))
-      info("Pending: \(pending.target.rawValue) in \(seconds) s")
-    } else if self.controller.isSuspended {
-      info("Waiting after wake or Bluetooth change")
-    }
-    info(self.controller.lastResult)
-    if let error = self.controller.configError { info(error) }
-    for problem in c.problems { info("⚠︎ \(problem)") }
-    menu.addItem(.separator())
-    let toggle = menu.addItem(withTitle: "Automatic Switching", action: #selector(self.toggleEnabled), keyEquivalent: "")
-    toggle.target = self
-    toggle.state = c.enabled ? .on : .off
-    menu.addItem(withTitle: "Settings…", action: #selector(self.openSettings), keyEquivalent: ",").target = self
-    menu.addItem(withTitle: "Open Log", action: #selector(self.openLog), keyEquivalent: "").target = self
-    menu.addItem(.separator())
-    menu.addItem(withTitle: "Quit LG Input Companion", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-  }
-
-  @objc private func toggleEnabled() {
-    do { try self.controller.setEnabled(!self.controller.config.enabled) } catch { NSAlert(error: error).runModal() }
-  }
-
-  @objc private func openSettings() { self.settings.show() }
-
-  @objc private func openLog() {
-    let log = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/LGInputCompanion.log")
-    NSWorkspace.shared.open(log)
-  }
-}
-
-final class SettingsWindowController: NSObject {
-  private let controller: CompanionController
-  private var window: NSWindow?
+  private let controller: AutomationController
+  private let pairedDevices: () -> [PairedDevice]?
+  private let displayCandidates: () -> [DisplayCandidate]
+  private let hidEntries: () -> [HIDEntry]?
+  private let migrationButton = NSButton(title: "Retire Old Companion", target: nil, action: nil)
+  private let deviceDocument = AutomationDeviceDocument()
+  private let savedLabel = NSTextField(wrappingLabelWithString: "")
   private let deviceStack = NSStackView()
   private var deviceChecks: [NSButton] = []
   private let displayPopup = NSPopUpButton()
@@ -76,21 +29,26 @@ final class SettingsWindowController: NSObject {
   private var keyboards: [PairedDevice] = []
   private var displays: [(label: String, name: String, identity: DisplayIdentity)] = []
 
-  init(controller: CompanionController) {
+  init(controller: AutomationController, pairedDevices: @escaping () -> [PairedDevice]? = BluetoothState.pairedDevices,
+       displays: @escaping () -> [DisplayCandidate] = DisplayCandidate.all,
+       hidEntries: @escaping () -> [HIDEntry]? = HIDRegistryWatcher.bluetoothEntries) {
     self.controller = controller
+    self.pairedDevices = pairedDevices
+    self.displayCandidates = displays
+    self.hidEntries = hidEntries
+    super.init(nibName: nil, bundle: nil)
   }
 
-  func show() {
-    if self.window == nil { self.window = self.makeWindow() }
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  override func viewWillAppear() {
+    super.viewWillAppear()
     self.load(self.controller.config)
-    NSApp.activate(ignoringOtherApps: true)
-    self.window?.makeKeyAndOrderFront(nil)
   }
 
-  private func makeWindow() -> NSWindow {
-    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 360), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-    window.title = "LG Input Companion Settings"
-    window.isReleasedWhenClosed = false
+  override func loadView() {
+    self.view = NSView(frame: NSRect(x: 0, y: 0, width: 650, height: 560))
+    self.view.widthAnchor.constraint(equalToConstant: 650).isActive = true
     func label(_ text: String) -> NSTextField {
       let l = NSTextField(labelWithString: text)
       l.alignment = .right
@@ -123,49 +81,65 @@ final class SettingsWindowController: NSObject {
     grid.rowSpacing = 8
     grid.column(at: 0).xPlacement = .trailing
     let refresh = NSButton(title: "Refresh Lists", target: self, action: #selector(self.refresh))
-    let cancel = NSButton(title: "Cancel", target: self, action: #selector(self.cancel))
-    cancel.keyEquivalent = "\u{1b}"
-    let save = NSButton(title: "Save", target: self, action: #selector(self.save))
-    save.keyEquivalent = "\r"
+    let cancel = NSButton(title: "Revert", target: self, action: #selector(self.cancel))
+    let save = NSButton(title: "Save Changes", target: self, action: #selector(self.save))
     let buttons = NSStackView(views: [refresh, NSView(), cancel, save])
-    let stack = NSStackView(views: [grid, note, buttons])
+    let scroll = NSScrollView()
+    scroll.hasVerticalScroller = true
+    scroll.borderType = .bezelBorder
+    scroll.documentView = self.deviceDocument
+    self.deviceDocument.addSubview(self.deviceStack)
+    self.deviceStack.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      self.deviceStack.leadingAnchor.constraint(equalTo: self.deviceDocument.leadingAnchor, constant: 6),
+      self.deviceStack.topAnchor.constraint(equalTo: self.deviceDocument.topAnchor, constant: 6),
+      self.deviceStack.widthAnchor.constraint(equalTo: self.deviceDocument.widthAnchor, constant: -12),
+      scroll.heightAnchor.constraint(equalToConstant: 125),
+    ])
+    grid.cell(atColumnIndex: 1, rowIndex: 0).contentView = scroll
+    self.migrationButton.target = self
+    self.migrationButton.action = #selector(self.retireCompanion)
+    let stack = NSStackView(views: [grid, note, self.migrationButton, self.savedLabel, buttons])
     stack.orientation = .vertical
     stack.alignment = .leading
     stack.spacing = 14
     stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
     stack.translatesAutoresizingMaskIntoConstraints = false
-    window.contentView = NSView()
-    window.contentView?.addSubview(stack)
+    self.view.addSubview(stack)
     NSLayoutConstraint.activate([
-      stack.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
-      stack.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
-      stack.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
-      stack.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
+      stack.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
+      stack.topAnchor.constraint(equalTo: self.view.topAnchor),
+      stack.bottomAnchor.constraint(equalTo: self.view.bottomAnchor),
+      grid.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
       buttons.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
       note.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
       self.displayPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
     ])
-    window.center()
-    return window
+    self.load(self.controller.config)
   }
 
   /// Saved choices stay visible, marked unavailable, when the device is not present now.
   private func load(_ c: CompanionConfig) {
-    self.keyboards = BluetoothState.pairedDevices() ?? []
+    self.migrationButton.isHidden = !LegacyCompanion.isPresent
+    self.keyboards = self.pairedDevices() ?? []
     let saved = Set(c.devices.compactMap { CompanionConfig.normalizedAddress($0.address) })
     for device in c.devices {
       guard let address = CompanionConfig.normalizedAddress(device.address), !self.keyboards.contains(where: { $0.address == address }) else { continue }
       self.keyboards.append(PairedDevice(name: device.name + " (unavailable: not paired)", address: address, connected: false))
     }
-    self.deviceChecks.forEach { $0.removeFromSuperview() }
+    self.deviceChecks.forEach { self.deviceStack.removeArrangedSubview($0); $0.removeFromSuperview() }
     self.deviceChecks = self.keyboards.map { device in
-      let check = NSButton(checkboxWithTitle: "\(device.name) — \(device.connected ? "connected" : "not connected") — \(device.address.uppercased())", target: nil, action: nil)
+      let check = NSButton(checkboxWithTitle: "\(device.name) — \(device.connected ? "connected" : "not connected")", target: nil, action: nil)
       check.state = saved.contains(device.address) ? .on : .off
+      check.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+      check.toolTip = "\(device.name) — Bluetooth \(device.address.uppercased())"
       return check
     }
     self.deviceChecks.forEach { self.deviceStack.addArrangedSubview($0) }
+    self.deviceDocument.frame = NSRect(x: 0, y: 0, width: 440, height: max(125, CGFloat(self.deviceChecks.count) * 24 + 12))
 
-    self.displays = DisplayCandidate.all().map { ($0.label, $0.name, $0.identity) }
+    self.displays = self.displayCandidates().map { ($0.label, $0.name, $0.identity) }
     if let vendor = c.displayVendorID, let product = c.displayProductID {
       let saved = DisplayIdentity(serial: c.displaySerial, vendorID: vendor, productID: product)
       if !c.displaySerial.isEmpty, !self.displays.contains(where: { $0.identity == saved }) {
@@ -182,6 +156,7 @@ final class SettingsWindowController: NSObject {
 
     self.protocolPopup.removeAllItems()
     CompanionConfig.supportedProtocols.forEach { self.protocolPopup.addItem(withTitle: $0.title) }
+    self.savedLabel.stringValue = self.controller.configError ?? ""
     self.protocolPopup.selectItem(at: CompanionConfig.supportedProtocols.firstIndex { $0.rawValue == c.inputProtocol } ?? 0)
     self.reloadInputs(connected: c.connectedInput, disconnected: c.disconnectedInput)
     self.connectDelayField.doubleValue = c.connectDelay
@@ -223,14 +198,20 @@ final class SettingsWindowController: NSObject {
     self.load(c)
   }
 
-  @objc private func cancel() { self.window?.close() }
+  @objc private func cancel() { self.load(self.controller.config) }
 
   private func collect() -> CompanionConfig {
     var c = self.controller.config
-    let entries = HIDRegistryWatcher.bluetoothEntries()
+    let entries = self.hidEntries()
     c.devices = zip(self.keyboards, self.deviceChecks).filter { $0.1.state == .on }.map { device, _ in
       // Keep saved identity; learn vendor/product IDs only from the live HID entry of a newly chosen address.
-      if let existing = self.controller.config.devices.first(where: { CompanionConfig.normalizedAddress($0.address) == device.address }) { return existing }
+      if var existing = self.controller.config.devices.first(where: { CompanionConfig.normalizedAddress($0.address) == device.address }) {
+        if let live = entries?.first(where: { CompanionConfig.normalizedAddress($0.address) == device.address }) {
+          if existing.vendorID == nil { existing.vendorID = live.vendorID }
+          if existing.productID == nil { existing.productID = live.productID }
+        }
+        return existing
+      }
       let entry = entries?.first { CompanionConfig.normalizedAddress($0.address) == device.address }
       return SelectedDevice(address: device.address, name: device.name, vendorID: entry?.vendorID, productID: entry?.productID)
     }
@@ -256,6 +237,18 @@ final class SettingsWindowController: NSObject {
     return c
   }
 
+  @objc private func retireCompanion() {
+    do {
+      let wasEnabledAtLogin = FileManager.default.fileExists(atPath: LegacyCompanion.plist.path)
+      try LegacyCompanion.retire()
+      self.controller.displayDidChange()
+      let loginReady = !wasEnabledAtLogin || app.setStartAtLogin(enabled: true)
+      self.load(self.controller.config)
+      self.savedLabel.stringValue = loginReady ? "Old companion retired. Saved devices and inputs were kept."
+        : "Companion retired. Check Start at Login in General; macOS did not register the login helper."
+    } catch { NSAlert(error: error).runModal() }
+  }
+
   @objc private func save() {
     let c = self.collect()
     if c.enabled, !c.problems.isEmpty {
@@ -267,9 +260,14 @@ final class SettingsWindowController: NSObject {
     }
     do {
       try self.controller.update(c)
-      self.window?.close()
+      self.load(self.controller.config)
+      self.savedLabel.stringValue = "Changes saved. Tracking restarts without switching inputs."
     } catch {
       NSAlert(error: error).runModal()
     }
   }
+}
+
+private final class AutomationDeviceDocument: NSView {
+  override var isFlipped: Bool { true }
 }

@@ -58,3 +58,7 @@ Tests use a fake display; they never send monitor commands. The built applicatio
 ## Automatic switching
 
 To switch inputs when a chosen Bluetooth keyboard connects or disconnects, see [LG Input Companion](lg-input-companion.md).
+
+## Integrated Bluetooth automation
+
+The former LG Input Companion is now part of this app, using the same DDC queue and input transport. See [Automation settings and migration](lg-input-companion.md). There is no separate companion app target in this branch. Earlier standalone hardware results above are retained as history and do not establish merged-app acceptance.

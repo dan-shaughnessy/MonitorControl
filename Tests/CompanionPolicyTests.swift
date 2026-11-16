@@ -112,21 +112,23 @@ struct CompanionPolicyTests {
     precondition(p.observe(.connected, now: 520) == .none)
     precondition(p.settled == .connected)
 
-    // Keyboard really gone after wake + grace + delay: one disconnect edge.
+    // Wake establishes a baseline even if the keyboard changed while asleep.
     p = TriggerPolicy(timing: timing)
     p.baseline(.connected)
     p.suspend()
     _ = p.resume(now: 100)
-    precondition(p.observe(.disconnected, now: 120) == .schedule(at: 130))
-    precondition(p.fire(observed: .disconnected, now: 130) == .edge(.disconnected))
+    precondition(p.observe(.disconnected, now: 120) == .none)
+    precondition(p.fire(observed: .disconnected, now: 130) == .none)
+    precondition(p.observe(.connected, now: 131) == .schedule(at: 133))
+    precondition(p.fire(observed: .connected, now: 133) == .edge(.connected))
 
     // Keyboard turned on while asleep: connect edge after wake grace.
     p = TriggerPolicy(timing: timing)
     p.baseline(.disconnected)
     p.suspend()
     _ = p.resume(now: 0)
-    precondition(p.observe(.connected, now: 20) == .schedule(at: 22))
-    precondition(p.fire(observed: .connected, now: 22) == .edge(.connected))
+    precondition(p.observe(.connected, now: 20) == .none)
+    precondition(p.fire(observed: .connected, now: 22) == .none)
 
     // Suspend and resume invalidate in-flight work.
     let g = p.generation
@@ -160,7 +162,7 @@ struct CompanionPolicyTests {
     var addressOnly = k5Device
     addressOnly.vendorID = nil
     addressOnly.productID = nil
-    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5], device: addressOnly) == .connected)
+    precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5], device: addressOnly) == .unknown)
     // The mouse is judged on its own identity, never the keyboard's.
     precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5, mouse], device: mouseDevice) == .connected)
     precondition(KeyboardIdentity.presence(powerOn: true, paired: true, entries: [k5], device: mouseDevice) == .disconnected)
@@ -243,7 +245,7 @@ struct CompanionPolicyTests {
     c.inputProtocol = DDCInputSource.InputProtocol.standard.rawValue
     precondition(c.input(for: .connected)?.value == 0x11 && c.problems.isEmpty)
     c.inputProtocol = DDCInputSource.InputProtocol.lgUSB.rawValue
-    precondition(c.protocolValue == nil && !c.problems.isEmpty, "LG USB is not available to the companion")
+    precondition(c.protocolValue == .lgUSB && c.input(for: .connected) == nil, "USB mode requires its own explicit input values")
     c = self.k5Config()
     c.disconnectDelay = -1
     precondition(!c.problems.isEmpty)
@@ -253,6 +255,22 @@ struct CompanionPolicyTests {
     precondition(!CompanionConfig().enabled && !CompanionConfig().problems.isEmpty, "default is disabled and unconfigured")
 
     // Round trip, explicit null kept as "do nothing", absent keys use defaults.
+    let migrationDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: migrationDirectory) }
+    let legacyStore = ConfigStore(url: migrationDirectory.appendingPathComponent("legacy.json"))
+    let expected = self.k5Config()
+    try! legacyStore.save(expected)
+    let migratedStore = ConfigStore(url: migrationDirectory.appendingPathComponent("automation.json"), legacyURL: legacyStore.url)
+    precondition(try! migratedStore.load() == expected)
+    precondition(FileManager.default.fileExists(atPath: migratedStore.url.path))
+    precondition(try! legacyStore.load() == expected, "Migration retains the original config")
+    var newer = expected
+    newer.connectDelay = 0
+    try! migratedStore.save(newer)
+    precondition(try! migratedStore.load() == newer, "Legacy never overwrites newer app settings")
+    try! Data("invalid".utf8).write(to: migratedStore.url)
+    precondition((try? migratedStore.load()) == nil, "Corrupt new config is never replaced with legacy")
+
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: dir) }
     let store = ConfigStore(url: dir.appendingPathComponent("config.json"))
@@ -276,6 +294,11 @@ struct CompanionPolicyTests {
     executor.setCurrentGeneration(5)
     precondition(executor.run(hdmi, generation: 5) == .sent(attempts: 3))
     precondition(writes == [0x90, 0x90, 0x90])
+
+    // Each queued job uses its captured configuration writer, not mutable main-thread state.
+    writes = []
+    precondition(executor.run(hdmi, generation: 5, write: { source in writes.append(source.value); return .sent }) == .sent(attempts: 1))
+    precondition(writes == [0x90])
 
     // Bounded retries.
     writes = []

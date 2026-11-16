@@ -22,7 +22,7 @@ struct PolicyTiming: Equatable {
 ///   keeps the baseline. Only a launch baseline can be mixed, so the next full match acts.
 /// - `unknown` (Bluetooth off, unpaired, query failure, identity mismatch) cancels and never acts.
 /// - Sleep or Bluetooth power-off suspends and cancels. After resume plus a grace period, the
-///   state is compared with the pre-suspend baseline, so a disconnect caused only by sleep is not an edge.
+///   first known state becomes a new baseline without a command. Only a later Bluetooth edge acts.
 /// - `generation` changes whenever earlier queued work becomes stale.
 final class TriggerPolicy {
   enum Decision: Equatable {
@@ -55,6 +55,8 @@ final class TriggerPolicy {
     if let resumeAt = self.resumeAt {
       if now < resumeAt { return .none }
       self.resumeAt = nil
+      self.baseline(observed)
+      return .none
     }
     if observed == .unknown {
       self.cancelPending()
@@ -65,7 +67,7 @@ final class TriggerPolicy {
       return .none
     }
     if observed == .mixed {
-      if self.pendingTarget != nil { self.cancelPending() }
+      self.cancelPending()
       return .none
     }
     if observed == settled {

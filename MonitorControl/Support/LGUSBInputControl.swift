@@ -31,10 +31,11 @@ final class LGUSBInputControl {
   }
 
   /// Call on the serial DDC queue. A successful USB write is not physical confirmation.
-  func write(value: UInt16) -> Bool {
+  func write(value: UInt16, canWrite: () -> Bool = { true }) -> Bool {
     guard DDCInputSource.InputProtocol.lgUSB.sources.contains(where: { $0.value == value }),
           let device = self.device(), IOHIDDeviceOpen(device, 0) == kIOReturnSuccess else { return false }
     defer { IOHIDDeviceClose(device, 0) }
+    guard canWrite() else { return false }
     var report = DDCInputSource.lgUSBWriteReport(value: value)
     return IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, CFIndex(report[0]), &report, report.count) == kIOReturnSuccess
   }

@@ -19,13 +19,15 @@
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>7152</string>
+	<string>7160</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Observe your selected Bluetooth devices to switch monitor inputs automatically. Key presses are never read.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>MIT Licensed. 2017.</string>
 	<key>NSPrincipalClass</key>
