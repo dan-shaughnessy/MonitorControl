@@ -31,17 +31,9 @@ public class IntelDDC {
     }
   }
 
-  public func write(command: UInt8, value: UInt16, errorRecoveryWaitTime: UInt32? = nil, writeSleepTime: UInt32 = 10000, numofWriteCycles: UInt8 = 2) -> Bool {
+  public func write(command: UInt8, value: UInt16, sourceAddress: UInt8 = 0x51, errorRecoveryWaitTime: UInt32? = nil, writeSleepTime: UInt32 = 10000, numofWriteCycles: UInt8 = 2) -> Bool {
     var success = false
-    var data: [UInt8] = Array(repeating: 0, count: 7)
-
-    data[0] = 0x51
-    data[1] = 0x84
-    data[2] = 0x03
-    data[3] = command
-    data[4] = UInt8(value >> 8)
-    data[5] = UInt8(value & 255)
-    data[6] = 0x6E ^ data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4] ^ data[5]
+    var data = DDCInputSource.writePacket(command: command, value: value, sourceAddress: sourceAddress)
 
     for _ in 1 ... numofWriteCycles {
       usleep(writeSleepTime)
@@ -106,6 +98,9 @@ public class IntelDDC {
         }
         guard replyData[3] == 0x00 else {
           os_log("Reading %{public}@ is not supported.", type: .info, String(reflecting: command))
+          return nil
+        }
+        if command == 0x60, DDCInputSource.currentValue(from: replyData, command: command) == nil {
           return nil
         }
         if i > 1 {

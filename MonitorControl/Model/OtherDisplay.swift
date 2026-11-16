@@ -5,6 +5,69 @@ import IOKit
 import os.log
 
 class OtherDisplay: Display {
+  // Main-thread input state is separate from brightness restore/coalescing.
+  let inputSourceSession = DDCInputSourceSession()
+  var inputSourceBusy = false
+  var inputSourceProtocol: DDCInputSource.InputProtocol {
+    DDCInputSource.InputProtocol(rawValue: self.readPrefAsInt(key: .inputSourceProtocol)) ?? .standard
+  }
+
+  var canControlInputSource: Bool {
+    self.inputSourceSession.isValid && !self.isSw() && !app.safeMode && app.sleepID == 0 && app.reconfigureID == 0
+      && DisplayManager.shared.displays.contains(where: { $0 === self })
+  }
+
+  func requestInputSource(_ source: DDCInputSource, completion: @escaping (Bool) -> Void) {
+    let inputProtocol = self.inputSourceProtocol
+    guard self.canControlInputSource, !self.inputSourceBusy, inputProtocol.sources.contains(source) else {
+      completion(false)
+      return
+    }
+    self.inputSourceBusy = true
+    DisplayManager.shared.globalDDCQueue.async {
+      // A menu can outlive a disconnect or reconfiguration while waiting behind other DDC work.
+      let valid = self.inputSourceSession.isValid && !self.readPrefAsBool(key: .forceSw)
+      var sent = false
+      if valid {
+        if Arm64DDC.isArm64 {
+          sent = Arm64DDC.write(service: self.arm64avService, command: inputProtocol.command, value: source.value,
+                               sourceAddress: inputProtocol.sourceAddress, numOfWriteCycles: 1, numOfRetryAttemps: 0)
+        } else {
+          sent = self.ddc?.write(command: inputProtocol.command, value: source.value,
+                                 sourceAddress: inputProtocol.sourceAddress, numofWriteCycles: 1) ?? false
+        }
+      }
+      DispatchQueue.main.async {
+        self.inputSourceBusy = false
+        if sent {
+          self.savePref(source.title + " (" + inputProtocol.title + ")", key: .lastRequestedInputSource)
+        }
+        completion(sent)
+      }
+    }
+  }
+
+  func readInputSource(completion: @escaping (UInt16?) -> Void) {
+    guard self.canControlInputSource, !self.inputSourceBusy, self.inputSourceProtocol == .standard else {
+      completion(nil)
+      return
+    }
+    DisplayManager.shared.globalDDCQueue.async {
+      let valid = self.inputSourceSession.isValid && !self.readPrefAsBool(key: .forceSw)
+      var value: UInt16?
+      if valid {
+        if Arm64DDC.isArm64 {
+          value = Arm64DDC.read(service: self.arm64avService, command: 0x60, numOfRetryAttemps: 0)?.current
+        } else {
+          value = self.ddc?.read(command: 0x60, tries: 1)?.0
+        }
+      }
+      DispatchQueue.main.async {
+        completion(self.canControlInputSource && self.inputSourceProtocol == .standard ? value : nil)
+      }
+    }
+  }
+
   var ddc: IntelDDC?
   var arm64ddc: Bool = false
   var arm64avService: IOAVService?

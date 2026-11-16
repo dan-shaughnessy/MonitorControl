@@ -194,6 +194,16 @@ class MenuHandler: NSMenu, NSMenuDelegate {
       let title = NSLocalizedString("Brightness", comment: "Shown in menu")
       addedSliderHandlers.append(self.setupMenuSliderHandler(command: .brightness, display: display, title: title))
     }
+    if let otherDisplay = display as? OtherDisplay, !otherDisplay.isVirtual, !otherDisplay.isDummy, !otherDisplay.isSwOnly() {
+      let friendlyName = display.readPrefAsString(key: .friendlyName).isEmpty ? display.name : display.readPrefAsString(key: .friendlyName)
+      let inputTitle = NSLocalizedString("Input Source", comment: "Shown in menu")
+      let item = NSMenuItem(title: asSubMenu || numOfDisplays == 1 ? inputTitle : "\(friendlyName) — \(inputTitle)", action: nil, keyEquivalent: "")
+      item.submenu = InputSourceMenu(display: otherDisplay)
+      monitorSubMenu.insertItem(item, at: 0)
+      if prefs.integer(forKey: PrefKey.menuIcon.rawValue) == MenuIcon.sliderOnly.rawValue {
+        app.updateStatusItemVisibility(true)
+      }
+    }
     if prefs.integer(forKey: PrefKey.multiSliders.rawValue) != MultiSliders.combine.rawValue {
       self.addDisplayMenuBlock(addedSliderHandlers: addedSliderHandlers, blockName: display.readPrefAsString(key: .friendlyName) != "" ? display.readPrefAsString(key: .friendlyName) : display.name, monitorSubMenu: monitorSubMenu, numOfDisplays: numOfDisplays, asSubMenu: asSubMenu)
     }

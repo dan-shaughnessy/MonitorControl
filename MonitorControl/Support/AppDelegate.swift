@@ -134,7 +134,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
+  private func invalidateInputSourceSessions() {
+    for display in DisplayManager.shared.getOtherDisplays() {
+      display.inputSourceSession.invalidate()
+    }
+  }
+
   @objc func displayReconfigured() {
+    self.invalidateInputSourceSessions()
     DisplayManager.shared.resetSwBrightnessForAllDisplays(noPrefSave: true)
     CGDisplayRestoreColorSyncSettings()
     self.reconfigureID += 1
@@ -199,6 +206,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc private func sleepNotification() {
+    self.invalidateInputSourceSessions()
     self.sleepID += 1
     os_log("Sleeping with sleep %{public}@", type: .info, String(self.sleepID))
     self.updateMediaKeyTap()

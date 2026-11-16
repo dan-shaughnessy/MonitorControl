@@ -161,6 +161,9 @@ class DisplayManager {
   }
 
   func configureDisplays() {
+    for display in self.getOtherDisplays() {
+      display.inputSourceSession.invalidate()
+    }
     self.clearDisplays()
     var onlineDisplayIDs = [CGDirectDisplayID](repeating: 0, count: 16)
     var displayCount: UInt32 = 0

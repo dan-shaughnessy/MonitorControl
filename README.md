@@ -1,3 +1,5 @@
+> **Personal fork:** Adds a per-display DDC input selector with standard and LG alternate commands. See [usage, build instructions and verification limits](docs/input-source.md).
+
 <img src=".github/Icon-cropped.png" width="200" alt="App icon" align="left"/>
 
 <div>

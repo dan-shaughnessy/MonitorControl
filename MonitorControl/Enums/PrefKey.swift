@@ -122,6 +122,10 @@ enum PrefKey: String {
   /// Combined brightness switching point
   case combinedBrightnessSwitchingPoint
 
+  /// Input source protocol and last explicitly requested source (never restored on startup)
+  case inputSourceProtocol
+  case lastRequestedInputSource
+
   /// Friendly name
   case friendlyName
 
