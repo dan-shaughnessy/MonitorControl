@@ -51,7 +51,7 @@ class InputSourceMenu: NSMenu, NSMenuDelegate {
       item.target = self
       item.tag = option.rawValue
       item.state = inputProtocol == option ? .on : .off
-      item.isEnabled = !display.inputSourceBusy && !self.isReading
+      item.isEnabled = !display.inputSourceBusy && !self.isReading && (option != .lgUSB || display.supportsLGUSBInput)
     }
     let protocolItem = self.addItem(withTitle: NSLocalizedString("Input Protocol", comment: "Input source submenu"), action: nil, keyEquivalent: "")
     protocolItem.submenu = protocolMenu
@@ -70,8 +70,8 @@ class InputSourceMenu: NSMenu, NSMenuDelegate {
     }
     if display.inputSourceBusy {
       self.status = NSLocalizedString("Sending input command…", comment: "Input source status")
-    } else if display.inputSourceProtocol == .lgAlternate {
-      self.status = NSLocalizedString("LG alternate: input readback unavailable", comment: "Input source status")
+    } else if display.inputSourceProtocol != .standard {
+      self.status = NSLocalizedString("Input change unverified; readback unavailable", comment: "Input source status")
     } else if !self.isReading {
       self.isReading = true
       self.status = NSLocalizedString("Reading current input…", comment: "Input source status")
@@ -107,7 +107,7 @@ class InputSourceMenu: NSMenu, NSMenuDelegate {
       if !sent {
         let alert = NSAlert()
         alert.messageText = NSLocalizedString("Could not send input command", comment: "Input source error")
-        alert.informativeText = NSLocalizedString("Check the monitor connection and DDC settings. For compatible LG monitors, try Input Protocol → LG alternate. You can always use the monitor’s input buttons.", comment: "Input source error recovery")
+        alert.informativeText = NSLocalizedString("Check the monitor connection and DDC settings. For compatible LG monitors, try Input Protocol → LG alternate or LG USB. LG USB requires a matching USB control connection. You can always use the monitor’s input buttons.", comment: "Input source error recovery")
         alert.runModal()
       }
     }

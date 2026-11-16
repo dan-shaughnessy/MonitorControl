@@ -3,6 +3,22 @@ import Foundation
 @main
 struct InputSourceTests {
   static func main() {
+    let usbHDMI = DDCInputSource.lgUSBWriteReport(value: 0x90)
+    precondition(usbHDMI.count == 64)
+    precondition(Array(usbHDMI.prefix(15)) == [0x08, 0x01, 0x55, 0x03, 0x07, 0, 0x03, 0x37, 0x50, 0x04, 0x03, 0xF4, 0, 0x90, 0x5D])
+    precondition(usbHDMI.dropFirst(15).allSatisfy { $0 == 0 })
+    let usbReturn = DDCInputSource.lgUSBWriteReport(value: 0xD1)
+    precondition(usbReturn[9] == 0x04, "LG USB requires 0x04, not the video DDC length 0x84")
+    precondition(usbReturn[13] == 0xD1)
+    precondition(usbReturn[8 ... 14].reduce(0x6E, ^) == 0)
+    precondition(!LGUSBInputControl.matches(serialNumber: "", expectedSerialNumber: "", usagePage: 0xFF00))
+    precondition(!LGUSBInputControl.matches(serialNumber: "OTHER", expectedSerialNumber: "LG123", usagePage: 0xFF00))
+    precondition(!LGUSBInputControl.matches(serialNumber: "LG123", expectedSerialNumber: "LG123", usagePage: 0xFF01))
+    precondition(LGUSBInputControl.matches(serialNumber: "LG123", expectedSerialNumber: "LG123", usagePage: 0xFF00))
+    precondition(DDCInputSource.InputProtocol.resolve(savedValue: nil, usbAvailable: true) == .lgUSB)
+    precondition(DDCInputSource.InputProtocol.resolve(savedValue: nil, usbAvailable: false) == .standard)
+    precondition(DDCInputSource.InputProtocol.resolve(savedValue: 0, usbAvailable: true) == .standard)
+    precondition(DDCInputSource.InputProtocol.resolve(savedValue: 2, usbAvailable: false) == .lgUSB)
     let standard = DDCInputSource.InputProtocol.standard
     let lg = DDCInputSource.InputProtocol.lgAlternate
     precondition(standard.command == 0x60 && standard.sourceAddress == 0x51)

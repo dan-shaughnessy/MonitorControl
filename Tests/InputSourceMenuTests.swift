@@ -3,6 +3,7 @@ import AppKit
 // A display fake lets the real AppKit menu run without touching monitor hardware.
 final class OtherDisplay {
   var canControlInputSource = true
+  var supportsLGUSBInput = false
   var inputSourceBusy = false
   var inputSourceProtocol = DDCInputSource.InputProtocol.standard
   var lastRequest = ""
@@ -54,6 +55,17 @@ struct InputSourceMenuTests {
     let recreatedMenu = InputSourceMenu(display: display)
     precondition(recreatedMenu.item(withTitle: "DisplayPort 3 / USB-C") != nil)
     precondition(recreatedMenu.items.contains { $0.title == "Last requested: HDMI 2 (LG alternate)" })
+    precondition(recreatedMenu.item(withTitle: "Input Protocol")!.submenu!.item(withTitle: "LG USB")?.isEnabled == false)
+    display.supportsLGUSBInput = true
+    display.canControlInputSource = true
+    let usbMenu = InputSourceMenu(display: display)
+    let usbOption = usbMenu.item(withTitle: "Input Protocol")!.submenu!.item(withTitle: "LG USB")!
+    precondition(usbOption.isEnabled)
+    NSApp.sendAction(usbOption.action!, to: usbOption.target, from: usbOption)
+    precondition(display.inputSourceProtocol == .lgUSB)
+    let usbSource = usbMenu.item(withTitle: "USB-C")!
+    NSApp.sendAction(usbSource.action!, to: usbSource.target, from: usbSource)
+    precondition(display.requested?.value == 0xD1)
     print("Native input menu state, routing and persistence tests passed")
   }
 }

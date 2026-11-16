@@ -60,6 +60,7 @@
 		FE4E0896249D584C003A50BB /* OSDUtils.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE4E0895249D584C003A50BB /* OSDUtils.swift */; };
 		BA0000000000000000000002 /* DDCInputSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000001 /* DDCInputSource.swift */; };
 		BA0000000000000000000004 /* InputSourceMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000003 /* InputSourceMenu.swift */; };
+		BA0000000000000000000006 /* LGUSBInputControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000005 /* LGUSBInputControl.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -189,6 +190,7 @@
 		FE4E0895249D584C003A50BB /* OSDUtils.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OSDUtils.swift; sourceTree = "<group>"; };
 		BA0000000000000000000001 /* DDCInputSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DDCInputSource.swift; sourceTree = "<group>"; };
 		BA0000000000000000000003 /* InputSourceMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputSourceMenu.swift; sourceTree = "<group>"; };
+		BA0000000000000000000005 /* LGUSBInputControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LGUSBInputControl.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -319,6 +321,7 @@
 				AA78BDBC2709FE7B00CA8DF7 /* UpdaterDelegate.swift */,
 				AA99521826FE49A300612E07 /* MenuHandler.swift */,
 				BA0000000000000000000003 /* InputSourceMenu.swift */,
+				BA0000000000000000000005 /* LGUSBInputControl.swift */,
 				F01B068F228221B7008E64DB /* SliderHandler.swift */,
 				6C85EFD922C941B000227EA1 /* DisplayManager.swift */,
 				AA25F6D626E68C160087F3A2 /* MediaKeyTapManager.swift */,
@@ -640,6 +643,7 @@
 				FE4E0896249D584C003A50BB /* OSDUtils.swift in Sources */,
 				6CBFE27A23DB266000D1BC41 /* Display.swift in Sources */,
 				BA0000000000000000000004 /* InputSourceMenu.swift in Sources */,
+				BA0000000000000000000006 /* LGUSBInputControl.swift in Sources */,
 				BA0000000000000000000002 /* DDCInputSource.swift in Sources */,
 				CB0D15010000000000000001 /* KeyboardShortcuts.swift in Sources */,
 				AA44E70727038F7F00E06865 /* KeyboardShortcutsManager.swift in Sources */,

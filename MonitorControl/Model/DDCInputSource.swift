@@ -10,11 +10,18 @@ struct DDCInputSource: Equatable {
   enum InputProtocol: Int, CaseIterable {
     case standard = 0
     case lgAlternate = 1
+    case lgUSB = 2
+
+    static func resolve(savedValue: Int?, usbAvailable: Bool) -> InputProtocol {
+      if let savedValue = savedValue, let saved = InputProtocol(rawValue: savedValue) { return saved }
+      return usbAvailable ? .lgUSB : .standard
+    }
 
     var title: String {
       switch self {
       case .standard: return NSLocalizedString("Standard DDC", comment: "Input source protocol")
       case .lgAlternate: return NSLocalizedString("LG alternate", comment: "Input source protocol")
+      case .lgUSB: return NSLocalizedString("LG USB", comment: "Input source protocol")
       }
     }
 
@@ -26,6 +33,9 @@ struct DDCInputSource: Equatable {
       case .standard:
         return [DDCInputSource(title: "HDMI 1", value: 0x11), DDCInputSource(title: "HDMI 2", value: 0x12),
                 DDCInputSource(title: "DisplayPort 1", value: 0x0F), DDCInputSource(title: "DisplayPort 2 / USB-C", value: 0x10)]
+      case .lgUSB:
+        return [DDCInputSource(title: "HDMI 1", value: 0x90), DDCInputSource(title: "HDMI 2", value: 0x91),
+                DDCInputSource(title: "DisplayPort", value: 0xD0), DDCInputSource(title: "USB-C", value: 0xD1)]
       case .lgAlternate:
         return [DDCInputSource(title: "HDMI 1", value: 0x90), DDCInputSource(title: "HDMI 2", value: 0x91),
                 DDCInputSource(title: "DisplayPort 1", value: 0xD0), DDCInputSource(title: "DisplayPort 2 / USB-C", value: 0xD1),
@@ -38,6 +48,14 @@ struct DDCInputSource: Equatable {
   static func writePacket(command: UInt8, value: UInt16, sourceAddress: UInt8) -> [UInt8] {
     let bytes: [UInt8] = [sourceAddress, 0x84, 0x03, command, UInt8(value >> 8), UInt8(value & 0xFF)]
     return bytes + [bytes.reduce(0x6E, ^)]
+  }
+
+  /// LG's USB bridge requires a different protocol-class length byte than video DDC.
+  static func lgUSBWriteReport(value: UInt16) -> [UInt8] {
+    let bytes: [UInt8] = [0x50, 0x04, 0x03, 0xF4, UInt8(value >> 8), UInt8(value & 0xFF)]
+    let packet = bytes + [bytes.reduce(0x6E, ^)]
+    let report: [UInt8] = [0x08, 0x01, 0x55, 0x03, UInt8(packet.count), 0, 0x03, 0x37] + packet
+    return report + [UInt8](repeating: 0, count: 64 - report.count)
   }
 
   /// Reject unsupported, unrelated and malformed Get VCP replies, even with a valid checksum.

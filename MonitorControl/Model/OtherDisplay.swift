@@ -8,12 +8,16 @@ class OtherDisplay: Display {
   // Main-thread input state is separate from brightness restore/coalescing.
   let inputSourceSession = DDCInputSourceSession()
   var inputSourceBusy = false
+  var lgUSBInputControl: LGUSBInputControl?
+  var supportsLGUSBInput: Bool { self.lgUSBInputControl != nil }
   var inputSourceProtocol: DDCInputSource.InputProtocol {
-    DDCInputSource.InputProtocol(rawValue: self.readPrefAsInt(key: .inputSourceProtocol)) ?? .standard
+    DDCInputSource.InputProtocol.resolve(savedValue: self.prefExists(key: .inputSourceProtocol) ? self.readPrefAsInt(key: .inputSourceProtocol) : nil,
+                                         usbAvailable: self.supportsLGUSBInput)
   }
 
   var canControlInputSource: Bool {
-    self.inputSourceSession.isValid && !self.isSw() && !app.safeMode && app.sleepID == 0 && app.reconfigureID == 0
+    self.inputSourceSession.isValid && !self.readPrefAsBool(key: .forceSw)
+      && (self.inputSourceProtocol == .lgUSB ? self.supportsLGUSBInput : !self.isSw()) && !app.safeMode && app.sleepID == 0 && app.reconfigureID == 0
       && DisplayManager.shared.displays.contains(where: { $0 === self })
   }
 
@@ -29,7 +33,9 @@ class OtherDisplay: Display {
       let valid = self.inputSourceSession.isValid && !self.readPrefAsBool(key: .forceSw)
       var sent = false
       if valid {
-        if Arm64DDC.isArm64 {
+        if inputProtocol == .lgUSB {
+          sent = self.lgUSBInputControl?.write(value: source.value) ?? false
+        } else if Arm64DDC.isArm64 {
           sent = Arm64DDC.write(service: self.arm64avService, command: inputProtocol.command, value: source.value,
                                sourceAddress: inputProtocol.sourceAddress, numOfWriteCycles: 1, numOfRetryAttemps: 0)
         } else {

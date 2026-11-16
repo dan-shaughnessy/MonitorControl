@@ -194,7 +194,7 @@ class MenuHandler: NSMenu, NSMenuDelegate {
       let title = NSLocalizedString("Brightness", comment: "Shown in menu")
       addedSliderHandlers.append(self.setupMenuSliderHandler(command: .brightness, display: display, title: title))
     }
-    if let otherDisplay = display as? OtherDisplay, !otherDisplay.isVirtual, !otherDisplay.isDummy, !otherDisplay.isSwOnly() {
+    if let otherDisplay = display as? OtherDisplay, !otherDisplay.isVirtual, !otherDisplay.isDummy, (!otherDisplay.isSwOnly() || otherDisplay.supportsLGUSBInput) {
       let friendlyName = display.readPrefAsString(key: .friendlyName).isEmpty ? display.name : display.readPrefAsString(key: .friendlyName)
       let inputTitle = NSLocalizedString("Input Source", comment: "Shown in menu")
       let item = NSMenuItem(title: asSubMenu || numOfDisplays == 1 ? inputTitle : "\(friendlyName) — \(inputTitle)", action: nil, keyEquivalent: "")
