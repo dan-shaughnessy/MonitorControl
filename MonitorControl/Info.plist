@@ -19,17 +19,26 @@
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>7160</string>
+	<string>7170</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Play this Mac’s audio through both paired desk Macs.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Observe your selected Bluetooth devices to switch monitor inputs automatically. Key presses are never read.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_airplay._tcp</string>
+		<string>_raop._tcp</string>
+	</array>
 	<key>NSHumanReadableCopyright</key>
 	<string>MIT Licensed. 2017.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connect securely to the other desk Mac and its AirPlay receiver.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>SUEnableJavaScript</key>

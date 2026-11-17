@@ -1,0 +1,527 @@
+import Foundation
+import CAudioSyncCore
+
+/// A named set of speakers with a volume of its own; a speaker is in at most
+/// one zone (docs/ENGINE_SPEC.md S245). Stored under `speakerZones` as JSON.
+struct SpeakerZone: Codable, Equatable {
+    let id: String
+    var name: String
+    var members: [String]       // SpeakerKey values
+    /// The zone's slider position, 0…100.
+    var volume: Double
+    /// The name each member was last listed under (S286), by key; nil while
+    /// none is kept, which leaves it out of the stored JSON.
+    var memberNames: [String: String]? = nil
+
+    static let defaultVolume = 100.0
+
+    /// This zone without kept names for keys that aren't members, or blank ones.
+    func pruned() -> SpeakerZone {
+        var copy = self
+        let kept = memberNames?.filter { key, name in
+            members.contains(key) && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        copy.memberNames = kept?.isEmpty == false ? kept : nil
+        return copy
+    }
+
+    /// The name member `key` was last listed under, kept by the zone that holds it (S286).
+    static func storedName(of key: String, in zones: [SpeakerZone]) -> String? {
+        zones.first { $0.members.contains(key) }?.memberNames?[key]
+    }
+
+    /// The name member `key` shows before the user's own: `listed`, the one
+    /// it is listed under now, else the one its zone kept (S286), else empty.
+    static func systemName(of key: String, listed: String, in zones: [SpeakerZone]) -> String {
+        listed.isEmpty ? storedName(of: key, in: zones) ?? "" : listed
+    }
+
+    /// `zones` without their hidden members, so the web remote counts what
+    /// the zone header counts (S256).
+    static func withoutHidden(_ zones: [SpeakerZone], isHidden: (String) -> Bool) -> [SpeakerZone] {
+        zones.map { zone in
+            var shown = zone
+            shown.members.removeAll(where: isHidden)
+            return shown
+        }
+    }
+
+    /// `zones` keeping `listed`, the names members are listed under now, as
+    /// each member's last name (S286); a blank name keeps the last one.
+    static func remembering(_ listed: [String: String], in zones: [SpeakerZone]) -> [SpeakerZone] {
+        zones.map { zone in
+            var copy = zone
+            for key in zone.members {
+                guard let name = listed[key],
+                      !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                if copy.memberNames == nil { copy.memberNames = [:] }
+                copy.memberNames?[key] = name
+            }
+            return copy
+        }
+    }
+
+    /// Whether `a` and `b` differ in kept names only, which changes no volume.
+    static func differInNamesOnly(_ a: [SpeakerZone], _ b: [SpeakerZone]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { first, second in
+            var copy = first
+            copy.memberNames = second.memberNames
+            return copy == second
+        }
+    }
+
+    /// `zones` as S245 keeps them: a key already in an earlier zone, or
+    /// earlier in the same one, is left out, a repeated ID keeps the first
+    /// zone, an empty ID drops its zone, a blank name becomes the one a new
+    /// zone would get after the zones before it (S150) and that no later
+    /// stored zone is named, and volumes are clamped to 0…100. An empty zone stays.
+    static func normalized(_ zones: [SpeakerZone]) -> [SpeakerZone] {
+        var ids = Set<String>()
+        var taken = Set<String>()
+        var out: [SpeakerZone] = []
+        for (index, zone) in zones.enumerated() where !zone.id.isEmpty && ids.insert(zone.id).inserted {
+            var copy = zone
+            if GroupName.cleaned(zone.name) == nil {
+                copy.name = GroupName.forNewGroup(typed: "", existing: out.map(\.name),
+                                                  alsoTaken: zones.dropFirst(index + 1).map(\.name),
+                                                  numbered: UIStrings().numberedZone)
+            }
+            copy.members = zone.members.filter { taken.insert($0).inserted }
+            copy.volume = zone.volume.isFinite ? min(max(zone.volume, 0), 100) : defaultVolume
+            out.append(copy.pruned())
+        }
+        return out
+    }
+
+    /// The zone volume of a speaker in no zone (S249).
+    static let noZoneVolume = 100.0
+
+    /// The zone volume of speaker `key`: its zone's, 100 in no zone (S249).
+    static func volume(of key: String, in zones: [SpeakerZone]) -> Double {
+        zones.first { $0.members.contains(key) }?.volume ?? noZoneVolume
+    }
+
+    /// The zone volume of every speaker of `kind` in a zone, by the ID after
+    /// its key's prefix (S249); the first zone holding a key wins.
+    static func volumes(_ zones: [SpeakerZone], kind: SpeakerKey.Kind) -> [String: Double] {
+        var out: [String: Double] = [:]
+        for zone in zones {
+            for key in zone.members {
+                guard let (id, found) = SpeakerKey.parseAny(key), found == kind, out[id] == nil else { continue }
+                out[id] = zone.volume
+            }
+        }
+        return out
+    }
+
+    /// The IDs of `kind` whose zone volume differs between `old` and `new`, 100 in no zone (S290).
+    static func volumeChanged(_ old: [SpeakerZone], _ new: [SpeakerZone], kind: SpeakerKey.Kind) -> Set<String> {
+        let before = volumes(old, kind: kind)
+        let after = volumes(new, kind: kind)
+        return Set(before.keys).union(after.keys)
+            .filter { (before[$0] ?? noZoneVolume) != (after[$0] ?? noZoneVolume) }
+    }
+}
+
+// Read value by value, so one that can't be read is dropped or falls back on its own (S245, S286).
+extension SpeakerZone {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        do {
+            name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        } catch {
+            name = ""
+            StoredTrace.log(decoder, container.codingPath + [CodingKeys.name as CodingKey], "dropped")
+        }
+        members = try container.decodeLossyList(String.self, forKey: .members)
+        volume = container.decodeNumberOrNaN(forKey: .volume, of: decoder)
+        do {
+            let names = try container.decodeIfPresent([String: LossyDecoded<String>].self, forKey: .memberNames)
+            memberNames = names?.compactMapValues(\.value)
+        } catch {
+            memberNames = nil
+            StoredTrace.log(decoder, container.codingPath + [CodingKeys.memberNames as CodingKey], "dropped")
+        }
+    }
+}
+
+/// The one-time move of the saved groups to zones (S248).
+enum ZoneMigration {
+    /// The zones `groups` become: one per group in saved order, with its ID,
+    /// its name as it is and volume 100; a key an earlier zone holds is left
+    /// out of the later one (the core's `asc_zone_migration_keeps`). The same
+    /// groups always give the same zones.
+    static func zones(from groups: [SpeakerGroup]) -> [SpeakerZone] {
+        let keys = groups.flatMap(\.members)
+        var keep = [Bool](repeating: false, count: keys.count)
+        let copies = keys.map { strdup($0) }
+        defer { copies.forEach { free($0) } }
+        let pointers: [UnsafePointer<CChar>?] = copies.map { $0.map { UnsafePointer($0) } }
+        pointers.withUnsafeBufferPointer { list in
+            keep.withUnsafeMutableBufferPointer { out in
+                asc_zone_migration_keeps(list.baseAddress, keys.count, out.baseAddress)
+            }
+        }
+        var index = 0
+        return groups.map { group in
+            var members: [String] = []
+            for key in group.members {
+                if keep[index] { members.append(key) }
+                index += 1
+            }
+            return SpeakerZone(id: group.id, name: group.name, members: members, volume: SpeakerZone.defaultVolume)
+        }
+    }
+}
+
+/// Changes to the zones the windows make, each keeping a speaker in at most
+/// one zone (S245).
+enum ZoneEdit {
+    /// `zones` with `key` and its kept name in no zone; an emptied zone stays.
+    static func removing(_ key: String, from zones: [SpeakerZone]) -> [SpeakerZone] {
+        zones.map { zone in
+            var copy = zone
+            copy.members.removeAll { $0 == key }
+            return copy.pruned()
+        }
+    }
+
+    /// `zones` after Remove on Cast device `id` added by address: one that left the list leaves its zone too.
+    static func removingCast(_ id: String, offList: Bool, from zones: [SpeakerZone]) -> [SpeakerZone] {
+        offList ? removing(CastID.key(id), from: zones) : zones
+    }
+
+    /// `key` after the members of zone `id`, with its kept name, out of the
+    /// zone that held it. Nothing changes for a zone that isn't there.
+    static func moving(_ key: String, to id: String, in zones: [SpeakerZone]) -> [SpeakerZone] {
+        guard zones.contains(where: { $0.id == id }) else { return zones }
+        let name = SpeakerZone.storedName(of: key, in: zones)
+        var out = removing(key, from: zones)
+        if let index = out.firstIndex(where: { $0.id == id }) {
+            out[index].members.append(key)
+            if let name { out = SpeakerZone.remembering([key: name], in: out) }
+        }
+        return out
+    }
+
+    /// Zone `id` named `typed`, cleaned as a speaker name is; a blank name keeps the current one.
+    static func renaming(_ id: String, to typed: String, in zones: [SpeakerZone]) -> [SpeakerZone] {
+        guard let index = zones.firstIndex(where: { $0.id == id }) else { return zones }
+        var out = zones
+        out[index].name = GroupName.afterRename(typed: SpeakerNames.clean(typed), current: zones[index].name)
+        return out
+    }
+
+    /// `zones` with a new zone of `members` after them, at volume 100, named
+    /// `name` cleaned as a speaker name is; each member leaves the zone that held it.
+    static func adding(id: String, name: String, members: [String], to zones: [SpeakerZone]) -> [SpeakerZone] {
+        var out = zones
+        for key in members { out = removing(key, from: out) }
+        var seen = Set<String>()
+        out.append(SpeakerZone(id: id, name: SpeakerNames.clean(name), members: members.filter { seen.insert($0).inserted },
+                               volume: SpeakerZone.defaultVolume))
+        return out
+    }
+
+    /// Use <target> Instead (S247): in zone `id`, `target` takes the place of
+    /// the first of `members` (the speakers that play as part of it) and the
+    /// rest of them leave; `target` leaves any other zone.
+    static func usingTarget(_ target: String, for members: Set<String>, in id: String,
+                            zones: [SpeakerZone]) -> [SpeakerZone] {
+        guard let index = zones.firstIndex(where: { $0.id == id }),
+              let first = zones[index].members.firstIndex(where: members.contains) else { return zones }
+        var out = zones
+        out[index].members[first] = target
+        out[index].members = out[index].members.enumerated().filter { offset, key in
+            offset == first || (key != target && !members.contains(key))
+        }.map(\.element)
+        for other in out.indices where other != index { out[other].members.removeAll { $0 == target } }
+        return out.map { $0.pruned() }
+    }
+}
+
+/// New Zone from Active Speakers (S245): `onKeys` gives the speakers that are
+/// on, in the windows' order, and `askName` runs the name prompt.
+enum NewZoneFromActive {
+    enum Outcome: Equatable {
+        case needsSpeakers
+        case cancelled
+        case create(name: String, members: [String])
+    }
+
+    static func run(onKeys: () -> [String], askName: () -> String?) -> Outcome {
+        guard !onKeys().isEmpty else { return .needsSpeakers }
+        guard let typed = askName() else { return .cancelled }
+        // Read again: a phone or an unplug can turn a speaker off while the prompt is open.
+        let members = onKeys()
+        return members.isEmpty ? .needsSpeakers : .create(name: typed, members: members)
+    }
+}
+
+/// A zone member as a click on its zone sees it (S246, S247).
+struct ZoneMemberFacts: Equatable {
+    enum Kind: Equatable { case local, airplay, airplay2, cast }
+    var kind: Kind
+    /// Listed now and not hidden.
+    var listed: Bool
+    var on: Bool
+    /// A Cast speaker that can't start now.
+    var busy = false
+    /// A stereo pair or home theater target while AirPlay 2 is off.
+    var needsAirPlay2 = false
+    /// Plays as part of a stereo pair or home theater target now.
+    var inTarget = false
+
+    /// `needsAirPlay2` for a member: a hidden target is found, so it gets the hidden reason (S252).
+    static func airPlay2Missing(target: Bool, found: Bool, airPlay2On: Bool) -> Bool {
+        target && !found && !airPlay2On
+    }
+}
+
+/// The core's plan for a click on a zone (`asc_zone_click_plan`).
+enum ZoneClick {
+    enum Action: Equatable { case nothing, turnOn, start, turnOff }
+    enum Step: Equatable {
+        case absent, needsAirPlay2, inTarget, on, waiting, off
+        case castAnotherPlays, castOneAtATime, castBusy
+    }
+
+    /// Whether a click with `step` on a Cast member that is off drops its saved-on mark (C112):
+    /// it switches the zone off or passes the member over, never when it turns it on.
+    static func dropsSavedOn(_ step: Step, turningOn: Bool) -> Bool {
+        !turningOn || step == .castAnotherPlays || step == .castOneAtATime
+    }
+
+    static func plan(_ members: [ZoneMemberFacts], streaming: Bool, castOnElsewhere: Bool,
+                     airPlay2PlayingElsewhere: Bool) -> (action: Action, steps: [Step]) {
+        let raw = members.map { member in
+            AscZoneMember(kind: code(member.kind), listed: member.listed, on: member.on, busy: member.busy,
+                          needs_airplay2: member.needsAirPlay2, in_target: member.inTarget)
+        }
+        var steps = [UInt32](repeating: 0, count: members.count)
+        let action = raw.withUnsafeBufferPointer { list in
+            steps.withUnsafeMutableBufferPointer { out in
+                asc_zone_click_plan(list.baseAddress, list.count, streaming, castOnElsewhere,
+                                    airPlay2PlayingElsewhere, out.baseAddress)
+            }
+        }
+        return (Self.action(action), steps.map(step))
+    }
+
+    private static func code(_ kind: ZoneMemberFacts.Kind) -> UInt32 {
+        switch kind {
+        case .local: return UInt32(ASC_ZONE_MEMBER_LOCAL)
+        case .airplay: return UInt32(ASC_ZONE_MEMBER_AIRPLAY)
+        case .airplay2: return UInt32(ASC_ZONE_MEMBER_AIRPLAY2)
+        case .cast: return UInt32(ASC_ZONE_MEMBER_CAST)
+        }
+    }
+
+    private static func action(_ code: UInt32) -> Action {
+        switch code {
+        case UInt32(ASC_ZONE_CLICK_TURN_ON): return .turnOn
+        case UInt32(ASC_ZONE_CLICK_START): return .start
+        case UInt32(ASC_ZONE_CLICK_TURN_OFF): return .turnOff
+        default: return .nothing
+        }
+    }
+
+    private static func step(_ code: UInt32) -> Step {
+        switch code {
+        case UInt32(ASC_ZONE_STEP_NEEDS_AIRPLAY2): return .needsAirPlay2
+        case UInt32(ASC_ZONE_STEP_IN_TARGET): return .inTarget
+        case UInt32(ASC_ZONE_STEP_ON): return .on
+        case UInt32(ASC_ZONE_STEP_WAITING): return .waiting
+        case UInt32(ASC_ZONE_STEP_OFF): return .off
+        case UInt32(ASC_ZONE_STEP_CAST_ANOTHER_PLAYS): return .castAnotherPlays
+        case UInt32(ASC_ZONE_STEP_CAST_ONE_AT_A_TIME): return .castOneAtATime
+        case UInt32(ASC_ZONE_STEP_CAST_BUSY): return .castBusy
+        default: return .absent
+        }
+    }
+}
+
+/// How the windows show the zones: the speakers in no zone, and a zone
+/// header's count.
+enum ZoneLayout {
+    /// `speakers` without the ones whose key is in a zone, order kept.
+    static func zoneless<T>(_ speakers: [T], key: (T) -> String, zoned: Set<String>) -> [T] {
+        speakers.filter { !zoned.contains(key($0)) }
+    }
+
+    /// The speakers of `speakers` whose key is in a zone, order kept: their
+    /// compact rows follow the section's full rows.
+    static func zoned<T>(_ speakers: [T], key: (T) -> String, zoned: Set<String>) -> [T] {
+        speakers.filter { zoned.contains(key($0)) }
+    }
+
+    /// H11: the speaker whose switch takes the focus once `hidden`'s row in
+    /// `section` goes: the next row's, else the previous row's. `zone` lists
+    /// the shown members of `hidden`'s zone in zone order, empty for none.
+    static func focusAfterHiding<T>(_ hidden: String, in section: [T], zone: [T] = [], key: (T) -> String,
+                                    zoned: Set<String>) -> T? {
+        if let at = zone.firstIndex(where: { key($0) == hidden }), zone.count > 1 {
+            return at + 1 < zone.count ? zone[at + 1] : zone[at - 1]
+        }
+        // A zone member's full row sits under its zone, maybe collapsed, so
+        // the focus passes only among the speakers in no zone.
+        let rows = section.filter { !zoned.contains(key($0)) || key($0) == hidden }
+        guard let at = rows.firstIndex(where: { key($0) == hidden }) else { return nil }
+        return at + 1 < rows.count ? rows[at + 1] : (at > 0 ? rows[at - 1] : nil)
+    }
+
+    /// Whether the note and the Add by address button under a section's rows
+    /// each get a separator above them. The zone box has its own edge, so a
+    /// full-width line right under it would run past its rounded corners.
+    static func linesBelowRows(zoneBox: Bool, note: Bool, castAdd: Bool) -> (note: Bool, castAdd: Bool) {
+        (note && !zoneBox, castAdd && (note || !zoneBox))
+    }
+
+    struct ZoneGroup<T>: Identifiable {
+        let zone: String
+        let rows: [T]
+        var id: String { zone }
+    }
+
+    /// The compact rows split into one group box per zone, zones in the order
+    /// of their first row, rows in their own order. A row whose zone is gone
+    /// is left out.
+    static func byZone<T>(_ speakers: [T], zone: (T) -> String?) -> [ZoneGroup<T>] {
+        var order: [String] = []
+        var rows: [String: [T]] = [:]
+        for speaker in speakers {
+            guard let id = zone(speaker) else { continue }
+            if rows[id] == nil { order.append(id) }
+            rows[id, default: []].append(speaker)
+        }
+        return order.map { ZoneGroup(zone: $0, rows: rows[$0] ?? []) }
+    }
+
+    /// A zone member as Only This Speaker sees it.
+    struct Member {
+        let key: String
+        let listed, on, cast: Bool
+        /// A Cast speaker offline or taken over by another app: it can't start now.
+        var busy = false
+    }
+
+    /// The switches Only This Speaker makes for member `key`, in order: it
+    /// comes on unless it is, and every other listed member that is on goes
+    /// off. Another Cast member goes off before it comes on, since one Cast
+    /// speaker plays at a time; the rest after, so streaming never stops in
+    /// between. Nobody leaves the zone. A Cast member that can't start now
+    /// switches nothing: the others would go off for nothing.
+    static func onlyThis(_ key: String, members: [Member]) -> [(key: String, on: Bool)] {
+        guard let this = members.first(where: { $0.key == key }), this.listed else { return [] }
+        if this.cast && this.busy && !this.on { return [] }
+        let others = members.filter { $0.key != key && $0.listed && $0.on }
+        var steps: [(key: String, on: Bool)] = []
+        if !this.on && !this.cast { steps.append((key: key, on: true)) }
+        for member in others where member.cast { steps.append((key: member.key, on: false)) }
+        if !this.on && this.cast { steps.append((key: key, on: true)) }
+        for member in others where !member.cast { steps.append((key: member.key, on: false)) }
+        return steps
+    }
+
+    /// A zone header's count, `total` being its members that aren't hidden
+    /// (rows and count agree): "No speakers", "None of 3 found" while none is
+    /// present, else "2 of 3 on" with ", 1 waiting" when one waits.
+    /// `inPair`: the members that play as part of a stereo pair.
+    static func count(on: Int, waiting: Int, present: Int, total: Int, inPair: Int = 0, text: UIStrings) -> String {
+        if total == 0 { return text.zoneEmpty }
+        if present == 0 { return inPair == total ? text.zonePlayingInPair(total) : text.zoneNoneHere(total) }
+        return text.zoneCount(on: on, of: total) + (waiting > 0 ? text.zoneWaiting(waiting) : "")
+    }
+
+    /// The note a zone header shows while it plays and every present member
+    /// that is on waits: `note`, its first waiting member's row note; nil
+    /// while one of them still plays (S246).
+    static func waitNote(state: SpeakerState, on: Int, waiting: Int, note: String?) -> String? {
+        state == .playing && on > 0 && waiting == on ? note : nil
+    }
+
+    /// What the menu bar panel shows after a zone's name: its count, as the
+    /// main window's header reads it, then its wait note (S359).
+    static func panelCaption(count: String, waitNote: String?, text: UIStrings) -> String {
+        count + (waitNote.map(text.zoneWaitNote) ?? "")
+    }
+
+    /// The menu bar panel's rows for `zones`: a header each, plus the members
+    /// of every zone not in `collapsed`.
+    static func panelRows<Z>(_ zones: [Z], id: (Z) -> String, members: (Z) -> Int,
+                             collapsed: Set<String>) -> Int {
+        zones.reduce(0) { $0 + 1 + (collapsed.contains(id($1)) ? 0 : members($1)) }
+    }
+
+    /// The member rows a zone shows: none while it is folded.
+    static func shownMembers<M>(_ members: [M], folded: Bool) -> [M] {
+        folded ? [] : members
+    }
+}
+
+/// What a click on each part of a zone's header does, in the main window and
+/// in the menu bar panel (which has no count line, slider or menu).
+/// Folding never switches the zone: only its round icon does, and the slider
+/// and the options menu keep their clicks to themselves. While none of the
+/// zone's speakers is present, the greyed icon folds, as on Windows.
+enum ZoneHeaderHit {
+    enum Area: CaseIterable {
+        case chevron, name, count, blank, zoneIcon, slider, menu
+    }
+
+    enum Action: Equatable {
+        case fold, toggleZone, none
+    }
+
+    static func action(for area: Area, nonePresent: Bool = false) -> Action {
+        switch area {
+        case .chevron, .name, .count, .blank: return .fold
+        case .zoneIcon: return nonePresent ? .fold : .toggleZone
+        case .slider, .menu: return .none
+        }
+    }
+
+    /// Where Go to Zone puts the keyboard focus: the round icon, or the arrow
+    /// while none of the zone's speakers is present and VoiceOver skips the icon.
+    static func goToZoneFocus(nonePresent: Bool) -> Area {
+        nonePresent ? .chevron : .zoneIcon
+    }
+
+    /// Whether an arrow key on the header folds or unfolds the zone: Right
+    /// unfolds a folded zone, Left folds an unfolded one, as on Windows.
+    /// Otherwise the key passes on.
+    static func arrowFolds(right: Bool, expanded: Bool) -> Bool {
+        right != expanded
+    }
+}
+
+/// How the main window draws zone members: one tinted box around a zone's
+/// rows, and the In zones label and the separators on the name column.
+enum ZoneLook {
+    /// A full row's switch; a compact row's smaller badge sits in a column
+    /// this wide, so every name starts at `nameColumn`.
+    static let badgeColumn: CGFloat = 32
+    static let badgeGap: CGFloat = 12
+    static let nameColumn = BrandTokens.Spacing.rowPaddingX + badgeColumn + badgeGap
+
+    static let compactBadge: CGFloat = 24
+    static let compactPaddingY: CGFloat = 6
+    static var compactRowHeight: CGFloat { compactBadge + 2 * compactPaddingY }
+
+    static let groupFill = 0.05
+    static let groupBorder = 0.35
+    static let groupBorderWidth: CGFloat = 0.5
+    static let groupRadius = BrandTokens.Radius.row
+    /// Between two zones' boxes in one section.
+    static let groupGap: CGFloat = 4
+
+    static let labelTop: CGFloat = 9
+    static let labelBottom: CGFloat = 5
+    static let labelLineGap: CGFloat = 8
+
+    /// The Go to Zone chip after a compact row's name.
+    static let chipHeight: CGFloat = 18
+    static let chipPaddingX: CGFloat = 7
+    static let chipFill = 0.12
+}

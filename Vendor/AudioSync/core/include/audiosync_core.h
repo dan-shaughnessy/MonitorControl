@@ -1,0 +1,2678 @@
+/*
+ * audiosync_core.h: the C interface of audiosync-core, AudioSync's
+ * platform-independent audio core.
+ *
+ * Copyright (C) 2026 Yasser Sutojoyo Kusumo
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Audio crosses this interface one whole buffer at a time: a pointer to
+ * interleaved stereo float32 frames (L, R) plus a frame count, never one
+ * sample per call. The core owns no thread, device or file: the host
+ * captures, plays and runs every thread, and calls in here.
+ * The exceptions are AudioSync's own AirPlay and Google Cast senders
+ * (asc_airplay_*, asc_cast_*) and its web remote (asc_remote_*), which run
+ * their own threads and network sockets.
+ *
+ * Real-time calls (marked "Real-time safe") never allocate, free, lock, wait,
+ * log or make a system call, and never panic: bad arguments make them do
+ * nothing or saturate.
+ *
+ * Threads. Each handle lists which thread runs which call:
+ * - an audio call (capture thread or output thread) runs on one thread at a
+ *   time per handle;
+ * - a control call runs on one control thread at a time per handle, and may
+ *   run while that handle's audio call runs;
+ * - an "any thread" call is a lock-free atomic operation and may run anywhere,
+ *   at any time, while the handle lives;
+ * - a destroy call runs once no other call on that handle can run.
+ * Handles that share audio (a ring and its writer and readers) are
+ * reference-counted inside, so they may be destroyed in any order. Functions
+ * without a handle are thread-safe.
+ *
+ * Pointers. A handle argument may be NULL, which makes the call do nothing
+ * and return false, 0, NULL or an all-zero struct, unless its comment says
+ * otherwise. A buffer argument points to the stated number of aligned, valid
+ * elements that nothing else touches during the call, and the buffers of one
+ * call don't overlap. A buffer may be NULL when that number is 0, and a NULL
+ * buffer with a nonzero count makes the call do nothing.
+ *
+ * This header is written by hand; a test in core/src/ffi.rs fails when it no
+ * longer matches the Rust definitions.
+ */
+
+#ifndef AUDIOSYNC_CORE_H
+#define AUDIOSYNC_CORE_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Version of this interface; asc_abi_version() returns the library's. */
+#define ASC_ABI_VERSION 1
+
+/* Number of equalizer bands. */
+#define ASC_EQ_BANDS 10
+
+/* Number of equalizer presets. */
+#define ASC_EQ_PRESETS 12
+
+/* Most AirPlay 2 speakers that play at once. */
+#define ASC_AIRPLAY2_SESSIONS 16
+
+/* The ring's safety margin M in frames: no ring holds fewer than twice this. */
+#define ASC_RING_MARGIN_FRAMES 8192
+
+/* Smallest ring capacity in frames (twice the margin). */
+#define ASC_RING_MIN_FRAMES 16384
+
+/* Largest ring capacity in frames: 24 s at 384 kHz. */
+#define ASC_RING_MAX_FRAMES 9216000
+
+/* How a read re-positioned its reader (AscReadReport.correction). */
+#define ASC_CORRECTION_NONE 0         /* the block follows the previous one */
+#define ASC_CORRECTION_PRIME 1        /* first anchor, or the first after a prime reset */
+#define ASC_CORRECTION_RESYNC 2       /* a requested resync, e.g. a delay change */
+#define ASC_CORRECTION_SKIP_FORWARD 3 /* behind by more than the tolerance */
+#define ASC_CORRECTION_OVERRUN 4      /* the frames it needed were overwritten */
+#define ASC_CORRECTION_STEP_BACK 5    /* ahead by more than the tolerance */
+
+/* What an AirPlay receiver event reports (AscAirPlayReceiver.event). */
+#define ASC_AIRPLAY_APPEARED 1 /* discovery found a receiver */
+#define ASC_AIRPLAY_CHANGED 2  /* its records or its verdict changed */
+#define ASC_AIRPLAY_GONE 3     /* it left the network, or discovery stopped */
+
+/* Whether a receiver can play from this sender (AscAirPlayReceiver.availability). */
+#define ASC_AIRPLAY_AVAILABLE 0      /* it can */
+#define ASC_AIRPLAY_NEEDS_PIN 1      /* it asks for a PIN once: an Apple TV, or a receiver reached over AirPlay 2 */
+#define ASC_AIRPLAY_NEEDS_PASSWORD 2 /* it asks for a password */
+#define ASC_AIRPLAY_NEEDS_PAIRING 3  /* it likely needs another kind of pairing */
+#define ASC_AIRPLAY_AIRPLAY2_ONLY 4  /* only AirPlay 2 could serve it, and that path is off */
+#define ASC_AIRPLAY_UNSUPPORTED 5    /* the sender can't drive it; .unsupported says why */
+
+/* Why a receiver can't play (AscAirPlayReceiver.unsupported). */
+#define ASC_AIRPLAY_REASON_NONE 0          /* none: it can, or another reason */
+#define ASC_AIRPLAY_REASON_ENCRYPTION 1    /* no encryption mode the sender supports */
+#define ASC_AIRPLAY_REASON_CODEC 2         /* no codec the sender may use */
+#define ASC_AIRPLAY_REASON_TRANSPORT 3     /* no UDP transport */
+#define ASC_AIRPLAY_REASON_METHODS 4       /* no ANNOUNCE, SETUP or RECORD */
+#define ASC_AIRPLAY_REASON_FORMAT 5        /* not 44 100 Hz, 16-bit stereo */
+#define ASC_AIRPLAY_REASON_AIRPLAY2_ONLY 6 /* only AirPlay 2 could serve it */
+#define ASC_AIRPLAY_REASON_TIMING 7        /* it refused NTP timing, and PTP can't take its place */
+#define ASC_AIRPLAY_REASON_TOO_MANY_AIRPLAY2 8  /* ASC_AIRPLAY2_SESSIONS AirPlay 2 sessions run; it waits and starts when one ends for good */
+#define ASC_AIRPLAY_REASON_PLAYS_THROUGH_SPEAKERS 9 /* an Apple TV whose home theater group plays, or the group of one that plays alone */
+#define ASC_AIRPLAY_REASON_PTP_OTHER_NETWORK 10 /* it takes only PTP, which runs for another network; it waits until PTP is free */
+
+/* What discovery saw (AscAirPlayReceiver.flags), bit by bit. */
+#define ASC_AIRPLAY_FLAG_RAOP 1            /* announces _raop._tcp (AirPlay 1 audio) */
+#define ASC_AIRPLAY_FLAG_AIRPLAY 2         /* announces _airplay._tcp */
+#define ASC_AIRPLAY_FLAG_APPLE_TV 4        /* its model is an Apple TV */
+#define ASC_AIRPLAY_FLAG_PASSWORD 8        /* its records say it needs a password */
+#define ASC_AIRPLAY_FLAG_PAIRING 16        /* its flags hint that it needs pairing */
+#define ASC_AIRPLAY_FLAG_LEGACY_PAIRING 32 /* an Apple TV that needs the PIN pairing */
+#define ASC_AIRPLAY_FLAG_BUSY 64           /* its flags hint that another sender plays */
+#define ASC_AIRPLAY_FLAG_AIRPLAY2 128      /* it lists AirPlay 2 features */
+#define ASC_AIRPLAY_FLAG_OVER_AIRPLAY2 256 /* the AirPlay 2 switch is on and the sender reaches it over AirPlay 2 */
+#define ASC_AIRPLAY_FLAG_PAIRED 512        /* credentials are kept for it, and no answer turned them down this run */
+#define ASC_AIRPLAY_FLAG_TARGET 1024       /* a stereo pair or home theater group, added like a speaker; only with the AirPlay 2 switch on */
+#define ASC_AIRPLAY_FLAG_INCOMPLETE 2048   /* a target with a member out of view, playing nothing, or reporting its partner unreachable */
+#define ASC_AIRPLAY_FLAG_CODE_EVERY_TIME 4096 /* reached over AirPlay 2, it asks for a code every time it connects; auto-connect leaves it off */
+#define ASC_AIRPLAY_FLAG_CREDENTIALS_KEPT 8192 /* credentials are stored for it, turned down or not, which asc_airplay_forget_pairing drops */
+#define ASC_AIRPLAY_FLAG_CREDENTIALS_TURNED_DOWN 16384 /* an answer turned its stored credentials down this run; asc_airplay_credentials_turned_down hands that to a new handle */
+
+/* What a sender event reports (AscAirPlayEvent.kind). */
+#define ASC_AIRPLAY_EVENT_STATE 1    /* a speaker's state changed: .state */
+#define ASC_AIRPLAY_EVENT_ERROR 2    /* an error ended a speaker's session: .error */
+#define ASC_AIRPLAY_EVENT_LATENCY 3  /* a speaker's latencies: .latency_ms, .receiver_latency_us and _sources, .receiver_latency_frames */
+#define ASC_AIRPLAY_EVENT_TIMELINE 4 /* the base latency L or the timeline changed: .latency_ms */
+#define ASC_AIRPLAY_EVENT_FAILED 5   /* the sender or its discovery stopped working (a bug); destroy it, create a new one; .detail where a panic was, or "" */
+#define ASC_AIRPLAY_EVENT_PIN_NEEDED 6      /* a pairing's Apple TV shows a PIN: ask the user, then asc_airplay_submit_pin */
+#define ASC_AIRPLAY_EVENT_PASSWORD_NEEDED 7 /* a pairing needs the password (.error PASSWORD_REQUIRED) or got a wrong one (WRONG_PASSWORD, forgotten) */
+#define ASC_AIRPLAY_EVENT_PAIRING_FAILED 8  /* a pairing ended without credentials: .error (WRONG_PIN, NOT_RESPONDING, ...) */
+#define ASC_AIRPLAY_EVENT_PAIRED 9          /* paired, credentials stored; .detail "" or why they last this run only; with .error ASC_AIRPLAY_PAIRED_FOR_SESSION paired for this session only, nothing stored */
+#define ASC_AIRPLAY_EVENT_VOLUME 10         /* its volume was changed on the speaker itself: .volume, the slider position that plays at it */
+#define ASC_AIRPLAY_EVENT_WARNING 11        /* something to show; the session goes on: .warning, .detail for a debug log */
+#define ASC_AIRPLAY_EVENT_TRACE 12          /* a debug log line about a speaker's session (.detail), only with AUDIOSYNC_DEBUG=1 */
+#define ASC_AIRPLAY_EVENT_REMOTE 13         /* a speaker's remote asked for .remote: send it through the now-playing control */
+#define ASC_AIRPLAY_EVENT_LATENCY_HELD 14   /* an Lf set while a speaker sounds is held (.latency_ms, the held L) until the stream is empty or restarts */
+#define ASC_AIRPLAY_EVENT_STORED 15         /* a PIN pairing whose verify failed stored its credentials; the PAIRING_FAILED that follows ends it: .detail "" or why they last this run only */
+
+/* A PAIRED event's .error. */
+#define ASC_AIRPLAY_PAIRED_FOR_SESSION 1 /* paired for this session only: nothing stored or written, it asks for a code every time */
+
+/* AscAirPlayEvent.remote: the transport control a speaker's remote asked for */
+#define ASC_AIRPLAY_REMOTE_PLAY_PAUSE 1
+#define ASC_AIRPLAY_REMOTE_NEXT 2
+#define ASC_AIRPLAY_REMOTE_PREVIOUS 3
+
+/* asc_airplay_set_playback: what the app the now-playing control follows does */
+#define ASC_AIRPLAY_PLAYBACK_UNKNOWN 0
+#define ASC_AIRPLAY_PLAYBACK_PLAYING 1
+#define ASC_AIRPLAY_PLAYBACK_PAUSED 2
+
+/* Which reports gave a speaker's latency (AscAirPlayEvent.receiver_latency_sources bits). */
+#define ASC_AIRPLAY_LATENCY_SOURCE_AUDIO_LATENCY 1     /* Audio-Latency of a RECORD answer */
+#define ASC_AIRPLAY_LATENCY_SOURCE_AUDIO_LATENCIES 2   /* audioLatencies of /info */
+#define ASC_AIRPLAY_LATENCY_SOURCE_ARRIVAL_TO_RENDER 4 /* arrivalToRenderLatencyMs of the stream SETUP answer */
+
+/* What a warning reports (AscAirPlayEvent.warning). */
+#define ASC_AIRPLAY_WARNING_JACK_DISCONNECTED 1          /* nothing is plugged into its audio jack */
+#define ASC_AIRPLAY_WARNING_AUTH_SETUP_FAILED 2          /* POST /auth-setup failed */
+#define ASC_AIRPLAY_WARNING_REQUEST_FAILED 3             /* a volume, metadata, flush or keep-alive request failed */
+/* 4 is retired: a receiver signature that fails its check is ASC_AIRPLAY_ERROR_RECEIVER_UNVERIFIED. */
+#define ASC_AIRPLAY_WARNING_PTP_PORTS_TAKEN 5            /* PTP port 319 or 320 can't be bound: receivers that need PTP can't play; once per sender */
+#define ASC_AIRPLAY_WARNING_PTP_OUTSIDE_FAMILY 6         /* it has no address in the PTP service's family and plays on NTP */
+#define ASC_AIRPLAY_WARNING_VOLUME_READS_STOPPED 7       /* three volume reads in a row failed on an AirPlay 2 session: it isn't asked again */
+#define ASC_AIRPLAY_WARNING_ARTWORK_REFUSED 8            /* an artwork image was refused or unanswered: the small one or none follows; once per session */
+#define ASC_AIRPLAY_WARNING_REMOTE_CONTROL_UNAVAILABLE 9 /* no remote control port could be bound for the session: its remote buttons do nothing */
+#define ASC_AIRPLAY_WARNING_REMOTE_CONTROL_NOT_ADVERTISED 10 /* the remote control's _dacp._tcp record couldn't be registered */
+#define ASC_AIRPLAY_WARNING_LATENCY_SHORTFALL 11         /* its reported latency needs more than the sounding stream's Lf; it plays at that Lf; .detail names both */
+#define ASC_AIRPLAY_WARNING_PTP_FREE 12                  /* a session bound the PTP ports after PTP_PORTS_TAKEN: they are free again, and a later clash is reported anew */
+#define ASC_AIRPLAY_WARNING_PEERS_UPDATE_REFUSED 13      /* a SETPEERS update was refused or unanswered; it plays on; once per session */
+#define ASC_AIRPLAY_WARNING_GRANDMASTER_OUTRANKED 14     /* it announced a clock ranked ahead of AudioSync's and may not follow it; once per session */
+
+/* A speaker's state (AscAirPlayEvent.state). */
+#define ASC_AIRPLAY_STATE_CONNECTING 1 /* a session is starting */
+#define ASC_AIRPLAY_STATE_PLAYING 2    /* it plays the shared timeline */
+#define ASC_AIRPLAY_STATE_RETRYING 3   /* its session failed; the next starts in .retry_ms */
+#define ASC_AIRPLAY_STATE_FAILED 4     /* its session failed and needs the user; no retry */
+#define ASC_AIRPLAY_STATE_STOPPED 5    /* removed, or the sender shut down */
+#define ASC_AIRPLAY_STATE_UNANNOUNCED 6 /* it stopped announcing itself; a session starts once it is listed able to play; not a failure */
+
+/* What to tell the user about an error that ended a session (AscAirPlayEvent.error). */
+#define ASC_AIRPLAY_ERROR_NOT_RESPONDING 1    /* the speaker didn't answer */
+#define ASC_AIRPLAY_ERROR_CONNECTION_LOST 2   /* the connection died while playing */
+#define ASC_AIRPLAY_ERROR_BUSY 3              /* another sender seems to play to it */
+#define ASC_AIRPLAY_ERROR_REFUSED 4           /* it turned the session down */
+#define ASC_AIRPLAY_ERROR_INCOMPATIBLE 5      /* it answered in a way the sender doesn't understand */
+#define ASC_AIRPLAY_ERROR_PASSWORD_REQUIRED 6 /* it needs a password and none was given */
+#define ASC_AIRPLAY_ERROR_WRONG_PASSWORD 7    /* it rejected the password */
+#define ASC_AIRPLAY_ERROR_PAIRING_REQUIRED 8  /* it needs pairing, or rejected or cancelled it */
+#define ASC_AIRPLAY_ERROR_UNSUPPORTED 9       /* the sender can't drive it; .unsupported says why */
+#define ASC_AIRPLAY_ERROR_WRONG_PIN 10        /* a pairing's Apple TV turned the PIN down; a new pairing shows a PIN again */
+#define ASC_AIRPLAY_ERROR_RECEIVER_UNVERIFIED 11 /* a paired speaker didn't prove it is the one paired; not connected, its credentials stay */
+
+/* What asc_airplay_open_pairings returns when the store holds nothing it found. */
+#define ASC_AIRPLAY_PAIRINGS_FAILED -1  /* NULL or dead handle, or NULL, empty or non-UTF-8 path */
+#define ASC_AIRPLAY_PAIRINGS_IGNORED -2 /* not in the expected format: ignored and replaced by the next pairing */
+#define ASC_AIRPLAY_PAIRINGS_NEWER -3   /* a newer AudioSync wrote it: ignored and left as it is */
+#define ASC_AIRPLAY_PAIRINGS_UNREADABLE -4 /* it can't be read: ignored and left as it is */
+
+/* How private asc_airplay_pairings_access and asc_airplay_airplay2_identity_access found a file. */
+#define ASC_AIRPLAY_FILE_UNREAD -1     /* NULL or dead handle, the identity file with AirPlay 2 off, or a file not read: another account owns it, it isn't a regular file, or opening it failed */
+#define ASC_AIRPLAY_FILE_PRIVATE 0     /* only its owner could read or write it, or there was none */
+#define ASC_AIRPLAY_FILE_TIGHTENED 1   /* other accounts could read or write it; it is owner-only now */
+#define ASC_AIRPLAY_FILE_STILL_OPEN 2  /* other accounts can read or write it; its mode couldn't be changed */
+
+/* What asc_airplay_forget_pairing returns. */
+#define ASC_AIRPLAY_FORGET_NOT_PAIRED 0 /* it wasn't paired, or a NULL or dead handle or a NULL id */
+#define ASC_AIRPLAY_FORGET_FORGOTTEN 1  /* forgotten, and its files written */
+#define ASC_AIRPLAY_FORGET_UNWRITTEN 2  /* forgotten for this handle, but a file couldn't be written: the next launch may find it again */
+
+/* The largest hold-back asc_airplay_set_hold_back applies, in ms: the sender's limit on a speaker's delay. */
+#define ASC_AIRPLAY_MAX_DELAY_MS 20000
+
+/* The rate of every Cast stream; the Cast input resamples the capture to it. */
+#define ASC_CAST_RATE 48000
+
+/* What a Cast device change reports (AscCastDevice.event). */
+#define ASC_CAST_APPEARED 1 /* discovery found it, or the host added it by address */
+#define ASC_CAST_CHANGED 2  /* its records changed, or it went offline during a session */
+#define ASC_CAST_GONE 3     /* it left the list */
+
+/* What a Cast device is (AscCastDevice.flags), bit by bit. */
+#define ASC_CAST_FLAG_GROUP 1   /* a Cast group: plays as one device, with its own volume and offset */
+#define ASC_CAST_FLAG_OFFLINE 2 /* its records went away while a session with it runs */
+#define ASC_CAST_FLAG_MANUAL 4  /* added by address; no browse has found its id yet */
+#define ASC_CAST_FLAG_OFFSET_MOVED 8 /* on the APPEARED with a former id: the re-key moved its offset here */
+
+/* Why asc_cast_start refused (its *refused). */
+#define ASC_CAST_REFUSED_NONE 0    /* it didn't */
+#define ASC_CAST_REFUSED_BUSY 1    /* another Cast device plays or starts: one at a time */
+#define ASC_CAST_REFUSED_UNKNOWN 2 /* the id is not a listed device */
+#define ASC_CAST_REFUSED_GROUP 3   /* no longer reported: a Cast group starts like a device */
+#define ASC_CAST_REFUSED_CLOSED 4  /* NULL or dead handle */
+#define ASC_CAST_REFUSED_INVALID 5 /* NULL or non-UTF-8 id */
+
+/* What a Cast event reports (AscCastEvent.kind). */
+#define ASC_CAST_EVENT_STARTED 1           /* the device plays the stream: .format */
+#define ASC_CAST_EVENT_ENDED 2             /* the attempt is over, its last event: .reason, and .error when it failed */
+#define ASC_CAST_EVENT_PLAYING 3           /* the device reports PLAYING */
+#define ASC_CAST_EVENT_CONNECT_FAILED 4    /* a connect attempt failed: .error, the next in .retry_ms */
+#define ASC_CAST_EVENT_RECOVERING 5        /* the channel failed and the sender reconnects */
+#define ASC_CAST_EVENT_RECOVERED 6         /* the session carries on: .relaunched */
+#define ASC_CAST_EVENT_RELOADED 7          /* the device saw the stream end; it was loaded again */
+#define ASC_CAST_EVENT_REBUFFERING 8       /* the receiver ran dry */
+#define ASC_CAST_EVENT_FORMAT_FALLBACK 9   /* the device refused WAV; .format is loaded instead */
+#define ASC_CAST_EVENT_VOLUME 10           /* the device's volume: .level, .has_level, .muted, .volume_fixed, .step */
+#define ASC_CAST_EVENT_DIAGNOSTICS 11      /* once a second while playing: .drift_ms, .queued_ms, .underrun_frames, .resync_offered */
+#define ASC_CAST_EVENT_STREAM 12           /* the stream server's log line in .detail */
+#define ASC_CAST_EVENT_COMMAND_FAILED 13   /* a volume, artwork or Resync request failed: .error */
+#define ASC_CAST_EVENT_MEMORY_CHANGED 14   /* store asc_cast_memory_json */
+#define ASC_CAST_EVENT_DISCOVERY_STOPPED 15 /* discovery's mDNS daemon ended; its devices were reported gone */
+#define ASC_CAST_EVENT_FAILED 16           /* the sender stopped working (a bug); destroy it, create a new one; .detail where a panic was, or "" */
+#define ASC_CAST_EVENT_MEMBERS 17          /* the playing group's members changed: asc_cast_member_count, asc_cast_member */
+#define ASC_CAST_EVENT_GROUP_LOG 18        /* a line about a Cast group for the debug log in .detail */
+#define ASC_CAST_EVENT_CERTIFICATE_CHANGED 19 /* the device's certificate changed since its last connect: "<before> to <after>" in .detail, for the debug log */
+#define ASC_CAST_EVENT_VOLUME_UNANSWERED 20 /* a level asked for that no status will answer, once per ask: .level, .ask */
+#define ASC_CAST_EVENT_PAUSED 21           /* someone paused the device itself; PLAYING follows once its next play loaded the stream again */
+#define ASC_CAST_EVENT_LOG 22              /* a line for the debug log in .detail: the certificates or device keys file couldn't be read or written, or a device authentication line */
+#define ASC_CAST_EVENT_UNAUTHENTICATED 23  /* the device didn't prove it's a genuine Cast device and plays anyway: warn once; .detail is the debug log line */
+
+/* How a Cast attempt ended (AscCastEvent.reason). */
+#define ASC_CAST_END_STOPPED 1     /* the sender's own teardown */
+#define ASC_CAST_END_TAKEN_OVER 2  /* someone else stopped or replaced the app or the stream */
+#define ASC_CAST_END_DESELECTED 3  /* stopped before it started */
+#define ASC_CAST_END_FAILED 4      /* a failure the session could not recover from: .error */
+
+/* Why something Cast failed (AscCastEvent.error). */
+#define ASC_CAST_ERROR_NONE 0
+#define ASC_CAST_ERROR_CONNECT 1      /* no TCP connection, a TLS failure, or no status in time */
+#define ASC_CAST_ERROR_LAUNCH 2       /* the Default Media Receiver did not launch */
+#define ASC_CAST_ERROR_MEDIA 3        /* the device refused or stopped the stream */
+#define ASC_CAST_ERROR_NO_FETCH 4     /* the device never fetched the stream: name a firewall as the likely cause */
+#define ASC_CAST_ERROR_STREAM 5       /* the stream server could not start */
+#define ASC_CAST_ERROR_NO_SESSION 6   /* no session runs */
+#define ASC_CAST_ERROR_VOLUME_FIXED 7 /* the device's volume is locked */
+#define ASC_CAST_ERROR_VOLUME 8       /* the device was not ready, or has no volume step */
+#define ASC_CAST_ERROR_ARTWORK 9      /* artwork that is not PNG or JPEG, or over 1280 by 720 */
+#define ASC_CAST_ERROR_GROUP 10       /* no longer reported: a Cast group plays like a device */
+#define ASC_CAST_ERROR_INTERNAL 11    /* a fault inside the sender; the next start runs (C107) */
+#define ASC_CAST_ERROR_NO_ADDRESS 12  /* no address to try: a group waits for its records (C81), a single device counts toward the give-up (C80) */
+#define ASC_CAST_ERROR_REFUSED 13     /* the device failed device authentication: turn it off, no retry (C130) */
+
+/* A Cast stream's format (AscCastEvent.format). */
+#define ASC_CAST_FORMAT_WAV 1
+#define ASC_CAST_FORMAT_FLAC 2
+
+/* What an output device's own volume and mute mean for its row (AscDeviceVolumeDecision.decision). */
+#define ASC_DEVICE_VOLUME_UNKNOWN 0       /* neither part is known: no hint */
+#define ASC_DEVICE_VOLUME_FINE 1          /* not muted, not low: no hint */
+#define ASC_DEVICE_VOLUME_LOW 2           /* the volume is 25 % or less */
+#define ASC_DEVICE_VOLUME_MUTED 3         /* muted, at a volume that isn't low or isn't known */
+#define ASC_DEVICE_VOLUME_MUTED_AND_LOW 4 /* muted, and 25 % or less too */
+
+/* What asc_calibration_estimate found (AscCalibration.status). */
+#define ASC_CALIBRATION_ACCEPTED 0       /* offset_ms is the new offset */
+#define ASC_CALIBRATION_TOO_SHORT 1      /* under the signal plus 100 ms, or the signal isn't the rate's */
+#define ASC_CALIBRATION_TOO_LONG 2       /* over 2^21 frames */
+#define ASC_CALIBRATION_CLIPPED 3        /* 3 samples in a row at 0.99 or more, or one not finite */
+#define ASC_CALIBRATION_TOO_QUIET 4      /* no peak 12 times over the noise floor */
+#define ASC_CALIBRATION_AMBIGUOUS_ECHO 5 /* another lag over 0.7 of the peak away from the arrival, or an earlier arrival over 0.9 of it */
+#define ASC_CALIBRATION_IMPLAUSIBLE 6    /* a difference over 22 000 ms */
+#define ASC_CALIBRATION_DISAGREE 7       /* asc_calibration_estimate_agreed only: all accepted, differences over 5 ms apart */
+
+/* The runs asc_calibration_estimate_agreed takes. */
+#define ASC_CALIBRATION_SWEEPS 3
+
+/* Which recording a refusal concerns (AscCalibration.recording). */
+#define ASC_CALIBRATION_RECORDING_NONE 0      /* accepted, or a refusal about the pair */
+#define ASC_CALIBRATION_RECORDING_REFERENCE 1 /* the reference's recording */
+#define ASC_CALIBRATION_RECORDING_CHOSEN 2    /* the chosen output's recording */
+
+/* How a speaker's delay is kept (AscCalibrationSpeaker.kind). */
+#define ASC_CALIBRATION_KIND_LOCAL 0   /* a local output's offset, -2000...+20 000 ms */
+#define ASC_CALIBRATION_KIND_CAST 1    /* a Cast speaker's measured offset, kept to 0...20 000 ms (the sender stores up to 120 000) */
+#define ASC_CALIBRATION_KIND_AIRPLAY 2 /* the one AirPlay delay as shown, 0...20 000 ms */
+
+/* What the sheet says about a speaker (AscCalibrationRow.state). */
+#define ASC_CALIBRATION_ROW_REFERENCE 0    /* the reference, never measured */
+#define ASC_CALIBRATION_ROW_NOT_MEASURED 1 /* the run ended before its turn */
+#define ASC_CALIBRATION_ROW_CERTAIN 2      /* new_ms applies */
+#define ASC_CALIBRATION_ROW_UNCERTAIN 3    /* uncertainty over 10 ms: shown, never applied */
+#define ASC_CALIBRATION_ROW_REFUSED 4      /* a sweep was refused: reason and recording say why */
+
+/* What the shared AirPlay delay comes to (AscCalibrationAirPlay.state). */
+#define ASC_CALIBRATION_AIRPLAY_NONE_CERTAIN 0 /* no AirPlay row is certain: the delay stays */
+#define ASC_CALIBRATION_AIRPLAY_CERTAIN 1      /* the median applies */
+#define ASC_CALIBRATION_AIRPLAY_SPREAD 2       /* the median applies, but the speakers differ by spread_ms, over 10 ms */
+
+/* Why a run or a sheet ended (asc_calibration_run_cancel, asc_calibration_sheet_ended). */
+#define ASC_CALIBRATION_END_NONE 0             /* it goes on */
+#define ASC_CALIBRATION_END_CANCELLED 1        /* the user cancelled */
+#define ASC_CALIBRATION_END_SPEAKERS_CHANGED 2 /* the speaker list changed */
+#define ASC_CALIBRATION_END_SPEAKER_OFF 3      /* a speaker taking part was turned off */
+#define ASC_CALIBRATION_END_SOURCE_CHANGED 4   /* the source was switched */
+
+/* What asc_calibration_sheet_apply answers. */
+#define ASC_CALIBRATION_APPLY_OK 0              /* the changes were written */
+#define ASC_CALIBRATION_APPLY_ENDED 1           /* the sheet ended: nothing to apply */
+#define ASC_CALIBRATION_APPLY_NOTHING_CERTAIN 2 /* no row is certain */
+#define ASC_CALIBRATION_APPLY_TOO_MANY 3        /* more changes than capacity: *count says how many */
+#define ASC_CALIBRATION_APPLY_INVALID 4         /* a NULL argument */
+#define ASC_CALIBRATION_APPLY_ALREADY_APPLIED 5 /* the sheet was applied once */
+
+/* What asc_source_quit_decide answers. */
+#define ASC_SOURCE_QUIT_KEEP 0             /* nothing changes */
+#define ASC_SOURCE_QUIT_STOP 1             /* stop, post the "source" notice, drop a pending rebuild */
+#define ASC_SOURCE_QUIT_SWITCH_TO_SYSTEM 2 /* go on with whole-system audio, store it, post the notice */
+
+/* Whether streaming is on when an app quits (asc_source_quit_decide's streaming). */
+#define ASC_STREAMING_OFF 0        /* no session runs */
+#define ASC_STREAMING_RUNNING 1    /* a session runs */
+#define ASC_STREAMING_REBUILDING 2 /* a session is being rebuilt (a capture format change): counts as on */
+
+/* A zone member's kind (AscZoneMember.kind). */
+#define ASC_ZONE_MEMBER_LOCAL 0    /* a local output */
+#define ASC_ZONE_MEMBER_AIRPLAY 1  /* an AirPlay speaker on AirPlay 1 */
+#define ASC_ZONE_MEMBER_AIRPLAY2 2 /* an AirPlay speaker or target on AirPlay 2: one plays at a time (P169) */
+#define ASC_ZONE_MEMBER_CAST 3     /* a Google Cast speaker or Cast group */
+
+/* What asc_zone_click_plan answers for the zone. */
+#define ASC_ZONE_CLICK_NOTHING 0  /* no member counts: nothing changes */
+#define ASC_ZONE_CLICK_TURN_ON 1  /* members go on; streaming is on */
+#define ASC_ZONE_CLICK_START 2    /* members go on, and streaming starts */
+#define ASC_ZONE_CLICK_TURN_OFF 3 /* every counted member goes off */
+
+/* What asc_zone_click_plan writes for each member. */
+#define ASC_ZONE_STEP_ABSENT 0             /* not listed, or hidden: left alone */
+#define ASC_ZONE_STEP_NEEDS_AIRPLAY2 1     /* a pair or theater target while AirPlay 2 is off: left alone */
+#define ASC_ZONE_STEP_IN_TARGET 2          /* plays as part of a target: left alone */
+#define ASC_ZONE_STEP_ON 3                 /* switched on, or stays on */
+#define ASC_ZONE_STEP_WAITING 4            /* switched on, waiting for the sender (S285) */
+#define ASC_ZONE_STEP_OFF 5                /* switched off, or stays off */
+#define ASC_ZONE_STEP_CAST_ANOTHER_PLAYS 6 /* a Cast member left off: a Cast speaker outside the zone is on */
+#define ASC_ZONE_STEP_CAST_ONE_AT_A_TIME 7 /* a Cast member left off: another Cast member plays */
+#define ASC_ZONE_STEP_CAST_BUSY 8          /* a Cast member left off: it can't start now */
+
+/* What asc_preset_recall_plan answers for the recall. */
+#define ASC_PRESET_RECALL_NOTHING 0 /* no stored member can go on: nothing changes, post the notice */
+#define ASC_PRESET_RECALL_APPLY 1   /* carry the plan out; streaming is on */
+#define ASC_PRESET_RECALL_START 2   /* carry the plan out, and start streaming */
+
+/* What asc_preset_recall_plan writes for each stored member. */
+#define ASC_PRESET_STEP_ON 0             /* switched on, or stays on */
+#define ASC_PRESET_STEP_WAITING 1        /* switched on, waiting for the sender (S285) */
+#define ASC_PRESET_STEP_NOT_FOUND 2      /* left off: no speaker with its key is listed */
+#define ASC_PRESET_STEP_HIDDEN 3         /* left off: hidden */
+#define ASC_PRESET_STEP_NEEDS_AIRPLAY2 4 /* left off: a pair or theater target while AirPlay 2 is off */
+#define ASC_PRESET_STEP_IN_TARGET 5      /* left off: plays as part of a target */
+#define ASC_PRESET_STEP_BUSY 6           /* left off: a Cast speaker that can't start now */
+#define ASC_PRESET_STEP_IGNORED 7        /* a Cast key after the first: left alone, not in the notice */
+#define ASC_PRESET_STEP_OFFLINE 8        /* left off: a Cast speaker not found on the network now */
+
+/* The port the web remote listens on unless its configuration names another (unassigned at IANA). */
+#define ASC_REMOTE_DEFAULT_PORT 7655
+
+/* Why asc_remote_start returned NULL. */
+#define ASC_REMOTE_ERROR_NONE 0        /* it didn't */
+#define ASC_REMOTE_ERROR_CONFIG 1      /* the configuration doesn't read, or the callback is NULL */
+#define ASC_REMOTE_ERROR_PORT_IN_USE 2 /* another program listens on the port: offer another */
+#define ASC_REMOTE_ERROR_LISTEN 3      /* no address could be listened on for another reason */
+#define ASC_REMOTE_ERROR_RANDOM 4      /* no randomness for the pairing code */
+#define ASC_REMOTE_ERROR_FAILED 5      /* a panic while starting */
+
+/* ---- Version and volume ------------------------------------------------- */
+
+/* The crate version, for example "0.1.0" (static string, never freed). */
+const char *asc_version(void);
+
+/* The interface version the library implements; compare with ASC_ABI_VERSION. */
+uint32_t asc_abi_version(void);
+
+/* Linear gain of a volume slider position 0...100: (p / 100)^3, clamped. */
+double asc_volume_gain(double position);
+
+/* Volume slider position of a linear gain 0...1: 100 * cbrt(g), clamped. */
+double asc_volume_position(double gain);
+
+/* A local output's linear gain: asc_volume_gain(local) * asc_volume_gain(master). */
+double asc_output_gain(double local_position, double master_position);
+
+/* A local output's linear gain through its zone (100 outside a zone):
+ * asc_volume_gain(local) * asc_volume_gain(zone) * asc_volume_gain(master);
+ * at zone 100 bit-identical to asc_output_gain. */
+double asc_zone_output_gain(double local_position, double zone_position, double master_position);
+
+/* An AirPlay speaker's device level D, 0 to 100: min(100, own x k), with
+ * k = zone as a fraction (zone 100 outside a zone); the master never enters
+ * it (S413). The own volume is stored unrounded and may pass 100 (S290). */
+double asc_airplay_device_level(double own_position, double zone_position);
+
+/* The whole number an AirPlay row shows for device level D: D rounded down. */
+double asc_airplay_row_level(double device_level);
+
+/* An AirPlay row moved to `row`: writes the own volume to store, row / k
+ * unrounded and possibly above 100, and the device level to send, the row
+ * itself. False, writing nothing, when the zone is 0,
+ * row isn't finite or a pointer is NULL. */
+bool asc_airplay_row_move(double row, double zone_position, double *own_position, double *device_level);
+
+/*
+ * Multiplies frames x 2 interleaved samples by gain, in place. Gain 0 (or a
+ * negative or non-finite gain) gives exact zeros; any NaN or infinity in the
+ * result becomes 0. Real-time safe.
+ */
+void asc_apply_gain(float *interleaved, size_t frames, float gain);
+
+/* ---- Equalizer ---------------------------------------------------------- */
+
+/* Number of equalizer bands (ASC_EQ_BANDS). */
+size_t asc_eq_band_count(void);
+
+/* Center frequency of a band in Hz, ascending from band 0; 0 for a bad index. */
+double asc_eq_band_center_hz(size_t band);
+
+/* Number of presets (ASC_EQ_PRESETS). */
+size_t asc_eq_preset_count(void);
+
+/* Identifier of a preset in menu order, for example "bassBoost"; NULL for a bad index. */
+const char *asc_eq_preset_id(size_t preset);
+
+/* Writes a preset's ASC_EQ_BANDS band gains (dB) to gains_db; false for a bad index. */
+bool asc_eq_preset_gains(size_t preset, double *gains_db);
+
+/* Whether two saved-curve names are one name: equal ignoring case, with no
+ * Unicode normalization; false for NULL. */
+bool asc_eq_same_curve_name(const char *a, const char *b);
+
+/*
+ * An equalizer. asc_eq_process runs on the capture thread; every other
+ * asc_eq_* call is a control call.
+ */
+typedef struct AscEqualizer AscEqualizer;
+
+/*
+ * Creates an equalizer, disabled and flat, designed for sample_rate (Hz).
+ * Returns NULL when the rate is not finite and positive.
+ */
+AscEqualizer *asc_eq_create(double sample_rate);
+
+/* Destroys an equalizer. */
+void asc_eq_destroy(AscEqualizer *eq);
+
+/*
+ * Control thread: publishes new settings (gains_db holds ASC_EQ_BANDS values),
+ * taking effect at the next processed block, all at once. Non-finite values
+ * count as 0 dB. Returns false when eq or gains_db is NULL.
+ */
+bool asc_eq_set_settings(AscEqualizer *eq, bool enabled, double preamp_db, const double *gains_db);
+
+/*
+ * Control thread, while capture is stopped: sets the design rate (Hz),
+ * recomputing the filters and clearing their state; the same rate again does
+ * nothing. Returns false for a NULL handle or a rate that isn't finite and positive.
+ */
+bool asc_eq_set_sample_rate(AscEqualizer *eq, double sample_rate);
+
+/* Capture thread: equalizes frames x 2 interleaved samples in place. Real-time safe. */
+void asc_eq_process(AscEqualizer *eq, float *interleaved, size_t frames);
+
+/* Control thread: how often a channel produced NaN or infinity and was reset. */
+uint64_t asc_eq_nan_resets(const AscEqualizer *eq);
+
+/*
+ * Control thread: a local output's linear gain with the equalizer's headroom
+ * cut given back as far as unity allows (S26, S71). The dB given back goes to
+ * returned_db when it isn't NULL. A NULL eq gives gain unchanged.
+ */
+double asc_eq_returned_gain(const AscEqualizer *eq, double gain, double *returned_db);
+
+/* ---- Delay ring, writer and readers ------------------------------------- */
+
+/*
+ * The shared delay ring: interleaved stereo float32 frames at the capture
+ * rate, written by one writer and read by any number of readers, each at its
+ * own delay. Its query calls run on any thread.
+ */
+typedef struct AscRing AscRing;
+
+/*
+ * The ring's single writer. asc_ring_write runs on the capture thread;
+ * asc_ring_writer_reset runs on the control thread while capture is stopped.
+ */
+typedef struct AscRingWriter AscRingWriter;
+
+/*
+ * A delay reader bound to one ring, one per local output. The read calls run
+ * on that output's IO thread; every other asc_reader_* call runs on any thread.
+ */
+typedef struct AscReader AscReader;
+
+/* What one read did. */
+typedef struct AscReadReport {
+    size_t frames;       /* frames written to dst */
+    int64_t written;     /* frames written to the ring when the read started (W) */
+    int64_t delay;       /* the effective delay applied, in frames */
+    int64_t error;       /* how far behind (positive) or ahead (negative) the reader was */
+    int64_t start;       /* ring index of the block's first frame */
+    int64_t lag;         /* the published lag: W minus the next frame to read */
+    int32_t correction;  /* an ASC_CORRECTION_* code */
+    size_t masked;       /* leading frames of silence: already played, gone, before the stream,
+                            or a whole block while the reader waits to anchor */
+    size_t copied;       /* frames copied from the ring */
+    size_t starved;      /* trailing frames of silence: the ring had nothing newer */
+    bool rejected;       /* the writer overtook the copy, which became silence */
+} AscReadReport;
+
+/* A reader's diagnostic counters: monotonic, read without blocking the reader. */
+typedef struct AscReaderCounters {
+    uint64_t primes;                /* anchors because the reader was not anchored */
+    uint64_t resyncs;               /* anchors that applied a requested resync */
+    uint64_t drift_skips;           /* skip-forward corrections (behind, or overrun) */
+    uint64_t drift_skip_frames;     /* frames those corrections skipped */
+    uint64_t drift_silences;        /* step-back corrections (ahead) */
+    uint64_t drift_silence_frames;  /* frames of silence those corrections inserted */
+    uint64_t starved_renders;       /* reads that reached the newest frame before the block was full */
+    uint64_t starved_frames;        /* frames of silence those reads ended with */
+    uint64_t rejected_copies;       /* copies the writer overtook */
+} AscReaderCounters;
+
+/* Ring capacity in frames for 24 s at capture rate `rate`; 0 outside 8000...384000 Hz. */
+size_t asc_ring_capacity_for_rate(uint32_t rate);
+
+/*
+ * Creates an empty ring of capacity_frames frames. Returns NULL outside
+ * ASC_RING_MIN_FRAMES...ASC_RING_MAX_FRAMES.
+ */
+AscRing *asc_ring_create(size_t capacity_frames);
+
+/* Destroys a ring handle; its writer and readers keep the frames alive. */
+void asc_ring_destroy(AscRing *ring);
+
+/* The capacity in frames. */
+size_t asc_ring_capacity(const AscRing *ring);
+
+/* Whether the ring holds 24 s at capture rate `rate`, which also lies in 8000...384000 Hz. */
+bool asc_ring_supports_rate(const AscRing *ring, uint32_t rate);
+
+/* Any thread: frames written since the last reset (the session's frames captured). */
+uint64_t asc_ring_frames_written(const AscRing *ring);
+
+/*
+ * Any thread: the largest sample magnitude written since the last call (1 is
+ * full scale; non-finite samples don't count), for one level meter polling at
+ * its own pace; 0 for NULL.
+ */
+float asc_ring_take_peak(const AscRing *ring);
+
+/* How often the UI polls asc_ring_take_peak for the input level meter, in ms. */
+#define ASC_METER_POLL_MS 100
+
+/*
+ * The input level meter's length, 0 to 1, after a poll that took `peak` while
+ * it showed `previous`: the peak on a dB scale from -60 to 0 dBFS, or the
+ * previous length less 0.15 when that is longer. Non-finite values count as
+ * silence. Pure function for the UI thread.
+ */
+float asc_meter_level(float previous, float peak);
+
+/*
+ * The input level meter's length as a screen reader reads it: whole percent
+ * in steps of 10, so the value changes a few times per word instead of at every
+ * poll. A non-finite length counts as 0. Pure function.
+ */
+uint32_t asc_meter_spoken_percent(float level);
+
+/*
+ * Any thread: the session lead of the ring's renderers in capture frames, into
+ * *frames, once every counted renderer has published its start lead (S208).
+ * False, writing nothing, before that, while none counts, or for a NULL
+ * argument. For the debug log.
+ */
+bool asc_ring_session_lead_frames(const AscRing *ring, int64_t *frames);
+
+/* Takes the ring's only writer; NULL while another writer exists. */
+AscRingWriter *asc_ring_writer_create(AscRing *ring);
+
+/* Destroys the writer, so the ring can hand out a new one. */
+void asc_ring_writer_destroy(AscRingWriter *writer);
+
+/*
+ * Capture thread: appends `frames` stereo frames as one block, stamped with
+ * the time of the call on the core's monotonic clock, so a converting output
+ * can follow the capture's clock (S207). Any count is accepted; once the ring
+ * is full the oldest frames are overwritten, and a write larger than the ring
+ * keeps only its last frames. Never waits for readers. Real-time safe.
+ */
+void asc_ring_write(AscRingWriter *writer, const float *interleaved, size_t frames);
+
+/*
+ * Control thread, at a session start: makes all history unreadable and
+ * restarts the frame count at 0. Call it only while no capture callback runs
+ * and no reader of the ring exists.
+ */
+void asc_ring_writer_reset(AscRingWriter *writer);
+
+/*
+ * Creates a reader of `ring` for a session captured at capture_rate (Hz). Its
+ * delay starts at 0 (one block) and its drift tolerance at 50 ms; it anchors
+ * on its first read that finds more than its delay written, and reads silence
+ * until then. Returns NULL outside 8000...384000 Hz, or for a capture_rate
+ * whose 24 s the ring can't hold (asc_ring_supports_rate).
+ */
+AscReader *asc_reader_create(AscRing *ring, uint32_t capture_rate);
+
+/* Destroys a reader. */
+void asc_reader_destroy(AscReader *reader);
+
+/*
+ * Output thread: fills dst with exactly `frames` stereo frames, read at the
+ * delay set by asc_reader_set_delay_frames. Steady state plays every frame
+ * once, in order; a delay change is exact; drift is corrected outside the
+ * tolerance; silence fills what the ring can't give, and no frame plays twice
+ * (until a prime reset). A reader that has played everything a stopped writer
+ * wrote makes no correction, and a delay change waits for the writer's next
+ * frames. A read of 0 frames does nothing: a pending resync or prime reset
+ * waits for the next read, and the report is all zeros. report may be NULL.
+ * Real-time safe.
+ */
+void asc_reader_read(AscReader *reader, float *dst, size_t frames, AscReadReport *report);
+
+/*
+ * Output thread: as asc_reader_read, at delay_frames with tolerance_frames
+ * given by the caller instead of the stored ones. Real-time safe.
+ */
+void asc_reader_read_at(AscReader *reader, float *dst, size_t frames, int64_t delay_frames,
+                        int64_t tolerance_frames, AscReadReport *report);
+
+/* Any thread: sets the target delay in frames (negative counts as 0) and requests a resync. */
+void asc_reader_set_delay_frames(AscReader *reader, int64_t frames);
+
+/* Any thread: the target delay in frames. */
+int64_t asc_reader_delay_frames(const AscReader *reader);
+
+/* Any thread: sets the drift tolerance in frames (negative counts as 0). */
+void asc_reader_set_tolerance_frames(AscReader *reader, int64_t frames);
+
+/* Any thread: the drift tolerance in frames. */
+int64_t asc_reader_tolerance_frames(const AscReader *reader);
+
+/* Any thread: asks the reader to re-anchor at the target delay, on its next read with unread frames. */
+void asc_reader_request_resync(AscReader *reader);
+
+/*
+ * Any thread: asks the next read to start over like a new reader (it anchors
+ * once more than its delay is written, and counts a prime); the counters are
+ * kept.
+ */
+void asc_reader_reset_prime(AscReader *reader);
+
+/* Any thread: the lag published by the last read, in frames (delay minus one block when steady). */
+int64_t asc_reader_lag_frames(const AscReader *reader);
+
+/* Any thread: a snapshot of the counters; fields may come from different reads. */
+AscReaderCounters asc_reader_counters(const AscReader *reader);
+
+/* ---- Rate conversion and the output stage ------------------------------- */
+
+/*
+ * A streaming stereo resampler that carries its phase across blocks, e.g.
+ * from the capture rate to an output device's rate. All calls on one
+ * resampler run on one thread at a time.
+ */
+typedef struct AscResampler AscResampler;
+
+/* What one asc_resampler_process call consumed and produced. */
+typedef struct AscResampleCount {
+    size_t input_frames;   /* input frames consumed */
+    size_t output_frames;  /* output frames produced */
+} AscResampleCount;
+
+/*
+ * The output stage of one local output: channel mapping and gain. The gain
+ * calls run on any thread; the apply and render calls run on the output thread.
+ */
+typedef struct AscGainStage AscGainStage;
+
+/*
+ * Creates a resampler; NULL unless both rates lie in 8000...384000 Hz. Equal
+ * rates pass samples through unchanged.
+ */
+AscResampler *asc_resampler_create(uint32_t input_rate, uint32_t output_rate);
+
+/* Destroys a resampler. */
+void asc_resampler_destroy(AscResampler *resampler);
+
+/* Changes the input rate and starts a new stream; false for an unsupported rate. Never allocates. */
+bool asc_resampler_set_input_rate(AscResampler *resampler, uint32_t input_rate);
+
+/* Starts a new stream: clears the history and the phase. Real-time safe. */
+void asc_resampler_reset(AscResampler *resampler);
+
+/* The content delay in input frames (0 when passing through). Real-time safe. */
+size_t asc_resampler_latency_frames(const AscResampler *resampler);
+
+/*
+ * Input frames still needed before the next output_frames output frames can
+ * be produced, so the output thread can size each reader request from the
+ * converter's needs; saturates at SIZE_MAX. Real-time safe.
+ */
+size_t asc_resampler_input_frames_for(const AscResampler *resampler, size_t output_frames);
+
+/*
+ * Converts input_frames stereo frames into at most output_frames stereo
+ * frames. Consumes input until it runs out or the output is full; call again
+ * with the rest. When the rates differ, non-finite input becomes silence and
+ * clears the history. Equal rates pass every sample through unchanged, NaN
+ * and infinity included; the output stage deals with those. Real-time safe.
+ */
+AscResampleCount asc_resampler_process(AscResampler *resampler, const float *input, size_t input_frames,
+                                       float *output, size_t output_frames);
+
+/* Creates an output stage at linear gain `gain` (negative or non-finite counts as 0). */
+AscGainStage *asc_gain_stage_create(float gain);
+
+/* Destroys an output stage. */
+void asc_gain_stage_destroy(AscGainStage *stage);
+
+/*
+ * Any thread: sets the linear gain (negative or non-finite counts as 0). The
+ * output thread ramps to it across its next buffer and holds it after that.
+ */
+void asc_gain_stage_set_gain(AscGainStage *stage, float gain);
+
+/* Any thread: the gain last set. */
+float asc_gain_stage_gain(const AscGainStage *stage);
+
+/*
+ * Output thread: multiplies frames x channels interleaved samples by the gain
+ * in place. Gain 0 gives exact zeros and any NaN or infinity becomes 0; the
+ * first buffer plays at the gain already set. Real-time safe.
+ */
+void asc_gain_stage_apply(AscGainStage *stage, float *interleaved, size_t frames, size_t channels);
+
+/*
+ * Output thread: maps `frames` stereo frames onto a device buffer of
+ * frames x channels interleaved samples (L to the first channel, R to the
+ * second, 0 to the rest; (L + R) / 2 on a one-channel device), then applies
+ * the gain as asc_gain_stage_apply does. Returns the frames written; 0 when
+ * channels is 0. Real-time safe.
+ */
+size_t asc_gain_stage_render(AscGainStage *stage, const float *stereo, size_t frames, float *device,
+                             size_t channels);
+
+/* ---- Renderer: a local output with its fades (S62-S65, S182-S188) ------- */
+
+/*
+ * One local output's renderer for one start on one device: its own delay
+ * reader on the ring, the converter to the device rate, the channel mapping,
+ * the gain and the 20 ms fades. It starts closed and fades in on its first
+ * audio; a stop's fade-out and every delay change fade (S184 to S188). The
+ * render calls run on the output thread; every other call runs on any thread
+ * and is a lock-free atomic operation.
+ */
+typedef struct AscRenderer AscRenderer;
+
+/* The longest a host waits for its outputs' fade-outs at a stop or a removal (S186). */
+#define ASC_STOP_FADE_CAP_MS 500
+
+/* asc_renderer_fade_state: exact zeros, fading in, full level, fading out. */
+#define ASC_FADE_CLOSED 0
+#define ASC_FADE_FADING_IN 1
+#define ASC_FADE_OPEN 2
+#define ASC_FADE_FADING_OUT 3
+
+/*
+ * Control thread: a renderer reading `ring`, captured at capture_rate, for a
+ * device running at device_rate with `channels` interleaved channels, at
+ * linear gain `gain`; its delay is 0 until one is set. NULL for a NULL ring,
+ * no channels, a rate outside 8000...384000 Hz, or a capture_rate whose 24 s
+ * the ring can't hold (asc_ring_supports_rate).
+ */
+AscRenderer *asc_renderer_create(AscRing *ring, uint32_t capture_rate, uint32_t device_rate, size_t channels,
+                                 float gain);
+
+/* Destroys a renderer, once the output thread no longer calls it. */
+void asc_renderer_destroy(AscRenderer *renderer);
+
+/*
+ * Output thread: fills `frames` frames of frames x channels interleaved
+ * floats: read at the output's delay, converted to the device rate, mapped
+ * onto the channels, at the gain, faded. Real-time safe.
+ */
+void asc_renderer_render(AscRenderer *renderer, float *device, size_t frames);
+
+/*
+ * Output thread: as asc_renderer_render, for a callback whose first frame is
+ * output at output_time_ns host nanoseconds, so that a stop's fade-out
+ * publishes when its last frame is output. The callback reads at the time of
+ * the call on the core's clock, the one asc_ring_write stamps the capture's
+ * blocks with, so a converting output follows the capture's clock (S207).
+ * Real-time safe.
+ */
+void asc_renderer_render_timed(AscRenderer *renderer, float *device, size_t frames, uint64_t output_time_ns);
+
+/* Any thread: the linear gain (negative or non-finite counts as 0), ramped to across the next callback. */
+void asc_renderer_set_gain(AscRenderer *renderer, float gain);
+
+/* Any thread: the gain last set. */
+float asc_renderer_gain(const AscRenderer *renderer);
+
+/*
+ * Control thread: sets the renderer's linear gain with each headroom cut of
+ * eq given back from the ring frame it starts at, so the gain changes with
+ * the first frame equalized with that cut (S26, S71). A NULL eq sets gain
+ * as is.
+ */
+void asc_eq_give_back(const AscEqualizer *eq, AscRenderer *renderer, double gain);
+
+/*
+ * Any thread: a new delay in capture-rate frames. A renderer that plays
+ * fades out first and hands it to its reader after the fade-out's last
+ * frame, then fades in on the new timeline; a closed one takes it at once.
+ */
+void asc_renderer_set_delay_frames(AscRenderer *renderer, int64_t frames);
+
+/* Any thread: the newest delay asked for, in capture-rate frames. */
+int64_t asc_renderer_delay_frames(const AscRenderer *renderer);
+
+/* Control thread, before the renderer's first callback: whether its device is
+   Bluetooth, which adds a capture block to its start lead (S230). */
+void asc_renderer_set_bluetooth(AscRenderer *renderer, bool bluetooth);
+
+/* Any thread: what the start lead adds for a Bluetooth device, in capture
+   frames (S230); 0 for any other device or a NULL handle. */
+int64_t asc_renderer_extra_lead_frames(const AscRenderer *renderer);
+
+/* Any thread: the start lead the renderer published for the session lead
+   (S208), in capture-rate frames, into *frames; false, leaving it alone,
+   before it published one or for a NULL handle. */
+bool asc_renderer_start_lead_frames(const AscRenderer *renderer, int64_t *frames);
+
+/*
+ * A renderer's start lead kept counting in its ring's session lead after the
+ * renderer is gone, for an output whose device went away while it stays
+ * switched on (S328). asc_held_lead_set_hold_back_frames runs on any thread
+ * and is a lock-free atomic operation.
+ */
+typedef struct AscHeldLead AscHeldLead;
+
+/* How long a switched-on output whose device left the list still counts toward the other outputs' timing (S328). */
+#define ASC_BRIEF_LOSS_HOLD_MS 10000
+
+/*
+ * Control thread: keeps `renderer`'s published start lead counting at its
+ * current hold-back; the renderer may then be destroyed. NULL for a NULL
+ * handle, a renderer that published no lead yet, or no slot free.
+ */
+AscHeldLead *asc_renderer_hold_lead(const AscRenderer *renderer);
+
+/* Any thread: the hold-back now counted for the lost output, in capture-rate frames (negative counts as 0). */
+void asc_held_lead_set_hold_back_frames(AscHeldLead *held, int64_t frames);
+
+/* Ends a held lead: it no longer counts. */
+void asc_held_lead_destroy(AscHeldLead *held);
+
+/*
+ * Control thread, after asc_renderer_set_bluetooth: the output latency the
+ * device reported, in ns; returns the one to use (S231). A Bluetooth
+ * device's report outside 50 to 1000 ms gives way to last_plausible_ns (the
+ * latest report accepted for the same output, 0 for none), else 150 ms. A
+ * NULL handle returns reported_ns.
+ */
+uint64_t asc_renderer_set_reported_latency(AscRenderer *renderer, uint64_t reported_ns,
+                                           uint64_t last_plausible_ns);
+
+/*
+ * Any thread: the output latency the device reported, in ns, when the
+ * window rejected it (S231); false, leaving *latency_ns alone, otherwise.
+ */
+bool asc_renderer_rejected_latency_ns(const AscRenderer *renderer, uint64_t *latency_ns);
+
+/*
+ * Any thread, before the output stops: fade out over 20 ms of device frames
+ * from the next callback, then render exact zeros until the output stops.
+ */
+void asc_renderer_request_fade_out(AscRenderer *renderer);
+
+/* Any thread: whether the requested fade-out's last frame has been rendered. */
+bool asc_renderer_fade_rendered(const AscRenderer *renderer);
+
+/*
+ * Any thread: the host time in nanoseconds at which the requested fade-out's
+ * last frame is output; false, leaving *time_ns alone, until a timed render
+ * has rendered it.
+ */
+bool asc_renderer_fade_end_time_ns(const AscRenderer *renderer, uint64_t *time_ns);
+
+/*
+ * Any thread: whether the requested fade-out has played by host time now_ns,
+ * that is its last frame's output time plus latency_ns (the device's and its
+ * stream's latency) has passed.
+ */
+bool asc_renderer_faded_by_time(const AscRenderer *renderer, uint64_t latency_ns, uint64_t now_ns);
+
+/* Any thread: where the fade was at the end of the latest callback, an ASC_FADE_* code. */
+int32_t asc_renderer_fade_state(const AscRenderer *renderer);
+
+/* Any thread: the frames of a fade at the device rate, 20 ms (960 at 48 kHz). */
+size_t asc_renderer_fade_frames(const AscRenderer *renderer);
+
+/* Any thread: the reader's lag, W - P after its latest read (S56). */
+int64_t asc_renderer_lag_frames(const AscRenderer *renderer);
+
+/* Any thread: the reader's counters; all zero for a NULL handle. */
+AscReaderCounters asc_renderer_counters(const AscRenderer *renderer);
+
+/* Any thread: the capture frames the renderer slowed its converter by to keep
+   its reader off the newest frame (S206) or to follow the capture's clock
+   (S207), in all; 0 for a NULL handle. */
+uint64_t asc_renderer_slowed_frames(const AscRenderer *renderer);
+
+/* Any thread: the capture frames the renderer sped its converter up by to
+   follow the capture's clock (S207), in all; 0 for a NULL handle. */
+uint64_t asc_renderer_sped_frames(const AscRenderer *renderer);
+
+/* Any thread: the largest lateness of a callback against the renderer's
+   earliest ones, in ns (S209); 0 without output times or for a NULL handle. */
+uint64_t asc_renderer_late_max_ns(const AscRenderer *renderer);
+
+/* Any thread: the callbacks that came more than 5 ms later than
+   the renderer's earliest ones (S209); 0 for a NULL handle. */
+uint64_t asc_renderer_late_callbacks(const AscRenderer *renderer);
+
+/* Control thread: the peak and RMS in dBFS the device got since the last take,
+   after every gain and the equalizer; silence reads as -infinity. False,
+   writing nothing, when nothing was rendered since or a pointer is NULL. */
+bool asc_renderer_take_level(const AscRenderer *renderer, double *peak_db, double *rms_db);
+
+/* Any thread: the device frames the converter couldn't produce and that were
+   played as silence, in all (0 unless the read sizing is wrong); 0 for a NULL
+   handle. */
+uint64_t asc_renderer_shortfall_frames(const AscRenderer *renderer);
+
+/* Any thread: the capture frames by which the renderer's slow-down made up
+   shortages of its reader (S206), apart from the trims that follow the
+   capture's clock, in all; 0 for a NULL handle. */
+uint64_t asc_renderer_shortage_frames(const AscRenderer *renderer);
+
+/* Any thread: the observer's least slack, in ns of capture frames: W - P at
+   the start of a callback less what the callback needs, below 0 when a
+   callback found too few frames (S229). False, leaving *slack_ns alone, until
+   the output has played its warm-up and a callback was measured since, and
+   for a NULL handle. */
+bool asc_renderer_least_slack_ns(const AscRenderer *renderer, int64_t *slack_ns);
+
+/* Any thread: the observer's largest drop of the lateness floor below the
+   anchor floor set at the reader's latest anchor, in ns (S229); 0 without
+   output times or for a NULL handle. */
+uint64_t asc_renderer_floor_drop_ns(const AscRenderer *renderer);
+
+/* Any thread: the observer's steps in the device's output times, callbacks
+   whose output time lay more than 1 ms off the previous callback's plus its
+   frames (S229); 0 without output times or for a NULL handle. */
+uint64_t asc_renderer_time_steps(const AscRenderer *renderer);
+
+/* Any thread: the times the reader re-anchored at its delay after a stall
+   (S207); 0 for a NULL handle. */
+uint64_t asc_renderer_stall_reanchors(const AscRenderer *renderer);
+
+/* Any thread: the times the reader re-anchored at its delay after a lasting
+   lateness (S207); 0 for a NULL handle. */
+uint64_t asc_renderer_late_reanchors(const AscRenderer *renderer);
+
+/* Any thread: the clock rate the renderer follows beside its trim, in ppm
+   (S207): positive when the device's clock runs slow; 0 when it follows none
+   or for a NULL handle. */
+int64_t asc_renderer_followed_ppm(const AscRenderer *renderer);
+
+/* Any thread: the share of the renderer's callbacks, in percent, that starved
+   while the capture was writing, over its latest 5 s of device frames (S347);
+   0 before the first or for a NULL handle. */
+uint32_t asc_renderer_starved_percent(const AscRenderer *renderer);
+
+/* ---- Delay helpers ------------------------------------------------------- */
+
+/*
+ * A delay input from the user, ready to store: clamped to 0...20 000 ms into
+ * *sanitized_ms. False, writing nothing, for a non-finite value (which is
+ * ignored) or a NULL sanitized_ms.
+ */
+bool asc_delay_sanitize_ms(double delay_ms, double *sanitized_ms);
+
+/*
+ * A delay in frames at `rate` Hz: floor(delay_ms x rate / 1000) into *frames
+ * (a negative delay counts as 0). False, writing nothing, for a non-finite
+ * delay or a NULL frames.
+ */
+bool asc_delay_ms_to_frames(double delay_ms, uint32_t rate, int64_t *frames);
+
+/* ---- Local delay model (offsets relative to a reference output) ---------- */
+
+/*
+ * The local delay model replaces the old AirPlay sync rule (S78): one local
+ * output, the reference (the built-in speakers on the Mac), defines time 0
+ * and has no delay setting; every other local output has an offset relative
+ * to it, -2000 to +20 000 ms, that always applies. The host passes the
+ * outputs taking part (switched on, with their devices listed) and gets each
+ * one's hold-back, the delay its renderer plays at. While an AirPlay speaker
+ * is chosen, the AirPlay latency L comes on top: the bundled engine's stored
+ * AirPlay delay, or the native sender's reported latency plus the user's
+ * adjustment (asc_local_native_latency_ms).
+ *
+ * Re-timing: whenever the outputs taking part, an offset, the reference, the
+ * AirPlay condition or L change, the host computes the hold-backs again and
+ * gives each running renderer whose hold-back changed the new one through
+ * asc_reader_set_delay_frames (more inserts silence, less skips forward);
+ * a renderer whose hold-back is unchanged gets no call. An output being
+ * attached starts at its hold-back.
+ */
+
+/* A local output taking part. */
+typedef struct AscLocalOutput {
+    double offset_ms;   /* its stored offset; ignored for the reference */
+    bool is_reference;  /* the reference: its offset counts as 0 */
+} AscLocalOutput;
+
+/*
+ * The hold-back in ms of each of the `count` outputs taking part, in the same
+ * order, into hold_backs_ms: its offset (0 for the reference) minus the
+ * smallest offset taking part, or minus -L when that is smaller and
+ * airplay_chosen, capped at 20 000 ms; never negative. An offset out of range
+ * counts clamped, one that isn't finite as 0; airplay_latency_ms counts only
+ * when airplay_chosen, clamped to 0...20 000 (not finite: 0). False, writing
+ * nothing, for a NULL array with a nonzero count.
+ */
+bool asc_local_hold_backs_ms(const AscLocalOutput *outputs, size_t count, bool airplay_chosen, double airplay_latency_ms, double *hold_backs_ms);
+
+/*
+ * An offset input from the user, ready to store: clamped to -2000...20 000 ms
+ * into *sanitized_ms. False, writing nothing, for a non-finite value (which
+ * is ignored) or a NULL sanitized_ms.
+ */
+bool asc_local_offset_sanitize_ms(double offset_ms, double *sanitized_ms);
+
+/*
+ * The starting offset of a local output (S455) into *seed_ms: for a
+ * Bluetooth output that is not the reference, was never listed before and
+ * has no stored offset, the reference's reported latency minus its own minus
+ * 80 ms (no margin when the reference is Bluetooth too), clamped to
+ * -2000...20 000 ms. False, writing nothing, for any other
+ * output, a non-finite latency or a NULL seed_ms.
+ */
+bool asc_local_bluetooth_seed_ms(bool bluetooth, bool is_reference, bool known, bool has_offset, double latency_ms, double reference_latency_ms, bool reference_bluetooth, double *seed_ms);
+
+/*
+ * The bundled engine's AirPlay delay input, ready to store: clamped to
+ * 0...20 000 ms into *sanitized_ms (2000 by default). False, writing nothing,
+ * for a non-finite value (which is ignored) or a NULL sanitized_ms.
+ */
+bool asc_local_airplay_delay_sanitize_ms(double delay_ms, double *sanitized_ms);
+
+/*
+ * L under the native sender: its reported base latency plus the user's
+ * adjustment (-2000...20 000 ms, 0 by default; out of range counts clamped,
+ * not finite as 0), clamped to 0...20 000 ms. The window's AirPlay delay
+ * field shows this value.
+ */
+double asc_local_native_latency_ms(double sender_latency_ms, double adjustment_ms);
+
+/*
+ * The adjustment to store when the user enters shown_ms in the AirPlay delay
+ * field under the native sender: shown_ms minus the sender's latency of that
+ * moment, clamped to -2000...20 000 ms, into *adjustment_ms. False, writing
+ * nothing, for a non-finite value or a NULL adjustment_ms.
+ */
+bool asc_local_native_adjustment_ms(double shown_ms, double sender_latency_ms, double *adjustment_ms);
+
+/*
+ * One device UID for the one-time migration of the stored absolute delays:
+ * every UID with a stored delay, and every one without that is switched on
+ * or in the device list of that moment.
+ */
+typedef struct AscStoredDelay {
+    bool is_reference;       /* the reference (the first one marked counts) */
+    bool has_stored_delay;   /* it has a stored absolute delay */
+    double stored_delay_ms;  /* that delay; read clamped to 0...20 000, not finite counts as none */
+} AscStoredDelay;
+
+/* The offset the migration stores for one UID. */
+typedef struct AscMigratedOffset {
+    bool store;        /* store offset_ms; false for the reference, which gets none */
+    double offset_ms;  /* -2000...20 000 */
+} AscMigratedOffset;
+
+/* The AirPlay settings the migration stores. */
+typedef struct AscDelayMigration {
+    double airplay_delay_ms;      /* the bundled engine's AirPlay delay */
+    double native_adjustment_ms;  /* the native sender's adjustment: 0 */
+} AscDelayMigration;
+
+/*
+ * The one-time migration of the stored absolute delays: one offset per
+ * entry into `offsets`, in the same order, and the AirPlay settings into
+ * *result. D0, what an output without a stored delay played at, is the
+ * legacy single delay (when has_legacy_delay) clamped to 0...20 000, else
+ * 2000; D_R is the reference's stored delay, else D0. The AirPlay delay
+ * becomes D_R when it is at least 1000 ms, else 2000; another UID with a
+ * stored delay D gets D - D_R; one without gets D0 - (the new AirPlay delay)
+ * when D0 is at least 1000 ms, else D0 - D_R; each clamped to
+ * -2000...20 000. The host stores the result under new keys, once, and
+ * leaves the old ones in place. False, writing nothing, for a NULL array
+ * with a nonzero count or a NULL result.
+ */
+bool asc_local_delay_migrate(const AscStoredDelay *entries, size_t count, bool has_legacy_delay, double legacy_delay_ms, AscMigratedOffset *offsets, AscDelayMigration *result);
+
+/*
+ * The switched-on local outputs whose devices left the list less than
+ * ASC_BRIEF_LOSS_HOLD_MS ago (S328): the host counts each among the outputs
+ * taking part, at its offset and never as the reference. Times are the
+ * host's uptime in seconds; a negative or non-finite one counts as 0.
+ * Control thread only.
+ */
+typedef struct AscBriefLosses AscBriefLosses;
+
+/* Creates a hold with no output held. */
+AscBriefLosses *asc_brief_losses_create(void);
+
+/* Destroys a hold; NULL is ignored. */
+void asc_brief_losses_destroy(AscBriefLosses *losses);
+
+/*
+ * A device list made at now_s: the listed IDs, the switched-on IDs and the
+ * reference among them (NULL for none). An output that took part at the last
+ * listing, wasn't the reference then, is still switched on and is missing
+ * now is held from now_s; one listed again, or switched off, no longer is.
+ * NULL and non-UTF-8 IDs are left out; nothing happens for a NULL handle or
+ * a NULL array with a nonzero count.
+ */
+void asc_brief_losses_note_listing(AscBriefLosses *losses, const char *const *listed, size_t listed_count, const char *const *enabled, size_t enabled_count, const char *reference, double now_s);
+
+/* Output id was switched off: it stops counting at once. True when it was
+   held, so the others re-time. */
+bool asc_brief_losses_switched_off(AscBriefLosses *losses, const char *id);
+
+/* Ends the holds ASC_BRIEF_LOSS_HOLD_MS old at now_s. True when any ended,
+   so the others re-time once. */
+bool asc_brief_losses_expire(AscBriefLosses *losses, double now_s);
+
+/* A session restart (S20): no output is held any longer. */
+void asc_brief_losses_restart(AscBriefLosses *losses);
+
+/* How many outputs are held; 0 for a NULL handle. */
+size_t asc_brief_losses_held_count(const AscBriefLosses *losses);
+
+/* The ID of held output `index`, sorted by ID; NULL past the end. It stays
+   valid until the next call that changes the hold. */
+const char *asc_brief_losses_held_id(const AscBriefLosses *losses, size_t index);
+
+/* When the next hold ends, in uptime seconds, into *at_s; false, writing
+   nothing, when nothing is held or for a NULL pointer. */
+bool asc_brief_losses_next_expiry_s(const AscBriefLosses *losses, double *at_s);
+
+/* ---- Output device volume (the operating system's own, per device) ------- */
+
+/*
+ * The operating system keeps a volume and a mute for every output device and
+ * applies them after AudioSync's gain, so a device left at 13 % sounds very
+ * quiet whatever AudioSync's slider says. The host reads both for each local
+ * output that is switched on (on the Mac through Core Audio, only the parts
+ * that are present and settable), asks here what the reading means and what
+ * the one-click fix writes, and writes only when the user clicks that fix.
+ * Pure functions for the control thread.
+ */
+
+/* One reading. A part the host couldn't read, or can't set, has its has_ flag false. */
+typedef struct AscDeviceVolume {
+    bool has_volume;  /* the volume is known */
+    double volume;    /* the volume, 0 to 1 (as the system's slider for the device shows it) */
+    bool has_mute;    /* the mute is known */
+    bool muted;       /* the device is muted */
+} AscDeviceVolume;
+
+/* What a reading means for the row, and what one click on its fix writes. */
+typedef struct AscDeviceVolumeDecision {
+    uint32_t decision;     /* ASC_DEVICE_VOLUME_... */
+    bool shows_hint;       /* LOW, MUTED or MUTED_AND_LOW: the row shows a hint and the fix */
+    bool has_percent;      /* the volume is known and finite */
+    uint32_t percent;      /* round(100 x clamp(volume, 0, 1)), half away from zero */
+    bool fix_sets_volume;  /* the fix sets the volume to fix_volume: only when LOW or MUTED_AND_LOW */
+    double fix_volume;     /* 0.75; never lower than a volume that isn't low */
+    bool fix_unmutes;      /* the fix clears the mute: only when muted */
+} AscDeviceVolumeDecision;
+
+/*
+ * What `reading` means: MUTED when the mute is known and set, LOW when the
+ * volume is known and 25 % or less, MUTED_AND_LOW when both hold, UNKNOWN when
+ * neither part is known, FINE otherwise; a volume that isn't finite counts as
+ * unknown. The fix writes each part at most once.
+ */
+AscDeviceVolumeDecision asc_device_volume_decide(AscDeviceVolume reading);
+
+/*
+ * Whether a new reading whose decision is `now` gets a debug log line after
+ * one whose decision was `previous`: only when they differ. The first reading
+ * (has_previous false) logs a line of its own, so it is no change here; a
+ * value that is no ASC_DEVICE_VOLUME_ decision gives false.
+ */
+bool asc_device_volume_decision_changed(bool has_previous, uint32_t previous, uint32_t now);
+
+/*
+ * A decision's name in the debug log ("unknown", "fine", "low", "muted",
+ * "muted and low") as a static string; NULL for a value that is no decision.
+ */
+const char *asc_device_volume_decision_name(uint32_t decision_code);
+
+/* ---- When the source app quits ------------------------------------------ */
+
+/*
+ * What a session does when an app quits (S227): ASC_SOURCE_QUIT_STOP or
+ * ASC_SOURCE_QUIT_SWITCH_TO_SYSTEM only when streaming is on and `quit_app`
+ * is the bundle ID of the app `source` captures, else ASC_SOURCE_QUIT_KEEP.
+ * `setting` is the stored setting ("system" switches; anything else, NULL
+ * included, stops) and `source` the stored source ("" or NULL the whole
+ * system, "input:<uid>" an input device, else an app's bundle ID). A string
+ * that isn't UTF-8 counts as NULL and an unknown `streaming` as
+ * ASC_STREAMING_OFF. Pure function for the control thread.
+ */
+uint32_t asc_source_quit_decide(const char *setting, const char *source, const char *quit_app, uint32_t streaming);
+
+/* ---- Zones ---------------------------------------------------------------- */
+
+/* One zone member as the host sees it when the zone is clicked. */
+typedef struct AscZoneMember {
+    uint32_t kind;       /* an ASC_ZONE_MEMBER_ code; an unknown one is absent */
+    bool listed;         /* listed now and not hidden */
+    bool on;             /* switched on */
+    bool busy;           /* a Cast speaker the host can't start now */
+    bool needs_airplay2; /* a pair or theater target while the AirPlay 2 switch is off */
+    bool in_target;      /* plays as part of a stereo pair or home theater target now */
+} AscZoneMember;
+
+/*
+ * The plan of a click on a zone (S246, S247): an ASC_ZONE_CLICK_ code, with
+ * one ASC_ZONE_STEP_ code per member written into `steps`, in zone order.
+ * At most one Cast member goes on: the one on already, else the first not
+ * busy, and none while `cast_on_elsewhere`. NULL arrays with a count above
+ * 0 answer ASC_ZONE_CLICK_NOTHING and write nothing. Pure function for the
+ * control thread.
+ */
+uint32_t asc_zone_click_plan(const AscZoneMember *members, size_t count, bool streaming, bool cast_on_elsewhere, bool airplay2_playing_elsewhere, uint32_t *steps);
+
+/*
+ * The one-time migration of groups to zones (S248): `keys` holds every
+ * saved group's member keys, group after group in saved order; `keep[i]`
+ * becomes false for a key that comes earlier in the list, and for a NULL or
+ * non-UTF-8 one, else true. Does nothing for a NULL array. Pure function
+ * for the control thread.
+ */
+void asc_zone_migration_keeps(const char *const *keys, size_t count, bool *keep);
+
+/* ---- Speaker presets ------------------------------------------------------ */
+
+/* One stored member as the host sees it at recall, matched by its key. */
+typedef struct AscPresetMember {
+    uint32_t kind;       /* an ASC_ZONE_MEMBER_ code; an unknown one is not found */
+    bool found;          /* a speaker with its key is listed now, hidden or not */
+    bool hidden;         /* hidden with Hide Speaker */
+    bool on;             /* switched on */
+    bool busy;           /* a Cast speaker the host can't start now */
+    bool needs_airplay2; /* a pair or theater target while the AirPlay 2 switch is off */
+    bool in_target;      /* plays as part of a stereo pair or home theater target now */
+    bool fixed_volume;   /* a Cast speaker whose volume can't be changed from here */
+    bool has_volume;     /* the preset stores an own volume for it */
+    bool offline;        /* a Cast speaker not found on the network now */
+} AscPresetMember;
+
+/* A speaker outside the preset at recall. */
+typedef struct AscPresetOther {
+    bool on;        /* switched on */
+    bool reference; /* the reference output, which a recall leaves alone */
+} AscPresetOther;
+
+/* One stored member as the current-preset check sees it; NaN is no volume. */
+typedef struct AscPresetMemberNow {
+    bool on;              /* the speaker is on now */
+    double stored_volume; /* the preset's own volume for it */
+    double volume;        /* its own volume now */
+} AscPresetMemberNow;
+
+/* One stored zone volume as the current-preset check sees it. */
+typedef struct AscPresetZoneNow {
+    double stored; /* the preset's volume for the zone */
+    double volume; /* the zone's volume now; NaN once the zone is deleted */
+} AscPresetZoneNow;
+
+/*
+ * Which stored member keys a preset keeps (S251): `keep[i]` becomes false
+ * for a key that isn't a speaker key with an ID, one earlier in the list, a
+ * Cast key after the first, and a NULL or non-UTF-8 one, else true. Does
+ * nothing for a NULL array. Pure function for the control thread.
+ */
+void asc_preset_member_keeps(const char *const *keys, size_t count, bool *keep);
+
+/*
+ * A preset's levels as stored (S251), in place: member volumes clamped to
+ * 0...100 (NaN, no volume, stays; infinity becomes NaN), zone volumes as a
+ * zone's, the master clamped (100 when it isn't a number), and the ten
+ * gains in `gains_db` on the controls' 0.5 dB steps within +-12 dB (S23).
+ * A NULL array is skipped. Pure function for the control thread.
+ */
+void asc_preset_levels(double *volumes, size_t count, double *zone_volumes, size_t zone_count, double *master, double *gains_db);
+
+/*
+ * The plan of a preset recall (S252), a full scene: an ASC_PRESET_RECALL_
+ * code, with one ASC_PRESET_STEP_ code and one set-volume flag per stored
+ * member in `steps` and `set_volume`, in preset order, and one flag per
+ * speaker outside the preset in `switch_off`. NULL arrays with a count
+ * above 0 answer ASC_PRESET_RECALL_NOTHING and write nothing. Pure function
+ * for the control thread.
+ */
+uint32_t asc_preset_recall_plan(const AscPresetMember *members, size_t count, const AscPresetOther *others, size_t other_count, bool streaming, uint32_t *steps, bool *set_volume, bool *switch_off);
+
+/*
+ * Whether the host plays a preset exactly (S253): `on_now` speakers are on,
+ * the reference output included; the gains are ten each. False for a NULL
+ * array with a count above 0, or NULL gains. Pure function for the control
+ * thread.
+ */
+bool asc_preset_matches(const AscPresetMemberNow *members, size_t count, size_t on_now, const AscPresetZoneNow *zones, size_t zone_count, double stored_master, const double *stored_gains_db, double master, const double *gains_db);
+
+/* ---- Microphone calibration ---------------------------------------------- */
+
+/*
+ * One local output measured against the reference with a microphone
+ * (S232-S234): the host plays the test signal on the reference and records
+ * it, then on the chosen output with the microphone where it was, and
+ * passes both recordings, mono at the signal's rate. Frame 0 of each is the
+ * moment the signal enters that output's path, before its hold-back, with
+ * the same gap from recording start to play start in both runs (a gap that
+ * differs goes into the result unseen). Each recording lasts the largest
+ * hold-back taking part (about 2 s with AirPlay, up to 20 s with large
+ * offsets) plus the output's latency plus the 0.75 s signal plus about
+ * 0.5 s. Record at 48 kHz: the 2^21-frame limit is about 44 s there but
+ * only 10.9 s at 192 kHz. Both calls allocate and are for the control
+ * thread; the estimate takes tens of ms and up to about 96 MB.
+ */
+
+/* Frames of the test signal at `rate`; 0 for a rate outside 22 050...384 000. */
+size_t asc_calibration_signal_frames(uint32_t rate);
+
+/*
+ * The test signal at `rate`, mono: a 0.75 s linear sweep from 300 Hz to
+ * 8 kHz peaking at -18 dBFS, with 20 ms raised-cosine fades. False, writing
+ * nothing, for an unsupported rate, a `frames` other than
+ * asc_calibration_signal_frames(rate) or a NULL samples.
+ */
+bool asc_calibration_signal(uint32_t rate, float *samples, size_t frames);
+
+/* What asc_calibration_estimate found. */
+typedef struct AscCalibration {
+    uint32_t status;      /* an ASC_CALIBRATION_ code */
+    uint32_t recording;   /* an ASC_CALIBRATION_RECORDING_ code */
+    double offset_ms;     /* the new offset, whole ms; refused: the old one as stored offsets count */
+    double difference_ms; /* how much later the chosen output was heard; refused: 0 */
+    double reference_ms;  /* where the signal arrived in the reference's recording; refused: 0 */
+    double chosen_ms;     /* where it arrived in the chosen output's recording; refused: 0 */
+    bool clamped;         /* accepted, but offset_ms hit an end of the range: the output stays off by the rest */
+} AscCalibration;
+
+/*
+ * The chosen output's new offset into *result: its old offset (0 when not
+ * finite, else clamped to -2000...+20 000) minus how much later it was
+ * heard than the reference, rounded to whole ms and clamped to that range;
+ * or a refusal that changes nothing. False, writing nothing, for a NULL
+ * array with a nonzero count or a NULL result.
+ */
+bool asc_calibration_estimate(const float *signal, size_t signal_frames, const float *reference, size_t reference_frames, const float *chosen, size_t chosen_frames, uint32_t rate, double old_offset_ms, AscCalibration *result);
+
+/*
+ * Three runs, each a reference and a chosen recording as the estimate takes
+ * them, each list ASC_CALIBRATION_SWEEPS long: accepted only when all three
+ * are and their differences lie within 5 ms, largest minus smallest, then
+ * the run with the middle difference. The first refused run in order gives
+ * its refusal; a wider spread gives ASC_CALIBRATION_DISAGREE with the old
+ * offset and the spread in *spread_ms, which is 0 otherwise. False, writing
+ * nothing, for a NULL array with a nonzero count, a NULL list or a NULL
+ * result or spread_ms.
+ */
+bool asc_calibration_estimate_agreed(const float *signal, size_t signal_frames, const float *const *references, const size_t *reference_frames, const float *const *chosen, const size_t *chosen_frames, uint32_t rate, double old_offset_ms, AscCalibration *result, double *spread_ms);
+
+/* Where the signal arrived in one recording and how the peak stands out,
+ * before the thresholds that would refuse it: for the debug log. */
+typedef struct AscCalibrationArrival {
+    uint32_t status;        /* ASC_CALIBRATION_ACCEPTED when measured, else the refusal */
+    size_t frame;           /* the arrival: the earliest strong lag, else the peak */
+    size_t peak_frame;      /* the strongest lag */
+    size_t echo_frame;      /* the strongest lag more than 3 ms from the arrival, and from the peak when that is its reflection */
+    double peak_over_floor; /* the peak over the median magnitude */
+    double echo_share;      /* that echo as a share of the peak */
+} AscCalibrationArrival;
+
+/*
+ * Measures one recording as the estimate does, into *result. False, writing
+ * nothing, for a NULL array with a nonzero count or a NULL result. Takes
+ * tens of ms or more: never on an audio thread.
+ */
+bool asc_calibration_measure(const float *signal, size_t signal_frames, const float *recording, size_t recording_frames, uint32_t rate, AscCalibrationArrival *result);
+
+/*
+ * Calibrate All Speakers: the reference's sweep, then every other speaker's
+ * two, one speaker at a time, each estimated against the reference as
+ * asc_calibration_estimate does. A row's result is the mean of its two
+ * sweeps with an uncertainty of half their difference plus 3 ms; over
+ * 10 ms the row is uncertain, and any refused sweep refuses the row. The
+ * AirPlay speakers share one delay, the median of the certain AirPlay rows.
+ * Nothing changes until the host writes what asc_calibration_sheet_apply
+ * lists. Speakers are named by their index in the array given to
+ * asc_calibration_run_create; rows keep that order. Every call is for one
+ * control thread at a time per handle; recording runs an FFT.
+ */
+typedef struct AscCalibrationRun AscCalibrationRun;
+typedef struct AscCalibrationSheet AscCalibrationSheet;
+
+/* A speaker that is on when the run starts. */
+typedef struct AscCalibrationSpeaker {
+    uint32_t kind;     /* an ASC_CALIBRATION_KIND_ code */
+    bool has_offset;   /* false: no stored delay (a Cast speaker's first window is then the longest) */
+    double offset_ms;  /* its stored delay; every AirPlay speaker carries the shared AirPlay delay */
+    double latency_ms; /* when its sweep is expected, from the moment it enters its path before the hold-back: hold-back plus latency, the reference's too */
+} AscCalibrationSpeaker;
+
+/* What to play and record next. */
+typedef struct AscCalibrationStep {
+    size_t row;           /* the speaker's index */
+    uint32_t sweep;       /* 0 the reference's sweep, else the speaker's first or second */
+    size_t window_frames; /* frames to record from the moment the sweep enters the speaker's path */
+    bool searching;       /* a Cast speaker without a stored offset: the longest window, show that it searches */
+} AscCalibrationStep;
+
+/* One row of the sheet. */
+typedef struct AscCalibrationRow {
+    uint32_t state;        /* an ASC_CALIBRATION_ROW_ code */
+    uint32_t reason;       /* refused: an ASC_CALIBRATION_ refusal code; else 0 */
+    uint32_t recording;    /* refused: an ASC_CALIBRATION_RECORDING_ code; else 0 */
+    bool has_old;          /* the speaker had a stored delay */
+    double old_ms;         /* that delay as given */
+    double new_ms;         /* certain or uncertain: the new delay, whole ms; else 0 */
+    double uncertainty_ms; /* certain or uncertain: the U of new_ms +- U; else 0 */
+    double difference_ms;  /* certain or uncertain: how much later than the reference it was heard */
+    bool clamped;          /* new_ms hit an end of its range */
+} AscCalibrationRow;
+
+/* The shared AirPlay delay. */
+typedef struct AscCalibrationAirPlay {
+    uint32_t state;      /* an ASC_CALIBRATION_AIRPLAY_ code */
+    bool has_old;        /* the AirPlay speakers carried a delay */
+    double old_ms;       /* that delay as given */
+    double new_ms;       /* the median, whole ms; NONE_CERTAIN: old_ms */
+    double spread_ms;    /* the largest minus the smallest difference among the certain rows */
+    size_t certain_rows; /* how many AirPlay rows are certain */
+    bool clamped;        /* new_ms hit an end of its range */
+} AscCalibrationAirPlay;
+
+/* One change Apply lists; writing back old_ms, or removing the stored value when has_old is false, undoes it. */
+typedef struct AscCalibrationChange {
+    size_t row;    /* the speaker's index; 0 for the AirPlay delay */
+    bool airplay;  /* the one AirPlay delay rather than the speaker on row */
+    bool has_old;  /* the value replaced was stored */
+    double old_ms; /* the value replaced */
+    double new_ms; /* the value to write */
+} AscCalibrationChange;
+
+/*
+ * A run over `count` speakers, `reference` the index of the reference, a
+ * local output. NULL for an unsupported rate, a reference that isn't a
+ * local output among them, only the reference, an expected arrival whose
+ * recording wouldn't fit 2^21 frames at that rate, an unknown kind or a
+ * NULL array with a nonzero count.
+ */
+AscCalibrationRun *asc_calibration_run_create(uint32_t rate, const AscCalibrationSpeaker *speakers, size_t count, size_t reference);
+
+/*
+ * asc_calibration_run_create for Calibrate Zone: each speaker whose `off`
+ * entry is true is a zone member that is off, listed on the sheet and never
+ * swept; `off` NULL means none. NULL too when no speaker is left besides
+ * the reference and the off ones.
+ */
+AscCalibrationRun *asc_calibration_run_create_listing(uint32_t rate, const AscCalibrationSpeaker *speakers, size_t count, size_t reference, const bool *off);
+
+/* The next step into *step; false, writing nothing, once the run is over or for a NULL argument. */
+bool asc_calibration_run_step(const AscCalibrationRun *run, AscCalibrationStep *step);
+
+/*
+ * The recording the last step asked for, mono at the run's rate. A refused
+ * reference sweep refuses every row and ends the steps; a refused first
+ * sweep skips the second. False when no step waits or for a NULL argument.
+ */
+bool asc_calibration_run_record(AscCalibrationRun *run, const float *recording, size_t frames);
+
+/* Ends the run with an ASC_CALIBRATION_END_ reason (unknown counts as cancelled); its sheet applies nothing. */
+void asc_calibration_run_cancel(AscCalibrationRun *run, uint32_t reason);
+
+/* The run's sheet; frees the run. A run with steps still waiting ends as cancelled. NULL for a NULL run. */
+AscCalibrationSheet *asc_calibration_run_finish(AscCalibrationRun *run);
+
+/* Frees a run without a sheet. */
+void asc_calibration_run_destroy(AscCalibrationRun *run);
+
+/* The number of rows, one per speaker; 0 for a NULL sheet. */
+size_t asc_calibration_sheet_rows(const AscCalibrationSheet *sheet);
+
+/* Row `index` into *row; false, writing nothing, out of range or for a NULL argument. */
+bool asc_calibration_sheet_row(const AscCalibrationSheet *sheet, size_t index, AscCalibrationRow *row);
+
+/* The shared AirPlay delay into *airplay; false, writing nothing, without AirPlay speakers or for a NULL argument. */
+bool asc_calibration_sheet_airplay(const AscCalibrationSheet *sheet, AscCalibrationAirPlay *airplay);
+
+/* Why the sheet ended, an ASC_CALIBRATION_END_ code; END_NONE while it can be applied. */
+uint32_t asc_calibration_sheet_ended(const AscCalibrationSheet *sheet);
+
+/*
+ * The changes Apply writes, one per certain local or Cast row and one for
+ * the AirPlay delay when an AirPlay row is certain, into `changes` and
+ * their number into *count, with an ASC_CALIBRATION_APPLY_ code. Only
+ * APPLY_OK writes changes, and spends the sheet: from then on its rows
+ * describe offsets no longer stored, so a second Apply answers
+ * APPLY_ALREADY_APPLIED and Measure Again is refused. APPLY_TOO_MANY sets
+ * *count to the number needed, never more than the rows, and leaves the
+ * sheet as it was. Keep the old values of one Apply for its Undo.
+ */
+uint32_t asc_calibration_sheet_apply(AscCalibrationSheet *sheet, AscCalibrationChange *changes, size_t capacity, size_t *count);
+
+/*
+ * Measure Again: a run of a new reference sweep and row `index`'s two,
+ * from the values the sheet started with; its steps name the sheet's rows.
+ * NULL for the reference's row, a row out of range, an ended, applied or
+ * NULL sheet. Finish it and pass its sheet to asc_calibration_sheet_replace.
+ */
+AscCalibrationRun *asc_calibration_sheet_measure_again(const AscCalibrationSheet *sheet, size_t index);
+
+/* Whether row `index` is a zone member that was off, listed and not measured; false out of range or for NULL. */
+bool asc_calibration_sheet_row_off(const AscCalibrationSheet *sheet, size_t index);
+
+/*
+ * Measure Again on an off row, with the speaker's stored delay (none when
+ * has_offset is false) and expected arrival as the host reads them now.
+ * NULL for a row that isn't off and as asc_calibration_sheet_measure_again;
+ * asc_calibration_sheet_measure_again refuses an off row.
+ */
+AscCalibrationRun *asc_calibration_sheet_measure_again_off(const AscCalibrationSheet *sheet, size_t index, bool has_offset, double offset_ms, double latency_ms);
+
+/*
+ * Puts the row of a Measure Again sheet in place of the old one and frees
+ * `again`. False, leaving `sheet` and its rows as they were, for an `again`
+ * that was cancelled or ended by a change, one not from this sheet's
+ * Measure Again, or a NULL argument; `again` is freed either way, except
+ * when it is `sheet` itself: then false, and nothing is freed.
+ */
+bool asc_calibration_sheet_replace(AscCalibrationSheet *sheet, AscCalibrationSheet *again);
+
+/* Frees a sheet. */
+void asc_calibration_sheet_destroy(AscCalibrationSheet *sheet);
+
+/* What asc_calibration_zone_plan answers. */
+#define ASC_CALIBRATION_ZONE_OK 0                 /* rows, off and silenced hold the plan */
+#define ASC_CALIBRATION_ZONE_NO_REFERENCE 1       /* the reference isn't present and on */
+#define ASC_CALIBRATION_ZONE_NOTHING_TO_MEASURE 2 /* no member besides it is present and on */
+#define ASC_CALIBRATION_ZONE_INVALID 3            /* a NULL argument or a key that isn't UTF-8 */
+
+/* A speaker the host lists, as asc_calibration_zone_plan sorts it. */
+typedef struct AscCalibrationZoneSpeaker {
+    const char *key; /* its speaker key (S149) */
+    bool present;    /* listed, not hidden and not held by a target (S246) */
+    bool on;         /* on and playing */
+} AscCalibrationZoneSpeaker;
+
+/*
+ * The plan of Calibrate Zone (S255) over the zone keyed `members`, in zone
+ * order: the rows, each an index into `speakers`, go into `rows` with one
+ * `off` flag each (for asc_calibration_run_create_listing), *row_count says
+ * how many, and silenced[i] whether speaker i plays silenced for the run.
+ * `rows`, `off` and `silenced` hold `count` elements. Answers an
+ * ASC_CALIBRATION_ZONE_ code. Pure function for the control thread.
+ */
+uint32_t asc_calibration_zone_plan(const char *const *members, size_t member_count, const char *reference, const AscCalibrationZoneSpeaker *speakers, size_t count, size_t *rows, bool *off, size_t *row_count, bool *silenced);
+
+/*
+ * A Cast speaker's expected arrival (AscCalibrationSpeaker.latency_ms), which
+ * is also how long the music sent to it plays out, in ms: its stored offset
+ * plus hold_back_ms, the Cast feed's hold-back, plus 500 ms. With no stored
+ * offset (has_offset false, or an offset of 0 or less) it is hold_back_ms
+ * plus a guess by format, the session's ASC_CAST_FORMAT_: 3000 ms for WAV,
+ * 6000 ms for FLAC or a format not reported yet. The FLAC guess is derived,
+ * not measured. A stored offset counts up to 20 000 ms, hold_back_ms is
+ * clamped to 0 to 20 000 ms, and an offset that is not a number counts as
+ * none. Never a delay for another output.
+ */
+double asc_calibration_cast_wait_ms(bool has_offset, double offset_ms, double hold_back_ms, int32_t format);
+
+/*
+ * An AirPlay speaker's expected arrival (AscCalibrationSpeaker.latency_ms),
+ * which is also how long the music sent to it plays out, in ms: the
+ * sender's latency for the session (sender_latency_ms, read at run start),
+ * or 3000 ms while has_sender is false, plus hold_back_ms, the hold-back the
+ * sender adds for the speaker, plus reported_ms, the latency the receiver
+ * reported (0 when it reported nothing), plus 500 ms. shown_ms, the AirPlay
+ * delay the field shows, counts instead of the sender's latency when it is
+ * longer.
+ * Each value is clamped to 0 to 20 000 ms; one that is not a number counts
+ * as 0; a sender latency that is not a number or not above 0 counts as
+ * none.
+ */
+double asc_calibration_airplay_wait_ms(bool has_sender, double sender_latency_ms, double shown_ms, double hold_back_ms,
+                                       double reported_ms);
+
+/* ---- AirPlay sender (AudioSync's own, airplay/) ----------------------------- */
+
+/*
+ * AudioSync's own AirPlay sender: discovery, speakers added by the IDs
+ * discovery reports, their volume and the master, their events, and the
+ * capture's audio through an input handle. Nothing secret crosses this
+ * interface outward: PINs and passwords go in only, credentials never leave
+ * the core (it keeps them in the pairing store, asc_airplay_open_pairings).
+ * Every asc_airplay_* call on a sender handle runs on one control thread at
+ * a time, never an audio thread; the sender runs its own threads and
+ * sockets. An input handle (AscAirPlayInput) has its own rules, below.
+ *
+ * A bug in the sender never ends the host: a panic inside a call returns
+ * that call's failure value (NULL, false or 0) and makes its handle dead,
+ * as does a panic that ends the sender's own driver thread or discovery's
+ * mDNS daemon. A dead handle's calls do nothing and return their failure
+ * values, except that
+ * asc_airplay_next_event reports ASC_AIRPLAY_EVENT_FAILED once; the host
+ * then destroys it (which still frees it) and may create a new sender. A
+ * panic in an input write makes the input and its sender dead. The failure's
+ * detail is where the panic happened, "panic at <file>:<line>" (the file
+ * from its crate's folder on), or "latest panic at <file>:<line>" when one
+ * of the sender's own threads ended and no call caught the panic, never
+ * what it said, or "" when no panic is known; the first asc_airplay_create
+ * installs a panic hook that notes the locations and then runs the hook that
+ * was there before.
+ */
+typedef struct AscAirPlay AscAirPlay;
+
+/*
+ * The capture's way into a sender (asc_airplay_take_input). Its write runs
+ * on one capture thread at a time, its rate request on any thread, and its
+ * destroy once no write can run. It may outlive its sender, whose audio
+ * then goes nowhere.
+ */
+typedef struct AscAirPlayInput AscAirPlayInput;
+
+/*
+ * One change discovery saw. The strings are NUL-terminated UTF-8 that the
+ * handle owns, valid until the next asc_airplay_next_receiver call on it or
+ * its destroy. A gone receiver has only its id; its name and model are "",
+ * its availability ASC_AIRPLAY_AVAILABLE, its reason and flags 0.
+ */
+typedef struct AscAirPlayReceiver {
+    int32_t event;        /* ASC_AIRPLAY_APPEARED, _CHANGED or _GONE */
+    const char *id;       /* its 12-hex-digit device ID, or "raop:<instance>" / "airplay:<instance>" */
+    const char *name;     /* the name it announces */
+    const char *model;    /* its model, "" when it announces none */
+    int32_t availability; /* ASC_AIRPLAY_AVAILABLE ... ASC_AIRPLAY_UNSUPPORTED */
+    int32_t unsupported;  /* ASC_AIRPLAY_REASON_*: why it can't play */
+    uint32_t flags;       /* ASC_AIRPLAY_FLAG_* bits */
+    const char *target;   /* the "pair:<tsid>" or "theater:<group>" ID of the target it is a member of, or "" */
+    const char *control;  /* a home theater group's Apple TV, by its id, or "" (P229) */
+    const char *missing;  /* a target's members out of view or playing nothing, by name, one per line, or "" (P181) */
+} AscAirPlayReceiver;
+
+/*
+ * One thing that happened to a speaker, or to the stream. The strings are
+ * NUL-terminated UTF-8 that the handle owns, valid until the next
+ * asc_airplay_next_event call on it or its destroy. Fields a kind doesn't
+ * use are 0, except retry_ms and receiver_latency_frames, which are then -1,
+ * and the strings, which are then "".
+ */
+typedef struct AscAirPlayEvent {
+    int32_t kind;                    /* ASC_AIRPLAY_EVENT_* */
+    const char *id;                  /* the speaker's receiver id; "" for a timeline event */
+    int32_t state;                   /* a state event's ASC_AIRPLAY_STATE_* */
+    int32_t error;                   /* an error event's ASC_AIRPLAY_ERROR_* */
+    int32_t unsupported;             /* with ASC_AIRPLAY_ERROR_UNSUPPORTED, its ASC_AIRPLAY_REASON_* */
+    int64_t retry_ms;                /* ms until the next session; -1 when the user must act */
+    double latency_ms;               /* a latency event's L + d_s, a timeline event's L */
+    int64_t receiver_latency_frames; /* a latency event's Audio-Latency; -1 when it sent none */
+    bool restarted;                  /* a timeline event after a restart */
+    const char *detail;              /* an error or warning event's text, a failure event's panic location; for a debug log (no secrets) */
+    double volume;                   /* a volume event's slider position, 0 to 100 */
+    int32_t warning;                 /* a warning event's ASC_AIRPLAY_WARNING_* */
+    int32_t remote;                  /* a remote event's ASC_AIRPLAY_REMOTE_* */
+    int64_t receiver_latency_us;     /* a latency event's reported latency R_s in microseconds; 0 when no source gave one */
+    uint32_t receiver_latency_sources; /* a latency event's ASC_AIRPLAY_LATENCY_SOURCE_* bits; 0 when none */
+    double device_level;             /* a volume event's device level D, 0 to 100 (show asc_airplay_row_level of it) */
+} AscAirPlayEvent;
+
+/*
+ * Starts an AirPlay sender: its stream, silent until audio comes through its
+ * input (asc_airplay_take_input), and its driver thread; discovery waits for
+ * asc_airplay_start_discovery. The master starts at 100. Returns NULL when
+ * the thread can't start or creating the sender failed.
+ */
+AscAirPlay *asc_airplay_create(void);
+
+/*
+ * Whether AirPlay 2 is automatic per receiver: the build's flag, or
+ * AUDIOSYNC_AIRPLAY2_AUTO=1 (on) or 0 (off) for this launch. While it is on,
+ * AirPlay 2 only receivers play with the setting off, and the setting means
+ * "Prefer AirPlay 2" for receivers that speak both.
+ */
+bool asc_airplay2_auto(void);
+
+/*
+ * Stops the sender and frees it: every speaker is torn down and its threads
+ * end within about 2 s, which this call waits for, so call it off the main
+ * thread. Takes the address of the host's pointer and sets that pointer to
+ * NULL, so destroying through it again does nothing; a NULL address or
+ * pointer does nothing. An input taken from it stays valid until its own
+ * destroy.
+ */
+void asc_airplay_destroy(AscAirPlay **airplay);
+
+/*
+ * Starts browsing the local network for AirPlay receivers over multicast DNS;
+ * they arrive through asc_airplay_next_receiver. When it runs already, a
+ * fresh browser takes the running one's place and the list stays. Returns
+ * false when the handle is NULL or dead or multicast DNS can't start.
+ */
+bool asc_airplay_start_discovery(AscAirPlay *airplay);
+
+/*
+ * Stops browsing; every receiver discovery listed is then reported gone.
+ * Speakers keep playing.
+ */
+void asc_airplay_stop_discovery(AscAirPlay *airplay);
+
+/*
+ * Takes the next change discovery saw, if one is waiting, into *receiver and
+ * returns true. Returns false, leaving *receiver as it was, when none is
+ * waiting or either pointer is NULL. Never waits. Speaker and timeline
+ * events wait for asc_airplay_next_event.
+ */
+bool asc_airplay_next_receiver(AscAirPlay *airplay, AscAirPlayReceiver *receiver);
+
+/*
+ * Takes the next speaker or timeline event, if one is waiting, into *event
+ * and returns true. Returns false, leaving *event as it was, when none is
+ * waiting or either pointer is NULL. Never waits. Receiver changes wait for
+ * asc_airplay_next_receiver, and an event waits until every receiver change
+ * queued before it was taken there: take the changes first. A dead sender
+ * reports ASC_AIRPLAY_EVENT_FAILED once, in place of whatever still waited,
+ * and nothing after it.
+ */
+bool asc_airplay_next_event(AscAirPlay *airplay, AscAirPlayEvent *event);
+
+/*
+ * Adds the receiver discovery lists under `id` as a speaker, at slider
+ * position `volume` (0 to 100) times the master, held back by the hold-back
+ * set last (asc_airplay_set_hold_back): a session starts at once, and its
+ * state, errors and latency come as events.
+ * It uses the password handed over for `id` and the stored credentials, if
+ * any. Adding one already added applies the volume, the password and the
+ * credentials and, if it failed or waits for
+ * a retry, starts a new session now. Returns false, adding nothing, when the
+ * handle or id is NULL, id isn't a listed receiver, or volume isn't finite.
+ */
+bool asc_airplay_add_speaker(AscAirPlay *airplay, const char *id, double volume);
+
+/*
+ * Removes the speaker added under `id`: TEARDOWN goes out and its connection
+ * closes after the answer or 2 s; a stopped state event follows. Returns
+ * false when the handle or id is NULL or no speaker was added under id.
+ */
+bool asc_airplay_remove_speaker(AscAirPlay *airplay, const char *id);
+
+/*
+ * Sets the own volume of the speaker added under `id` (0 up, unrounded, and
+ * above 100 when S290 stored it so); it plays at min(100, own x k), live.
+ * Returns false, changing nothing, when the handle or id is NULL, no speaker
+ * was added under id, or volume isn't finite.
+ */
+bool asc_airplay_set_volume(AscAirPlay *airplay, const char *id, double volume);
+
+/*
+ * An AirPlay row move (asc_airplay_row_move's results): stores own volume
+ * `own_position` for the speaker added under `id` and sends it device level
+ * `device_level`, live. Returns false, changing nothing, when the handle or
+ * id is NULL, no speaker was added under id, or a value isn't finite.
+ */
+bool asc_airplay_set_device_level(AscAirPlay *airplay, const char *id, double own_position,
+                                  double device_level);
+
+/*
+ * Tells whether the user is dragging the volume slider of the speaker added
+ * under `id`: while it is, a level read back from the speaker is ignored.
+ * Returns false when the handle or id is NULL or no speaker was added under
+ * id.
+ */
+bool asc_airplay_set_volume_dragging(AscAirPlay *airplay, const char *id, bool dragging);
+
+/*
+ * Keeps the speaker added under `id` muted while another speaker is
+ * measured, its own volume unchanged; a level set on it meanwhile is kept,
+ * not sent. Unsilenced, it sends nothing: the host sends its level. Returns
+ * false when the handle or id is NULL or no speaker was added under id.
+ */
+bool asc_airplay_set_silenced(AscAirPlay *airplay, const char *id, bool silenced);
+
+/*
+ * Sets the zone position (0 to 100, 100 for no zone) of speaker `id`: it
+ * plays at its own position times the zone's, live once added and from its
+ * start when added later, and a level read back from it moves its own
+ * position by the zone. Returns false, changing
+ * nothing, when the handle or id is NULL or zone isn't finite.
+ */
+bool asc_airplay_set_zone_volume(AscAirPlay *airplay, const char *id, double zone);
+
+/*
+ * Asks every speaker added for its own volume, which someone may have changed
+ * on the speaker itself; a stereo pair or home theater group asks its leader.
+ * Only playing sessions answer. A level that moves a slider comes as
+ * ASC_AIRPLAY_EVENT_VOLUME, already the speaker's level in the sender, so a
+ * reconnect or a member that starts late plays at it and the host doesn't
+ * set it again. Dropped: a level read before the host last set the volume,
+ * one that comes while the slider is dragged, and one within 0.5 dB of the
+ * level sent in the 3 s after a set. Speakers that leave volume to the
+ * sender, and ones that turned a read down or whose reads stopped, aren't
+ * asked.
+ */
+void asc_airplay_read_volumes(AscAirPlay *airplay);
+
+/*
+ * Sets the master position (0 to 100), a gain on the stream every speaker
+ * hears, never a speaker's volume (S413); a master that isn't finite is
+ * ignored.
+ */
+void asc_airplay_set_master(AscAirPlay *airplay, double master);
+
+/*
+ * Takes the equalizer's headroom cut (gains_db holds ASC_EQ_BANDS values, at
+ * 48 kHz), which the stream's gain gives back under the master as far as
+ * unity allows (S26, S413). Returns false when airplay or gains_db is NULL.
+ */
+bool asc_airplay_set_equalizer(AscAirPlay *airplay, bool enabled, const double *gains_db);
+
+/*
+ * Holds every speaker back by hold_back_ms on top of L, live, and every
+ * speaker added later, so they meet an output that plays later than L, such
+ * as a Google Cast speaker with a longer offset. The sender caps a speaker's
+ * delay at ASC_AIRPLAY_MAX_DELAY_MS; past it the speakers play early by the
+ * rest. A value below 0 or not finite counts as 0. Returns the hold-back
+ * applied, in ms; 0 for a NULL or dead handle.
+ */
+double asc_airplay_set_hold_back(AscAirPlay *airplay, double hold_back_ms);
+
+/*
+ * The base latency L in milliseconds: a local output lines up with the
+ * speakers at L plus its own delay. 0 for a NULL or dead handle.
+ */
+double asc_airplay_latency_ms(const AscAirPlay *airplay);
+
+/*
+ * The user paused playback on purpose (a remote's Pause, a media key or the
+ * app's pause button, never silence): every speaker gets a FLUSH so its
+ * buffer drops at once, and no audio goes out until asc_airplay_resume. The
+ * sessions stay up. A pause while paused does nothing. NULL does nothing.
+ */
+void asc_airplay_pause(AscAirPlay *airplay);
+
+/*
+ * Resumes after asc_airplay_pause: every speaker goes on from its flush
+ * point, in step, with the audio written from now on. A resume while
+ * playing does nothing. NULL does nothing.
+ */
+void asc_airplay_resume(AscAirPlay *airplay);
+
+/*
+ * Sets the stream's base latency Lf in frames, clamped to 4410 to 88200.
+ * While no speaker sounds it applies at once and a timeline event reports
+ * the new L; later it is held (ASC_AIRPLAY_EVENT_LATENCY_HELD) until the
+ * stream has no speaker or the timeline restarts. NULL does nothing.
+ */
+void asc_airplay_set_latency(AscAirPlay *airplay, uint32_t frames);
+
+/*
+ * True once a speaker of the stream reached its first-sound time, so an Lf
+ * set now is held; false for a NULL or dead handle.
+ */
+bool asc_airplay_sounding(const AscAirPlay *airplay);
+
+/*
+ * The stream's Lf in frames from every speaker's reported latency, count
+ * values in microseconds (a negative one counts as 0):
+ * clamp(R_max + 4410, 4410, 88200). NULL or a count of 0 gives 4410.
+ */
+uint32_t asc_airplay_session_latency_frames(const int64_t *reported_us, size_t count);
+
+/*
+ * Gives the speaker added under id a delay of its own on top of the
+ * hold-back (the host's E - e_s for a receiver that reports less latency
+ * than the largest), offset_ms clamped to 0 to ASC_AIRPLAY_MAX_DELAY_MS and
+ * the sum capped there; not finite counts as 0. Returns the offset applied
+ * in ms, -1 for a NULL handle or id or an id not added.
+ */
+double asc_airplay_set_speaker_offset(AscAirPlay *airplay, const char *id, double offset_ms);
+
+/*
+ * A speaker's counters, as asc_airplay_speaker_counters copies them: one
+ * session's, or a stereo pair's or home theater group's summed over its
+ * members. They keep counting across the speaker's reconnects.
+ */
+typedef struct AscAirPlayCounters {
+    uint64_t packets_sent;
+    uint64_t resend_requests;
+    uint64_t packets_resent;
+    uint64_t not_held;             /* requested packets not resent: no longer held, or resent three times */
+    uint64_t timing_replies;
+    uint64_t late_packets;         /* sent more than 5 ms after their time */
+    uint64_t silent_frames;
+    uint64_t input_frames_dropped; /* the stream's count: every session plays the one input */
+    uint64_t foreign_datagrams;    /* dropped on the control and timing sockets: from another address */
+    uint32_t sessions;             /* sessions summed: 1 for a speaker, the member count for a target */
+} AscAirPlayCounters;
+
+/* The stream's counters, as asc_airplay_stream_counters copies them. */
+typedef struct AscAirPlayStreamCounters {
+    double rate_hz;                /* the current input rate estimate */
+    uint64_t packets_encoded;      /* one per packet of the timeline */
+    uint64_t silent_frames;        /* inserted where the input hadn't arrived in time */
+    uint64_t input_frames_dropped;
+} AscAirPlayStreamCounters;
+
+/*
+ * Copies into *out the counters of the speaker added under id: a stereo
+ * pair's or home theater group's summed over its members, or one member's
+ * when id names a member of an added target. Reads atomics only, never
+ * blocking the sender. False, with *out zeroed, when the handle or id is
+ * NULL, the sender stopped working, or nothing was added under id; false
+ * and nothing written when out is NULL.
+ */
+bool asc_airplay_speaker_counters(const AscAirPlay *airplay, const char *id,
+                                  AscAirPlayCounters *out);
+
+/*
+ * Copies the stream's counters into *out. False, with *out zeroed, for a
+ * NULL handle or a sender that stopped working; false and nothing written
+ * when out is NULL.
+ */
+bool asc_airplay_stream_counters(const AscAirPlay *airplay, AscAirPlayStreamCounters *out);
+
+/*
+ * Sets what is playing, for the receivers that show it: the track's title,
+ * artist and album as UTF-8 text, and its artwork as two JPEGs of at most
+ * 512 KiB each: large for AirPlay 2 sessions, small for AirPlay 1 sessions
+ * and after a refusal. Every speaker that lists the type gets it now, and
+ * every speaker that starts or restarts later gets it too. A NULL text is an
+ * empty one, and three NULL texts send no track information; one image alone
+ * serves both paths, and none (NULL or a length of 0) sends no artwork.
+ * Returns false, changing nothing, for a NULL or dead handle, a text that
+ * isn't UTF-8, a NULL image with a length, or an image the sender refuses
+ * (not a JPEG, or too large).
+ */
+bool asc_airplay_set_now_playing(AscAirPlay *airplay, const char *title, const char *artist,
+                                 const char *album, const uint8_t *large, size_t large_len,
+                                 const uint8_t *small, size_t small_len);
+
+/*
+ * Sets how far into the track the audio arriving now is, and how long the
+ * track is, in ms, for the receivers that show progress. It goes out with
+ * the track and artwork set last (asc_airplay_set_now_playing), now and to
+ * every speaker that starts or restarts later. A length that isn't positive
+ * and finite sends none; so does another track, until this is called again,
+ * while the same track set again keeps it. An elapsed time outside 0 to the
+ * length is taken as its nearest end. Returns false, changing nothing, for a
+ * NULL or dead handle.
+ */
+bool asc_airplay_set_progress(AscAirPlay *airplay, double elapsed_ms, double length_ms);
+
+/*
+ * Tells which app the now-playing control follows, by a name for the debug
+ * log (UTF-8), and what it does (ASC_AIRPLAY_PLAYBACK_*), so a speaker
+ * remote's Play or Pause goes as play-pause only when that changes something.
+ * A NULL or empty app is no app to control: remote transport commands then do
+ * nothing. Returns false, changing nothing, for a NULL or dead handle or an
+ * app that isn't UTF-8.
+ */
+bool asc_airplay_set_playback(AscAirPlay *airplay, const char *app, int32_t playback);
+
+/*
+ * Opens the pairing store kept in the file at `path` (UTF-8), meant for
+ * once, before discovery starts: an Apple TV it holds credentials for is
+ * listed as available and verifies with them; one it doesn't is listed as
+ * ASC_AIRPLAY_NEEDS_PIN. The file is versioned, mode 0600, written through a
+ * temporary file created new and renamed over it, and removed once nothing
+ * is paired; it never holds a password. Listed receivers are reported again
+ * as changed. A store whose last write failed, left by a handle destroyed
+ * this run, is taken back instead of reading the file; for a file its first
+ * open ignored, that code is returned again. Returns how many receivers it
+ * holds credentials for, or an ASC_AIRPLAY_PAIRINGS_* code.
+ */
+int32_t asc_airplay_open_pairings(AscAirPlay *airplay, const char *path);
+
+/*
+ * Opens the AirPlay 2 identity kept in the file at `path` (UTF-8), meant for
+ * once, before discovery starts: the device ID the AirPlay 2 path sends, made
+ * and written once when the file is missing, and the HomeKit credentials of
+ * the receivers it paired with, which later sessions verify with; new ones
+ * are written to it as pairings give them. Kept like the pairings file
+ * (versioned, mode 0600, replaced through a temporary file); it never holds
+ * a password and its credentials never cross this interface. An identity
+ * whose last write failed comes back as asc_airplay_open_pairings says for
+ * such a store. With the hidden AirPlay 2 switch off it reads and writes
+ * nothing and returns 0, and only asc_airplay_forget_pairing opens the
+ * file, to drop the receiver from it,
+ * and writes it only when it reads as this build's own: one it can't read
+ * or parse, or that another account owns, is left as it is.
+ * Returns how many receivers it holds credentials for, or an
+ * ASC_AIRPLAY_PAIRINGS_* code.
+ */
+int32_t asc_airplay_open_airplay2_identity(AscAirPlay *airplay, const char *path);
+
+/*
+ * How private asc_airplay_open_pairings found the pairings file, for the
+ * host's log: an ASC_AIRPLAY_FILE_* code. A file other accounts could read
+ * or write is made owner-only when it is opened, also when it is then
+ * ignored.
+ */
+int32_t asc_airplay_pairings_access(const AscAirPlay *airplay);
+
+/*
+ * How private asc_airplay_open_airplay2_identity found the identity file, for
+ * the host's log: an ASC_AIRPLAY_FILE_* code, ASC_AIRPLAY_FILE_UNREAD with
+ * the hidden AirPlay 2 switch off.
+ */
+int32_t asc_airplay_airplay2_identity_access(const AscAirPlay *airplay);
+
+/*
+ * Starts a PIN pairing with the listed receiver `id` (one listed as
+ * ASC_AIRPLAY_NEEDS_PIN that the user turned on; never on the app's own): it
+ * is asked to show a PIN, and ASC_AIRPLAY_EVENT_PIN_NEEDED follows, or how
+ * the pairing ended. It uses the password handed over for `id`, if any. A
+ * pairing already running for it is replaced (cancelled). A new pairing
+ * starts once the one cancelled before it has ended, and nothing that one
+ * reports reaches the host or ends the new one; when that one ended paired
+ * after all, the new one never starts and ASC_AIRPLAY_EVENT_PAIRED follows
+ * instead, with no PIN asked. Returns false, starting nothing, when the
+ * handle or id is NULL or id isn't listed.
+ */
+bool asc_airplay_start_pairing(AscAirPlay *airplay, const char *id);
+
+/*
+ * Hands the PIN the user typed to the pairing with `id`; the outcome comes as
+ * an event (ASC_AIRPLAY_EVENT_PAIRED, or _PAIRING_FAILED with
+ * ASC_AIRPLAY_ERROR_WRONG_PIN). Returns false, sending nothing, when a
+ * pointer is NULL, no pairing runs for id, or pin isn't digits only. Never
+ * kept or logged.
+ */
+bool asc_airplay_submit_pin(AscAirPlay *airplay, const char *id, const char *pin);
+
+/*
+ * Stops the pairing with `id`, if one runs; nothing more is reported for it.
+ * Credentials it still gets before it stops are stored all the same.
+ */
+void asc_airplay_cancel_pairing(AscAirPlay *airplay, const char *id);
+
+/*
+ * Hands over the password of receiver `id` for its next sessions
+ * (asc_airplay_add_speaker adds or restarts one) and pairings, until the
+ * handle is destroyed; NULL or "" forgets it. Kept in memory only and wiped
+ * when dropped, never stored or logged, and forgotten when the receiver turns
+ * it down. Returns false when the handle or id is NULL, or when password is
+ * not UTF-8, which keeps the stored one.
+ */
+bool asc_airplay_set_password(AscAirPlay *airplay, const char *id, const char *password);
+
+/*
+ * Marks the stored credentials of `id` as turned down by an answer this run,
+ * as a handle that stopped working had them: it is listed as needing a PIN
+ * until a new pairing replaces them or a session proves them. Returns whether
+ * credentials are stored for it; false when the handle or id is NULL.
+ */
+bool asc_airplay_credentials_turned_down(AscAirPlay *airplay, const char *id);
+
+/*
+ * Forgets the stored credentials of `id` and rewrites the pairings file; the
+ * receiver is reported again as ASC_AIRPLAY_NEEDS_PIN. Returns an
+ * ASC_AIRPLAY_FORGET_* code. The core also forgets credentials a receiver
+ * turns down by itself.
+ */
+int32_t asc_airplay_forget_pairing(AscAirPlay *airplay, const char *id);
+
+/*
+ * The sender's audio input, for the capture thread: the first call hands it
+ * over, every later one returns NULL, as does a NULL handle. It starts
+ * without a rate, so its writes are dropped until asc_airplay_input_set_rate
+ * gives it one.
+ */
+AscAirPlayInput *asc_airplay_take_input(AscAirPlay *airplay);
+
+/*
+ * Any thread: the rate in Hz of the audio the capture writes from now on,
+ * rounded to whole hertz. The next write takes it in and starts the
+ * resampler afresh, with a 20 ms fade-in from silence, so call it at each
+ * capture start, even at an unchanged rate. Returns false, changing nothing,
+ * for a NULL handle or a rate outside 8000 to 384 000 Hz. Real-time safe.
+ */
+bool asc_airplay_input_set_rate(AscAirPlayInput *input, double rate);
+
+/*
+ * Any thread, at a session stop: the input fades out over the next 20 ms of
+ * frames written and hands zeros after them, until the next
+ * asc_airplay_input_set_rate fades it in again. Does nothing for a NULL
+ * handle. Real-time safe.
+ */
+void asc_airplay_input_request_fade_out(AscAirPlayInput *input);
+
+/*
+ * Capture thread: hands `frames` interleaved stereo frames at the rate last
+ * set to the sender, resampled to 44.1 kHz, as audio that arrived now.
+ * Returns the 44.1 kHz frames handed over, 0 before a rate is set; the
+ * sender drops those that come too late or don't fit. Reads the monotonic
+ * clock once. Real-time safe. Returns 0 once a write panicked (only a panic
+ * itself would allocate).
+ */
+size_t asc_airplay_input_write(AscAirPlayInput *input, const float *samples, size_t frames);
+
+/*
+ * Capture thread, after a block went to both `writer`'s ring and this
+ * input: announces on the ring, once, the speakers' newest timeline move, at
+ * the ring frame and in ring frames at the capture rate, so the local
+ * outputs start it on the speakers' frame. Returns whether it announced one.
+ * Real-time safe.
+ */
+bool asc_airplay_input_forward_move(AscAirPlayInput *input, AscRingWriter *writer);
+
+/*
+ * Frees an input handle. Takes the address of the host's pointer and sets
+ * that pointer to NULL, so destroying through it again does nothing; a NULL
+ * address or pointer does nothing.
+ */
+void asc_airplay_input_destroy(AscAirPlayInput **input);
+
+/* ---- Google Cast sender (AudioSync's own, cast/) --------------------------- */
+
+/*
+ * AudioSync's own Google Cast sender: discovery, one device's session at a
+ * time, its events, the device memory the host stores between runs, and
+ * the capture's audio through an input handle. Devices go by their id: 32
+ * hex digits from discovery, or "manual:<ip:port>" for one added by
+ * address. A Cast device is a measured-offset output: nothing ties its
+ * playback to a clock, so the host delays its other outputs by the offset
+ * stored here per device, and Resync is only ever a user action.
+ * Every asc_cast_* call on a sender handle runs on one control thread at a
+ * time, never an audio thread, and none waits on the network: the sender's
+ * worker thread makes every network call. asc_cast_destroy is the one call
+ * that waits. An input handle (AscCastInput) has its own rules, below.
+ *
+ * A bug in the sender never ends the host: a panic inside a call returns
+ * that call's failure value (NULL, false, 0 or -1) and makes the handle
+ * dead, as does a panic that ends its worker thread. A dead handle's calls
+ * do nothing, except that asc_cast_next_event reports ASC_CAST_EVENT_FAILED
+ * once; the host then destroys it and may create a new one. Its .detail is
+ * "panic at <file>:<line>", "latest panic at <file>:<line>" or "", as for
+ * the AirPlay sender.
+ */
+typedef struct AscCast AscCast;
+
+/*
+ * The capture's way into a Cast sender (asc_cast_take_input). Its write runs
+ * on one capture thread at a time, its rate and fade-out requests on any
+ * thread, and its destroy once no write can run. It may outlive its sender,
+ * whose audio then goes nowhere.
+ */
+typedef struct AscCastInput AscCastInput;
+
+/*
+ * One device change. The strings are NUL-terminated UTF-8 that the handle
+ * owns, valid until the next asc_cast_next_device call on it or its destroy.
+ * A gone device has only its id; its name and model are "", its flags 0.
+ */
+typedef struct AscCastDevice {
+    int32_t event;     /* ASC_CAST_APPEARED, _CHANGED or _GONE */
+    const char *id;    /* 32 hex digits, or "manual:<ip:port>" */
+    const char *name;  /* the name it announces, else its full service name; "" when none */
+    const char *model; /* its model, "" when none */
+    uint32_t flags;    /* ASC_CAST_FLAG_* bits */
+    const char *former; /* on the APPEARED of a device a browse found that was added by address:
+                           the "manual:<ip:port>" id it was listed under; "" otherwise */
+} AscCastDevice;
+
+/*
+ * One member of the playing Cast group. The strings are NUL-terminated
+ * UTF-8 that the handle owns, valid until the next asc_cast_member call on
+ * it or its destroy.
+ */
+typedef struct AscCastMember {
+    const char *id;   /* the listed device it is, as AscCastDevice.id; "" when none matches: show the name alone */
+    const char *name; /* the name the group gives it, "" when none */
+} AscCastMember;
+
+/*
+ * One thing that happened to an attempt, or to the sender. The strings are
+ * NUL-terminated UTF-8 that the handle owns, valid until the next
+ * asc_cast_next_event call on it or its destroy. Fields a kind doesn't use
+ * are 0 or "", except retry_ms, which is then -1.
+ */
+typedef struct AscCastEvent {
+    int32_t kind;        /* ASC_CAST_EVENT_* */
+    uint64_t attempt;    /* what asc_cast_start returned for it; 0 for none */
+    const char *id;      /* the attempt's device id; "" for none */
+    int32_t reason;      /* an ended event's ASC_CAST_END_* */
+    int32_t error;       /* ASC_CAST_ERROR_* */
+    int32_t format;      /* ASC_CAST_FORMAT_* */
+    int64_t retry_ms;    /* ms until the next connect attempt */
+    double level;        /* the device's volume, 0 to 1 */
+    bool muted;
+    bool volume_fixed;   /* the device's volume can't be changed: show the control as unavailable */
+    bool has_level;      /* the status gave the level; .level means nothing without it */
+    bool answers_mute;   /* a volume event's status is the first since a mute was sent */
+    double step;         /* the device's volume step; 0 when it reports none */
+    uint64_t ask;        /* a volume-unanswered event's ask id, as asc_cast_set_volume returned it */
+    double drift_ms;     /* dropped audio plus rebuffering since the stream was loaded */
+    double queued_ms;    /* audio waiting in the sender's queue */
+    uint64_t underrun_frames; /* silent frames sent since the stream was loaded because the input ran dry */
+    bool resync_offered; /* the drift is over 250 ms: the host may offer Resync */
+    bool relaunched;     /* the app had to be launched and loaded again */
+    const char *detail;  /* an error's text, a log line, a panic location; for a debug log */
+} AscCastEvent;
+
+/*
+ * Starts a Cast sender's worker thread with the device memory the host
+ * stored from asc_cast_memory_json; NULL, or text that doesn't read, starts
+ * empty, and damaged entries are skipped. Discovery waits for
+ * asc_cast_start_discovery. Returns NULL when the thread can't start.
+ */
+AscCast *asc_cast_create(const char *memory_json);
+
+/*
+ * As asc_cast_create, keeping the certificate fingerprints in
+ * cast-certificates.txt in folder, so a certificate changed across a
+ * relaunch is logged too. NULL or an empty folder keeps them in memory.
+ */
+AscCast *asc_cast_create_in(const char *memory_json, const char *folder);
+
+/*
+ * Whether asc_cast_create reads memory_json as device memory: a JSON object
+ * that no newer format version wrote. Keep a file that doesn't read before
+ * saving over it. False for NULL.
+ */
+bool asc_cast_memory_reads(const char *memory_json);
+
+/*
+ * Stops the sender and frees it: a running or starting session is torn down
+ * within 3 s, which this call waits for (about 3.5 s at most), so call it
+ * from the quit path, off the main thread. Takes the address of the host's
+ * pointer and sets that pointer to NULL; a NULL address or pointer does
+ * nothing. An input taken from it stays valid until its own destroy.
+ */
+void asc_cast_destroy(AscCast **cast);
+
+/*
+ * Starts browsing the local network for Cast devices over multicast DNS;
+ * they arrive through asc_cast_next_device. When it runs already, a fresh
+ * browser takes the running one's place and the list stays. Returns false
+ * when the handle is NULL or dead or multicast DNS can't start.
+ */
+bool asc_cast_start_discovery(AscCast *cast);
+
+/*
+ * Stops browsing: every device discovery found is reported gone, except one
+ * in a session, which stays listed as offline. Devices added by address stay.
+ */
+void asc_cast_stop_discovery(AscCast *cast);
+
+/*
+ * Adds a device by address, for a network where multicast DNS is blocked:
+ * "ip:port", "[ipv6]:port" or an address alone (port 8009). It is listed as
+ * "manual:<ip:port>" until a browse finds its id, then reported gone and
+ * listed again under that id. Returns false for a NULL or dead handle or an
+ * address that doesn't read.
+ */
+bool asc_cast_add_device(AscCast *cast, const char *address);
+
+/*
+ * Takes back a device added by address that no browse has found yet, by its
+ * "manual:<ip:port>" ID; its gone change follows. Turn it off first. Returns
+ * false for a NULL or dead handle, or an ID that names no such device: one a
+ * browse found stays listed under its id.
+ */
+bool asc_cast_remove_device(AscCast *cast, const char *id);
+
+/*
+ * Clears the device authentication pin or mark of the device listed as `id`
+ * when the user removes it, with a line for the debug log. Returns false for
+ * a NULL or dead handle, an ID that doesn't read, or a device with nothing
+ * to clear.
+ */
+bool asc_cast_clear_device_key(AscCast *cast, const char *id);
+
+/*
+ * Checks the ID of the device the user selected, or none with a NULL or empty
+ * id. Nothing holds it: the list's cap of 128 devices drops no listed device
+ * (C108). Returns false for a NULL or dead handle, or an ID that doesn't read.
+ */
+bool asc_cast_set_selected(AscCast *cast, const char *id);
+
+/*
+ * Takes the next device change, if one is waiting, into *device and returns
+ * true. Returns false, leaving *device as it was, when none is waiting or
+ * either pointer is NULL. Never waits.
+ */
+bool asc_cast_next_device(AscCast *cast, AscCastDevice *device);
+
+/*
+ * Takes the next event, if one is waiting, into *event and returns true.
+ * Returns false, leaving *event as it was, when none is waiting or either
+ * pointer is NULL. Never waits. Every attempt's events carry its number,
+ * and every attempt ends with exactly one ASC_CAST_EVENT_ENDED. A dead
+ * sender reports ASC_CAST_EVENT_FAILED once, in place of whatever still
+ * waited, and nothing after it.
+ */
+bool asc_cast_next_event(AscCast *cast, AscCastEvent *event);
+
+/*
+ * Starts a session on the listed device `id` in the background and returns
+ * its attempt number (1 or more). The stream plays what the input writes
+ * from then on, with the metadata and artwork set last; the format that
+ * worked last on the device is tried first. Returns 0, starting nothing,
+ * for a NULL or dead handle, an id that isn't listed, or while
+ * another Cast device plays or starts; *refused (when refused isn't NULL)
+ * gets the ASC_CAST_REFUSED_* code, ASC_CAST_REFUSED_NONE on success.
+ */
+uint64_t asc_cast_start(AscCast *cast, const char *id, int32_t *refused);
+
+/*
+ * How many members the playing group has, as its latest
+ * ASC_CAST_EVENT_MEMBERS reported; 0 while none are known, when no group
+ * plays, and for a NULL or dead handle.
+ */
+size_t asc_cast_member_count(AscCast *cast);
+
+/*
+ * Writes member `index` of the playing group into *member and returns true.
+ * Returns false, leaving *member as it was, for an index past the count or
+ * a NULL pointer or handle.
+ */
+bool asc_cast_member(AscCast *cast, size_t index, AscCastMember *member);
+
+/*
+ * Stops the session, or the attempt to start one: connect retries and the
+ * waits for the device end at once, and the teardown runs on the worker.
+ * Another device may start right away; this attempt's ended event follows.
+ */
+void asc_cast_stop(AscCast *cast);
+
+/*
+ * Sets the device's volume, 0 to 1, clamped. Show the level volume events
+ * report, and while the user drags a slider send at most one every 100 ms.
+ * Returns the ask id that ASC_CAST_EVENT_VOLUME_UNANSWERED names for this
+ * ask; 0, sending nothing, for a NULL or dead handle, a level that isn't
+ * finite, or when no session runs or starts; a locked volume comes as
+ * ASC_CAST_EVENT_COMMAND_FAILED with ASC_CAST_ERROR_VOLUME_FIXED.
+ */
+uint64_t asc_cast_set_volume(AscCast *cast, double level);
+
+/*
+ * Mutes or unmutes the device, apart from its level. Returns false, sending
+ * nothing, for a NULL or dead handle or when no session runs or starts.
+ */
+bool asc_cast_set_muted(AscCast *cast, bool muted);
+
+/*
+ * Moves the device's volume one of its own steps up or down. Returns false,
+ * sending nothing, for a NULL or dead handle or when no session runs or
+ * starts.
+ */
+bool asc_cast_step_volume(AscCast *cast, bool up);
+
+/*
+ * Sets the master position (0 to 100): every session's audio is scaled by
+ * its gain on the volume curve, a change fading in over the next read, and
+ * no device is sent a volume (S415). A master that isn't finite is ignored.
+ */
+void asc_cast_set_master(AscCast *cast, double master);
+
+/*
+ * Takes the equalizer's headroom cut (gains_db holds ASC_EQ_BANDS values, at
+ * 48 kHz), which the master's gain gives back as far as unity allows (S26,
+ * S415). Returns false when cast or gains_db is NULL.
+ */
+bool asc_cast_set_equalizer(AscCast *cast, bool enabled, const double *gains_db);
+
+/*
+ * The speaker's zone level (0 to 1, 1 outside a zone) on a Cast speaker's
+ * own level, which may pass 1. The level to send is zone * own, at most 1;
+ * anything not finite counts as 0. A reported level that answers none the
+ * host sent means the own level reported / zone, unclamped above, and
+ * leaves `own` as it is at zone 0 or when a value isn't finite. A reported
+ * level answers a sent one within half a percent. A session starts from
+ * `own` when has_own is true, whatever its first status reports; without
+ * one, from that status's level read as asc_cast_zone_own_level reads it.
+ */
+double asc_cast_zone_level(double zone, double own);
+double asc_cast_zone_own_level(double reported, double zone, double own);
+double asc_cast_zone_start_own_level(double zone, bool has_own, double own, double reported);
+
+/*
+ * A Cast row moved to `row`, 0 to 100 (S415): writes the own level to store,
+ * row / zone, possibly above 1, through `own`, so the device gets the row
+ * itself. False, writing nothing, at zone 0, when `row` isn't finite or
+ * `own` is NULL.
+ */
+bool asc_cast_row_move(double row, double zone, double *own);
+bool asc_cast_level_answers(double sent, double reported);
+
+/*
+ * Whether a reported level answers the level sent: within half a percent,
+ * or within half of `step`, the device's own volume step (0 for none), as a
+ * device that rounds to its step answers.
+ */
+bool asc_cast_volume_answers(double sent, double reported, double step);
+
+/*
+ * Sets the track's title, artist and album (UTF-8) for the next time the
+ * stream is loaded: the next start, or a Resync; a playing stream is not
+ * reloaded for it. NULL or "" leaves a field out. Returns false, changing
+ * nothing, for a NULL or dead handle or a text that isn't UTF-8.
+ */
+bool asc_cast_set_metadata(AscCast *cast, const char *title, const char *artist, const char *album);
+
+/*
+ * Sets the track's artwork, a PNG or JPEG of at most 1280 by 720, for the
+ * next load of this and every later session; NULL or a length of 0 forgets
+ * it. A device or sender refusing the image comes as
+ * ASC_CAST_EVENT_COMMAND_FAILED with ASC_CAST_ERROR_ARTWORK. Returns false,
+ * changing nothing, for a NULL or dead handle, NULL bytes with a length, or
+ * more than 8 MiB.
+ */
+bool asc_cast_set_artwork(AscCast *cast, const uint8_t *bytes, size_t len);
+
+/*
+ * The user's Resync: the stream is loaded again on the same app, which brings
+ * the latency back toward where it started, at the cost of a gap. Never sent
+ * by the core on its own. Returns false, sending nothing, for a NULL or dead
+ * handle or when no session runs or starts.
+ */
+bool asc_cast_resync(AscCast *cast);
+
+/*
+ * Stores the user's measured offset for device `id` in ms, rounded to whole
+ * ms; the host delays its other outputs by it. The device needn't be listed.
+ * Store asc_cast_memory_json afterwards. Returns false for a NULL or dead
+ * handle, an id that doesn't read, or an offset outside 0 to 120 000 ms.
+ */
+bool asc_cast_set_offset(AscCast *cast, const char *id, double offset_ms);
+
+/*
+ * The offset stored for device `id` in ms; -1 when none is, and for a NULL
+ * or dead handle or an id that doesn't read.
+ */
+double asc_cast_offset_ms(AscCast *cast, const char *id);
+
+/*
+ * Holds the audio the input hands the session back by hold_back_ms, live,
+ * so a device whose offset is shorter than L plays at L. It stops at
+ * 20 000 ms; a value below 0 or not finite counts as 0. A change fades out
+ * and in over 20 ms; a capture start (asc_cast_input_set_rate) begins with
+ * silence for the hold-back, never with the end of the last capture.
+ * Returns the hold-back applied, in ms; 0 for a NULL or dead handle.
+ */
+double asc_cast_set_hold_back(AscCast *cast, double hold_back_ms);
+
+/*
+ * Takes the formats and offsets of memory_json, a stored memory, for each
+ * device field the handle's memory holds none of, so a value set since
+ * launch wins. Store asc_cast_memory_json afterwards. Returns false for a
+ * NULL or dead handle or text asc_cast_memory_reads refuses.
+ */
+bool asc_cast_fill_memory(AscCast *cast, const char *memory_json);
+
+/*
+ * The device memory to store between runs, as JSON: per device, the format
+ * that last worked and the offset. NUL-terminated UTF-8 that the handle
+ * owns, valid until the next asc_cast_memory_json call on it or its destroy.
+ * NULL for a NULL or dead handle.
+ */
+const char *asc_cast_memory_json(AscCast *cast);
+
+/*
+ * The sender's audio input, for the capture thread: the first call hands it
+ * over, every later one returns NULL, as does a NULL or dead handle. It
+ * starts without a rate, so its writes are dropped until
+ * asc_cast_input_set_rate gives it one.
+ */
+AscCastInput *asc_cast_take_input(AscCast *cast);
+
+/*
+ * Any thread: the rate in Hz of the audio the capture writes from now on,
+ * rounded to whole hertz. The next write takes it in and starts the
+ * resampler afresh, with a 20 ms fade-in from silence, so call it at each
+ * capture start, even at an unchanged rate. Returns false, changing
+ * nothing, for a NULL handle or a rate outside 8000 to 384 000 Hz.
+ * Real-time safe.
+ */
+bool asc_cast_input_set_rate(AscCastInput *input, double rate);
+
+/*
+ * Any thread, at a capture stop: the input fades out over the next 20 ms of
+ * frames written and hands zeros after them, until the next
+ * asc_cast_input_set_rate fades it in again. Does nothing for a NULL handle.
+ * Real-time safe.
+ */
+void asc_cast_input_request_fade_out(AscCastInput *input);
+
+/*
+ * Capture thread: hands `frames` interleaved stereo frames at the rate last
+ * set to the running session, resampled to ASC_CAST_RATE. Returns the
+ * frames at that rate its ring took: 0 before a rate is set and while no
+ * session runs or starts; frames that don't fit are dropped. Real-time
+ * safe. Returns 0 once a write panicked.
+ */
+size_t asc_cast_input_write(AscCastInput *input, const float *samples, size_t frames);
+
+/*
+ * Frees an input handle. Takes the address of the host's pointer and sets
+ * that pointer to NULL; a NULL address or pointer does nothing.
+ */
+void asc_cast_input_destroy(AscCastInput **input);
+
+/* ---- Web remote (AudioSync's own, remote/) --------------------------------- */
+
+/*
+ * AudioSync's web remote: a small HTTP server on the home network that
+ * serves one page to paired phones. The host publishes a full snapshot as
+ * JSON whenever something the page shows changes; each change a phone makes
+ * comes back through the command callback, on a server thread, and the host
+ * applies it on its main thread like a click in its window, then publishes
+ * the result. The server never calls the host for a read.
+ * Every asc_remote_* call on a handle runs on one control thread at a time,
+ * never an audio thread. asc_remote_stop waits for a callback in progress,
+ * so the callback must not wait for the thread that stops the remote.
+ * A panic inside a call returns that call's failure value (NULL, false or 0).
+ */
+typedef struct AscRemote AscRemote;
+
+/*
+ * The host's command callback, on a server thread, one call at a time:
+ * command_json is NUL-terminated UTF-8 valid during the call only, either
+ * {"type":"speaker","id":...} with the posted "on", "volume" (0 to 100) and
+ * "delay_ms" among the fields, {"type":"master","volume":...}, or
+ * {"type":"source","id":...}, a source the last snapshot listed as
+ * available. Every value was checked against the last snapshot's ranges.
+ */
+typedef void (*AscRemoteCommand)(void *context, const char *command_json);
+
+/*
+ * Starts the remote. config_json is {"port", "local_name", "devices_path",
+ * "listen"}, each optional: the port (default ASC_REMOTE_DEFAULT_PORT), the
+ * computer's name so <local_name>.local is an accepted address, the file
+ * that keeps the paired devices' token hashes (none: memory only), and the
+ * IP literals to listen on (default every IPv6 and IPv4 address). A NULL
+ * config_json takes every default; one that isn't UTF-8 fails with
+ * ASC_REMOTE_ERROR_CONFIG. command gets each accepted change with context;
+ * both may be used from any thread until asc_remote_stop returns. Returns
+ * NULL on failure with the reason (ASC_REMOTE_ERROR_*) in *error when error
+ * isn't NULL.
+ */
+AscRemote *asc_remote_start(const char *config_json, AscRemoteCommand command, void *context, int32_t *error);
+
+/* The port the remote listens on. */
+uint32_t asc_remote_port(AscRemote *remote);
+
+/*
+ * Publishes the snapshot in state_json: {"computer_name", "master": {"volume"},
+ * "now_playing": {"title", "artist", "source"} or null, "speakers": [{"id",
+ * "name", "kind", "on", "volume", "delay_ms", "delay_min_ms", "delay_max_ms",
+ * "available", "notice"}], "sources": [{"id", "name", "kind" ("system",
+ * "app" or "input"), "available", "notice"}], "source_id"}, volumes 0 to
+ * 100, ids unique and not empty; computer_name is the name the page's footer
+ * shows, empty when left out. sources is the source picker's list in its
+ * order (none when left out; available is true when left out), and
+ * source_id the one in use, or null; one the list doesn't hold counts as
+ * null. The server numbers
+ * it and streams it to the open pages; an unchanged snapshot sends nothing.
+ * Returns false when it doesn't read; the previous one then stays. Neither
+ * the snapshot nor the name ever reaches the log.
+ */
+bool asc_remote_publish(AscRemote *remote, const char *state_json);
+
+/*
+ * The pairing code that works now, 6 digits, or NULL when none does (it
+ * expired after 10 minutes: call asc_remote_rotate_code). The string is the
+ * handle's, valid until the next code call on it or its stop.
+ */
+const char *asc_remote_pairing_code(AscRemote *remote);
+
+/*
+ * Makes a new pairing code, for when the user opens the setting: the old
+ * one stops working and a lockout after too many wrong codes ends. Returns
+ * it as asc_remote_pairing_code does; NULL when no code could be made.
+ */
+const char *asc_remote_rotate_code(AscRemote *remote);
+
+/*
+ * Makes <local_name>.local the accepted address in place of the name the
+ * remote started with, for when the computer is renamed; NULL or empty
+ * leaves only the IP address. The pairing code, its age and a lockout stay.
+ */
+void asc_remote_set_local_name(AscRemote *remote, const char *local_name);
+
+/* Whether 40 wrong codes locked pairing until the next asc_remote_rotate_code. */
+bool asc_remote_pairing_locked(AscRemote *remote);
+
+/* How many devices are paired (8 at most; pairing a ninth drops the oldest). */
+uint32_t asc_remote_device_count(AscRemote *remote);
+
+/*
+ * Forgets every paired device: their next request is refused and their open
+ * pages lose the stream. Returns false when the device file couldn't be
+ * written; they are still forgotten until the app quits.
+ */
+bool asc_remote_forget_all(AscRemote *remote);
+
+/*
+ * The oldest debug-log line not taken yet (pairing, refusals, file
+ * problems; never a code or a token), or NULL when there is none. The
+ * string is the handle's, valid until the next call of this on it or its stop.
+ */
+const char *asc_remote_next_log(AscRemote *remote);
+
+/*
+ * Stops the remote and frees it: closes the port and every connection and
+ * waits for a command callback in progress; once it returns the callback is
+ * never called again. Takes the address of the host's pointer and sets that
+ * pointer to NULL; a NULL address or pointer does nothing.
+ */
+void asc_remote_stop(AscRemote **remote);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* AUDIOSYNC_CORE_H */

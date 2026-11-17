@@ -1,0 +1,508 @@
+import CAudioSyncCore
+import CoreAudio
+import Foundation
+
+// The decisions of a microphone calibration (S232-S234) that need no audio
+// hardware, so the logic suite can check them: when one may start, how long
+// each run records and where its frame 0 is, and what the core's estimate
+// does to the chosen speaker's offset. AppDelegate+Calibration.swift runs
+// the measurement around them.
+
+/// Which of the two runs something concerns.
+enum CalibrationRecording: Equatable {
+    case reference
+    case chosen
+}
+
+/// What a calibration needs that is off, named in this order in its text.
+struct CalibrationMissing: OptionSet, Hashable {
+    let rawValue: Int
+    static let streaming = CalibrationMissing(rawValue: 1)
+    /// The speaker being calibrated.
+    static let speaker = CalibrationMissing(rawValue: 2)
+    /// The Mac's built-in speakers.
+    static let reference = CalibrationMissing(rawValue: 4)
+    static let all: CalibrationMissing = [.streaming, .speaker, .reference]
+
+    /// While streaming runs, whichever of `speaker` and `reference` doesn't
+    /// play; while it is off, whichever is switched off.
+    static func of(streaming: Bool, speaker: String, reference: String, playing: Set<String>,
+                   switchedOn: Set<String>) -> CalibrationMissing {
+        let on = streaming ? playing : switchedOn
+        var missing: CalibrationMissing = streaming ? [] : .streaming
+        if !on.contains(speaker) { missing.insert(.speaker) }
+        if !on.contains(reference) { missing.insert(.reference) }
+        return missing
+    }
+}
+
+/// Why a calibration changed nothing.
+enum CalibrationFailure: Equatable {
+    /// No reference (the Mac's built-in speakers) is listed.
+    case noReference
+    /// Streaming is off, or the chosen speaker or the reference isn't playing.
+    case notPlaying(CalibrationMissing)
+    /// The built-in output plays to the headphone jack, so its speakers are silent.
+    case referenceHeadphones
+    case microphoneDenied
+    /// No default input device, or one AudioSync can't read.
+    case noMicrophone
+    /// The default input is a Bluetooth headset's hands-free one, which
+    /// recording from would switch to call mode.
+    case handsFreeMicrophone
+    /// The capture's rate is outside the test signal's range (S233).
+    case unsupportedRate
+    /// The microphone's rate is outside the test signal's range (S233).
+    case unsupportedMicrophoneRate
+    /// No block carried the signal: neither the capture nor the fill that
+    /// stands in for a quiet capture (`QuietFill`) wrote one.
+    case sourceSilent
+    /// Streaming stopped, or the speakers or their delays changed, during
+    /// the measurement.
+    case interrupted
+    /// Measure Again: the row's stored delay changed since the sheet was made.
+    case delayChanged
+    /// The default input device or its rate changed between the runs.
+    case microphoneChanged
+    /// The microphone lost audio before the recording's end, so its timing
+    /// can't be trusted.
+    case microphoneSkipped
+    case tooShort(CalibrationRecording?)
+    case tooLong(CalibrationRecording?)
+    case clipped(CalibrationRecording?)
+    case tooQuiet(CalibrationRecording?)
+    case ambiguousEcho(CalibrationRecording?)
+    case implausible
+    /// Calibrate Zone: no speaker in zone `zone` but the reference can be measured (S255).
+    case nothingToMeasure(zone: String)
+}
+
+/// The input device a run recorded with (an `AudioObjectID`) and its rate.
+struct CalibrationMicrophoneID: Equatable {
+    var device: UInt32
+    var rate: UInt32
+}
+
+/// Where one calibration stands.
+enum CalibrationPhase: Equatable {
+    enum Step: Equatable {
+        /// The music fades out and what is still on its way plays out.
+        case preparing
+        case measuring(CalibrationRecording)
+        case estimating
+    }
+
+    case idle
+    case running(Step)
+    /// The new offset was filled in; `clamped` when the range cut it.
+    case done(offsetMs: Double, clamped: Bool)
+    case failed(CalibrationFailure)
+    /// The user cancelled it.
+    case cancelled
+
+    var isRunning: Bool {
+        if case .running = self { return true }
+        return false
+    }
+}
+
+/// What a shown result depends on: once one of these changes it no longer
+/// describes the speaker and goes.
+struct CalibrationContext: Equatable {
+    var streaming: Bool
+    var reference: String?
+    var speakerOn: Bool
+}
+
+/// The calibration the window shows: the speaker it concerns and its phase.
+struct CalibrationStatus: Equatable {
+    var uid: String?
+    var phase: CalibrationPhase = .idle
+    /// The context `phase` was shown in.
+    var context: CalibrationContext?
+    /// A run still holds the outputs: running, or letting a cut-off sweep
+    /// play out after a cancel (`CalibrationFlow.settleSeconds`).
+    var holdsOutputs = false
+
+    /// What `uid`'s row shows.
+    func phase(of uid: String) -> CalibrationPhase { self.uid == uid ? phase : .idle }
+
+    var isRunning: Bool { phase.isRunning }
+
+    /// Whether `uid`'s row says another calibration holds the outputs.
+    func heldByAnother(_ uid: String, calibrateAllHolds: Bool) -> Bool {
+        ((holdsOutputs && self.uid != uid) || calibrateAllHolds) && !phase(of: uid).isRunning
+    }
+
+    /// The status after streaming, the reference or the speaker's switch may
+    /// have changed: an ended run's line goes once its context moved; a
+    /// running one stays, since the run checks for itself.
+    func following(_ now: CalibrationContext) -> CalibrationStatus {
+        guard !isRunning, uid != nil, phase != .idle, context != now else { return self }
+        var next = self
+        next.phase = .idle
+        next.context = nil
+        return next
+    }
+
+    /// The status after `uid`'s offset was set by hand or by a calibration:
+    /// an ended run's line about that speaker goes.
+    func offsetChanged(_ uid: String) -> CalibrationStatus {
+        guard !isRunning, self.uid == uid else { return self }
+        var next = self
+        next.phase = .idle
+        next.context = nil
+        return next
+    }
+
+    /// Whether setting a stored offset (nil plays as 0 ms) to the clamped
+    /// `ms` changes it; a + step at the maximum doesn't, and keeps the line.
+    static func offsetDiffers(stored: Double?, clamped ms: Double) -> Bool {
+        (stored ?? 0) != ms
+    }
+}
+
+/// Why a local output sits out of microphone calibration, which measures
+/// external speakers only: the microphone hears neither headphones nor a
+/// device with no hardware behind it.
+enum CalibrationLeftOut: Equatable {
+    case headphones, virtual
+}
+
+/// Whether the reference output's own volume and mute let the microphone
+/// hear it, read before a run so the window can warn up front.
+enum CalibrationReferenceLevel: Equatable {
+    case muted, quiet, ok, unknown
+
+    /// Quiet is the main window's low line (S196, 25 % or less), since no
+    /// measurement ties a volume to the core's too-quiet refusal.
+    init(_ reading: DeviceVolumeReading) {
+        let verdict = reading.verdict
+        switch verdict.decision {
+        case UInt32(ASC_DEVICE_VOLUME_MUTED), UInt32(ASC_DEVICE_VOLUME_MUTED_AND_LOW): self = .muted
+        case UInt32(ASC_DEVICE_VOLUME_LOW): self = .quiet
+        case UInt32(ASC_DEVICE_VOLUME_FINE) where verdict.percent != nil: self = .ok
+        default: self = .unknown
+        }
+    }
+}
+
+/// The reference's row under "Before you start": a warning with the main
+/// window's fix when it is muted or quiet, a check when it is fine; nil when
+/// the level is unknown, so nothing alarming shows.
+struct CalibrationVolumeCheck: Equatable {
+    let warning: DeviceVolumeHint?
+    /// The whole percent the meter shows; nil when the volume is unknown.
+    let percent: Int?
+
+    /// The core's low line as a whole percent, where the meter marks it.
+    static let lowPercent: Int = (0...100).last { n in
+        let reading = AscDeviceVolume(has_volume: true, volume: Double(n) / 100, has_mute: false, muted: false)
+        return asc_device_volume_decide(reading).decision == UInt32(ASC_DEVICE_VOLUME_LOW)
+    } ?? 0
+
+    init?(_ reading: DeviceVolumeReading) {
+        guard CalibrationReferenceLevel(reading) != .unknown else { return nil }
+        let verdict = reading.verdict
+        warning = verdict.hint
+        percent = verdict.percent
+    }
+}
+
+enum CalibrationFlow {
+    /// Why calibration won't record from the default input, nil when it may:
+    /// a Bluetooth hands-free input is refused before anything plays, for one
+    /// speaker and for Calibrate All. No default input is the start's to report.
+    /// `inputSubTransports` are an aggregate's (`AudioDevices.Device`).
+    static func microphoneRefusal(defaultInputTransport: UInt32?,
+                                  inputSubTransports: [UInt32] = []) -> CalibrationFailure? {
+        guard let transport = defaultInputTransport,
+              AudioDevices.isHandsFreeInput(transport: transport, inputSubTransports: inputSubTransports)
+        else { return nil }
+        return .handsFreeMicrophone
+    }
+
+    /// Why calibration can't record from the default input, asked before the
+    /// music fades (S232): `nominalRate` is nil without one, and a rate the
+    /// signal isn't made at (S233) is unsupported rather than no microphone.
+    static func microphonePreflight(nominalRate: Double?, transport: UInt32?,
+                                    subTransports: [UInt32] = []) -> CalibrationFailure? {
+        guard let nominal = nominalRate else { return .noMicrophone }
+        if let refusal = microphoneRefusal(defaultInputTransport: transport, inputSubTransports: subTransports) {
+            return refusal
+        }
+        return microphoneRate(nominal: nominal) == nil ? .unsupportedMicrophoneRate : nil
+    }
+
+    /// An input's nominal rate in whole Hz, nil for one the test signal isn't made at (S233).
+    static func microphoneRate(nominal: Double) -> UInt32? {
+        guard nominal.isFinite, nominal.rounded() == nominal, nominal >= 1, nominal <= Double(UInt32.max),
+              asc_calibration_signal_frames(UInt32(nominal)) > 0
+        else { return nil }
+        return UInt32(nominal)
+    }
+
+    /// Why an output sits out of calibration, nil when it takes part.
+    /// `terminal` is its first output stream's `kAudioStreamPropertyTerminalType`,
+    /// `dataSource` its output `kAudioDevicePropertyDataSource`, `name` the
+    /// name macOS gives it. Over Bluetooth only the name decides: macOS reports
+    /// Bluetooth speakers with the headphones terminal too, and has no documented kind.
+    static func leftOut(transport: UInt32, terminal: UInt32?, dataSource: UInt32?,
+                        name: String) -> CalibrationLeftOut? {
+        if transport == kAudioDeviceTransportTypeVirtual { return .virtual }
+        if transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE {
+            return SpeakerTag.isHeadphoneName(name) ? .headphones : nil
+        }
+        if dataSource == headphoneJackSource { return .headphones }
+        if let terminal, headphoneTerminals.contains(terminal) { return .headphones }
+        return nil
+    }
+
+    /// 'hdpn', the headphones output port subtype of IOKit's IOAudioTypes.h.
+    private static let headphoneJackSource: UInt32 = 0x6864_706E
+
+    /// Core Audio's headphones terminal, and the USB Audio terminal types
+    /// headphones (0x0302), head-mounted display audio (0x0303) and headset
+    /// (0x0402), which USB devices report as they are.
+    private static let headphoneTerminals: Set<UInt32> = [
+        UInt32(kAudioStreamTerminalTypeHeadphones), 0x0302, 0x0303, 0x0402,
+    ]
+
+    /// What the estimate's answer does to the chosen speaker's offset.
+    enum Outcome: Equatable {
+        case commit(offsetMs: Double, clamped: Bool)
+        case refuse(CalibrationFailure)
+    }
+
+    /// Whether `chosen` can be calibrated now: a reference is listed, streaming
+    /// runs, and both it and the reference play (S232: both take part).
+    /// `referenceLeftOut` is why the reference would sit out, if it would.
+    static func blocker(streaming: Bool, reference: String?, chosen: String,
+                        playing: [String], referenceLeftOut: CalibrationLeftOut? = nil) -> CalibrationFailure? {
+        guard let reference else { return .noReference }
+        // Nothing plays while streaming is off, so only streaming is named then.
+        guard streaming else { return .notPlaying(.streaming) }
+        guard chosen != reference else { return .notPlaying(.all) }
+        var missing: CalibrationMissing = []
+        if !playing.contains(chosen) { missing.insert(.speaker) }
+        if !playing.contains(reference) { missing.insert(.reference) }
+        if !missing.isEmpty { return .notPlaying(missing) }
+        return referenceLeftOut == .headphones ? .referenceHeadphones : nil
+    }
+
+    /// Why the button can't start a calibration now, from what the row
+    /// knows; nil when it may try (`blocker` checks the rest on the press).
+    static func unavailable(streaming: Bool, hasReference: Bool, speakerOn: Bool) -> CalibrationFailure? {
+        if !hasReference { return .noReference }
+        var missing: CalibrationMissing = []
+        if !streaming { missing.insert(.streaming) }
+        if !speakerOn { missing.insert(.speaker) }
+        return missing.isEmpty ? nil : .notPlaying(missing)
+    }
+
+    /// Allowance for an output's own latency in a recording's length; a
+    /// Bluetooth output stays under it.
+    static let latencyAllowanceS = 0.5
+
+    /// The longest recording the estimate takes (S234).
+    static let maxRecordingFrames = 1 << 21
+
+    /// Whether a run's recording fits the estimate's limit at the
+    /// microphone's `rate`: checked before anything plays, so a long
+    /// hold-back at a high rate is refused at once (S232).
+    static func fits(largestHoldBackMs: Double, rate: UInt32) -> Bool {
+        recordingFrames(largestHoldBackMs: largestHoldBackMs, rate: rate) <= maxRecordingFrames
+    }
+
+    /// Whether the input just opened for a run may record it: the chosen
+    /// output's run uses the same device at the same rate as the reference's,
+    /// since only an input latency that is the same in both cancels out
+    /// (S232), and the recording fits the estimate's limit at that rate.
+    static func microphoneCheck(first: CalibrationMicrophoneID?, now: CalibrationMicrophoneID,
+                                largestHoldBackMs: Double) -> CalibrationFailure? {
+        if let first, first != now { return .microphoneChanged }
+        return fits(largestHoldBackMs: largestHoldBackMs, rate: now.rate) ? nil : .tooLong(nil)
+    }
+
+    /// Host ticks of the first recorded frame from a buffer that follows
+    /// `framesBefore` recorded frames; nil when the device gave the buffer
+    /// no host time, so the first buffer that has one decides. Plain
+    /// arithmetic, safe on the microphone's IOProc.
+    static func firstFrameTicks(_ stamp: AudioTimeStamp, framesBefore: Int, ticksPerFrame: Double) -> UInt64? {
+        guard stamp.mFlags.contains(.hostTimeValid), stamp.mHostTime != 0 else { return nil }
+        return stamp.mHostTime &- UInt64(Double(framesBefore) * ticksPerFrame)
+    }
+
+    /// Why a run stops at once because of the microphone itself: it went
+    /// away before its recording was whole, or it lost audio before the
+    /// recording's end, which shifts every frame after the gap. `needed` is
+    /// the frame count the recording must reach; nil before it records.
+    static func microphoneLoss(gapAt: Int?, alive: Bool, recorded: Int, needed: Int?) -> CalibrationFailure? {
+        if !alive && needed.map({ recorded < $0 }) ?? true { return .noMicrophone }
+        if let gapAt, let needed, gapAt < needed { return .microphoneSkipped }
+        return nil
+    }
+
+    /// Whether the estimate may be committed: the output's offset is still the
+    /// one it was made from, the output still plays and the reference is the same.
+    static func mayCommit(offsetMs: Double, oldOffsetMs: Double, chosenPlays: Bool, reference: String?,
+                          runReference: String) -> Bool {
+        offsetMs == oldOffsetMs && chosenPlays && reference == runReference
+    }
+
+    /// How long a run that ends keeps the outputs as they are (only one
+    /// heard, the music silent) before giving them back: the sweep already
+    /// in the delay buffer plays out through the hold-backs on that one
+    /// output, faded, instead of on every speaker at once. Nothing to wait
+    /// for when no sweep was sent, or the session it was sent in is gone.
+    static func settleSeconds(signalSent: Bool, sameSession: Bool, largestHoldBackMs: Double) -> Double {
+        signalSent && sameSession ? quietSeconds(largestHoldBackMs: largestHoldBackMs) : 0
+    }
+
+    /// Frames each run keeps from the moment the signal enters the outputs'
+    /// paths (S232): the largest hold-back taking part, the output's latency,
+    /// the 0.75 s signal and half a second.
+    static func recordingFrames(largestHoldBackMs: Double, rate: UInt32) -> Int {
+        let holdBackS = largestHoldBackMs.isFinite ? max(0, largestHoldBackMs) / 1000 : 0
+        return Int(((holdBackS + latencyAllowanceS + 0.75 + 0.5) * Double(rate)).rounded(.up))
+    }
+
+    /// How long the music on its way through the hold-backs takes to play
+    /// out once it faded, before the first run starts.
+    static func quietSeconds(largestHoldBackMs: Double) -> Double {
+        let holdBackS = largestHoldBackMs.isFinite ? max(0, largestHoldBackMs) / 1000 : 0
+        return holdBackS + latencyAllowanceS
+    }
+
+    /// The recorded frame at `signalNs`, the moment the signal entered the
+    /// outputs' paths, in a recording whose first frame was at `firstFrameNs`:
+    /// each run starts there, so the gap from recording start to play start
+    /// is 0 in both (S232). Nil when the recording started after it.
+    static func trimStart(signalNs: UInt64, firstFrameNs: UInt64, rate: UInt32) -> Int? {
+        guard signalNs >= firstFrameNs else { return nil }
+        return Int((Double(signalNs - firstFrameNs) * Double(rate) / 1e9).rounded())
+    }
+
+    /// The test signal at `rate` (S233); nil for a rate it isn't made at.
+    static func signal(rate: UInt32) -> [Float]? {
+        let frames = asc_calibration_signal_frames(rate)
+        guard frames > 0 else { return nil }
+        var samples = [Float](repeating: 0, count: frames)
+        let made = samples.withUnsafeMutableBufferPointer { asc_calibration_signal(rate, $0.baseAddress, frames) }
+        return made ? samples : nil
+    }
+
+    /// The core's measurement of one recording (S234) in the debug log, off
+    /// the main thread; nothing while the log is off.
+    static func logArrival(_ label: String, recording: [Float], rate: UInt32) {
+        guard DebugTrace.enabled else { return }
+        DispatchQueue.global(qos: .utility).async {
+            guard let signal = CalibrationFlow.signal(rate: rate) else { return }
+            var found = AscCalibrationArrival()
+            let ok = signal.withUnsafeBufferPointer { s in
+                recording.withUnsafeBufferPointer { r in
+                    asc_calibration_measure(s.baseAddress, s.count, r.baseAddress, r.count, rate, &found)
+                }
+            }
+            guard ok else { return }
+            let ms = 1000 / Double(rate)
+            DebugTrace.log("[AudioSync] \(label) measured: status \(found.status), frame \(found.frame) "
+                + "(\(Double(found.frame) * ms) ms), peak frame \(found.peak_frame), "
+                + "peak_over_floor \(found.peak_over_floor), echo_share \(found.echo_share) "
+                + "at frame \(found.echo_frame) (\(Double(found.echo_frame) * ms) ms)")
+        }
+    }
+
+    /// The core's estimate (S232, S234). Allocates and takes tens of ms:
+    /// off the main thread. Nil when the core rejects the call itself.
+    static func estimate(signal: [Float], reference: [Float], chosen: [Float], rate: UInt32,
+                         oldOffsetMs: Double) -> AscCalibration? {
+        var result = AscCalibration()
+        let ok = signal.withUnsafeBufferPointer { s in
+            reference.withUnsafeBufferPointer { r in
+                chosen.withUnsafeBufferPointer { c in
+                    asc_calibration_estimate(s.baseAddress, s.count, r.baseAddress, r.count,
+                                             c.baseAddress, c.count, rate, oldOffsetMs, &result)
+                }
+            }
+        }
+        return ok ? result : nil
+    }
+
+    /// The core's judgement of three runs (S232) and, on a disagreement, the
+    /// spread. Unused by the app until the flow measures three times.
+    static func estimateAgreed(signal: [Float], runs: [(reference: [Float], chosen: [Float])], rate: UInt32,
+                               oldOffsetMs: Double) -> (result: AscCalibration, spreadMs: Double)? {
+        guard runs.count == Int(ASC_CALIBRATION_SWEEPS) else { return nil }
+        let recordings = runs.map(\.reference) + runs.map(\.chosen)
+        let frames = recordings.map(\.count)
+        let starts = frames.indices.map { frames[..<$0].reduce(0, +) }
+        let joined = Array(recordings.joined())
+        var result = AscCalibration()
+        var spreadMs = 0.0
+        let ok = signal.withUnsafeBufferPointer { s in
+            joined.withUnsafeBufferPointer { all in
+                let at: [UnsafePointer<Float>?] = starts.map { start in all.baseAddress.map { $0 + start } }
+                let n = runs.count
+                return asc_calibration_estimate_agreed(s.baseAddress, s.count, Array(at[..<n]), Array(frames[..<n]),
+                                                       Array(at[n...]), Array(frames[n...]), rate, oldOffsetMs,
+                                                       &result, &spreadMs)
+            }
+        }
+        return ok ? (result, spreadMs) : nil
+    }
+
+    /// The estimate's answer as a decision: only an accepted one moves the
+    /// offset (S232).
+    static func outcome(_ result: AscCalibration?) -> Outcome {
+        guard let result else { return .refuse(.tooShort(nil)) }
+        let which: CalibrationRecording? = switch result.recording {
+        case UInt32(ASC_CALIBRATION_RECORDING_REFERENCE): .reference
+        case UInt32(ASC_CALIBRATION_RECORDING_CHOSEN): .chosen
+        default: nil
+        }
+        switch result.status {
+        case UInt32(ASC_CALIBRATION_ACCEPTED):
+            guard result.offset_ms.isFinite else { return .refuse(.implausible) }
+            return .commit(offsetMs: result.offset_ms, clamped: result.clamped)
+        case UInt32(ASC_CALIBRATION_TOO_LONG): return .refuse(.tooLong(which))
+        case UInt32(ASC_CALIBRATION_CLIPPED): return .refuse(.clipped(which))
+        case UInt32(ASC_CALIBRATION_TOO_QUIET): return .refuse(.tooQuiet(which))
+        case UInt32(ASC_CALIBRATION_AMBIGUOUS_ECHO): return .refuse(.ambiguousEcho(which))
+        case UInt32(ASC_CALIBRATION_IMPLAUSIBLE): return .refuse(.implausible)
+        default: return .refuse(.tooShort(which))
+        }
+    }
+
+    /// Ends a calibration with the estimate's answer: an accepted offset goes
+    /// through `commit` (the normal offset path, so the row's value and the
+    /// saved settings follow), a refusal touches nothing. Returns what the
+    /// row shows next.
+    static func finish(_ result: AscCalibration?, commit: (Double) -> Void) -> CalibrationPhase {
+        switch outcome(result) {
+        case .commit(let ms, let clamped):
+            commit(ms)
+            return .done(offsetMs: ms, clamped: clamped)
+        case .refuse(let failure):
+            return .failed(failure)
+        }
+    }
+}
+
+/// Where a recording first lost audio, from the device's sample time on each
+/// buffer: one that doesn't start where the last one ended had frames dropped
+/// before it. Plain values only, since the microphone's IOProc keeps one.
+struct MicrophoneContinuity {
+    /// The recorded frame the first gap fell before; nil while there was none.
+    private(set) var gapAt: Int?
+    private var nextSampleTime: Double?
+
+    /// A buffer of `frames` frames at `sampleTime` (nil when the device gave
+    /// none) that follows `framesBefore` recorded frames.
+    mutating func buffer(sampleTime: Double?, frames: Int, framesBefore: Int) {
+        if gapAt == nil, let expected = nextSampleTime, let sampleTime, abs(sampleTime - expected) >= 1 {
+            gapAt = framesBefore
+        }
+        nextSampleTime = sampleTime.map { $0 + Double(frames) }
+    }
+}

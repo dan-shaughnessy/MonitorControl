@@ -1,0 +1,482 @@
+import CoreAudio
+import Foundation
+import CAudioSyncCore
+
+// The local delay model on the Mac (docs/ENGINE_SPEC.md S172 to S181): the
+// built-in speakers are the reference and have no delay setting; every other
+// local output has an offset relative to them that always applies; the core
+// turns the offsets of the outputs taking part into hold-backs, the delays the
+// renderers play at, and adds the AirPlay latency L while an AirPlay speaker
+// is chosen. The rules are the core's (`asc_local_*`); this file picks the
+// reference, feeds the core and says which renderers to re-time. Main thread
+// only: the core calls here may allocate.
+
+enum LocalDelay {
+    /// The AirPlay sender's latency before it reports one: its configured
+    /// Lf's default (AirPlay spec P98).
+    static let senderDefaultLatencyMs = 100.0
+
+    // MARK: The reference (S173)
+
+    /// The reference among the listed output devices, in Core Audio's order:
+    /// the first built-in device whose first output stream is a speaker, else
+    /// the first built-in device, else none. Whether a device is switched on
+    /// doesn't matter.
+    static func reference(in devices: [AudioDevices.Device]) -> String? {
+        let candidates = devices.filter { $0.transport == kAudioDeviceTransportTypeBuiltIn && !$0.uid.isEmpty }
+        let speaker = UInt32(kAudioStreamTerminalTypeSpeaker)
+        return (candidates.first { $0.outputTerminal == speaker } ?? candidates.first)?.uid
+    }
+
+    // MARK: Hold-backs and re-timing (S176, S177)
+
+    /// The hold-back in ms of every output taking part (`uids`, each once):
+    /// its offset (0 for the reference) minus the smallest offset taking
+    /// part, or minus −L while an AirPlay speaker is chosen when that is
+    /// smaller, capped at 20 000 ms. An output without a stored offset has 0.
+    static func holdBacks(takingPart uids: [String], reference: String?, offsets: [String: Double],
+                          airPlayChosen: Bool, latencyMs: Double) -> [String: Double] {
+        var counted = Set<String>()
+        let unique = uids.filter { counted.insert($0).inserted }
+        guard !unique.isEmpty else { return [:] }
+        let outputs = unique.map { AscLocalOutput(offset_ms: offsets[$0] ?? 0, is_reference: $0 == reference) }
+        var holds = [Double](repeating: 0, count: outputs.count)
+        let ok = outputs.withUnsafeBufferPointer { list in
+            holds.withUnsafeMutableBufferPointer { out in
+                asc_local_hold_backs_ms(list.baseAddress, list.count, airPlayChosen, latencyMs, out.baseAddress)
+            }
+        }
+        guard ok else { return [:] }
+        return Dictionary(uniqueKeysWithValues: zip(unique, holds))
+    }
+
+    /// The lead the local speakers play at, as the debug log names it.
+    static func leadDescription(networkMs: Double?) -> String {
+        guard let wait = networkMs else {
+            return "lead: local speakers play at their device's start lead (logged in ms once measured)"
+        }
+        return "lead: local speakers wait \(Int(wait.rounded())) ms for the network speakers"
+    }
+
+    /// The `setDelay` calls that re-time the running renderers: `applied`
+    /// holds what each running renderer was last given, and every one whose
+    /// hold-back in `holdBacks` differs gets the new one. A renderer whose
+    /// hold-back is unchanged, or that no longer takes part (it is about to
+    /// be detached), gets no call.
+    static func retimes(applied: [String: Double], holdBacks: [String: Double]) -> [String: Double] {
+        var calls: [String: Double] = [:]
+        for (uid, now) in applied {
+            if let next = holdBacks[uid], next != now { calls[uid] = next }
+        }
+        return calls
+    }
+
+    /// Whether a re-time to `ms` moves a renderer whose newest delay is
+    /// `delayFrames` at `captureRate`: not when a step's move (S281) already
+    /// put it there, since any call fades the output out and in (S187).
+    static func retimeMoves(toMs ms: Double, captureRate: Double, delayFrames: Int64) -> Bool {
+        var frames: Int64 = 0
+        guard let rate = CoreRate.hz(captureRate), asc_delay_ms_to_frames(ms, rate, &frames) else { return true }
+        // The move rounds its frames and this floors its ms, so a moved output may sit one frame off.
+        return abs(frames - delayFrames) > 1
+    }
+
+    // MARK: Settings (S175, S178)
+
+    /// An offset ready to store: clamped to −2000…20 000 ms; nil (ignored)
+    /// when it isn't finite.
+    static func sanitizedOffset(_ ms: Double) -> Double? {
+        var value = 0.0
+        return asc_local_offset_sanitize_ms(ms, &value) ? value : nil
+    }
+
+    /// The starting offset of a local output listed now (S455): set only for a
+    /// Bluetooth output that is not the reference, new and never set.
+    static func bluetoothSeed(bluetooth: Bool, isReference: Bool, known: Bool, hasOffset: Bool,
+                              latencyMs: Double, referenceLatencyMs: Double, referenceBluetooth: Bool) -> Double? {
+        var value = 0.0
+        return asc_local_bluetooth_seed_ms(bluetooth, isReference, known, hasOffset, latencyMs,
+                                           referenceLatencyMs, referenceBluetooth, &value) ? value : nil
+    }
+
+    /// An AirPlay delay L as the field takes it: clamped to 0…20 000 ms, the
+    /// range L can take (S178); nil (ignored) when it isn't finite.
+    static func sanitizedAirPlayDelay(_ ms: Double) -> Double? {
+        var value = 0.0
+        return asc_local_airplay_delay_sanitize_ms(ms, &value) ? value : nil
+    }
+
+    /// The AirPlay sender's adjustment A ready to store: clamped to
+    /// −2000…20 000 ms; nil (ignored) when it isn't finite. A is what the
+    /// field would store for a value shown at a sender latency of 0.
+    static func sanitizedAdjustment(_ ms: Double) -> Double? {
+        var value = 0.0
+        return asc_local_native_adjustment_ms(ms, 0, &value) ? value : nil
+    }
+
+    // MARK: What the window shows and takes (S181)
+
+    /// The offset a speaker row shows, nil for the reference, which has no
+    /// delay field (also while it is switched off).
+    static func shownOffset(_ uid: String, reference: String?, offsets: [String: Double]) -> Double? {
+        uid == reference ? nil : offsets[uid] ?? 0
+    }
+
+    /// Whole ms typed in a delay field, with an optional leading "+" or "−"
+    /// (a hyphen-minus counts as "−") and spaces around it; nil for any other
+    /// text, which the field ignores.
+    static func wholeMs(_ text: String) -> Double? {
+        var rest = Substring(text.trimmingCharacters(in: .whitespaces))
+        var sign = 1.0
+        if let first = rest.first, "+−-".contains(first) {
+            if first != "+" { sign = -1 }
+            rest = rest.dropFirst()
+        }
+        guard !rest.isEmpty, rest.allSatisfy({ ("0"..."9").contains($0) }), let n = Double(rest) else { return nil }
+        return sign * n
+    }
+
+    /// What a delay field keeps of a keystroke or a paste: digits, after one
+    /// leading "+" or "−" (or hyphen-minus); anything else can't be typed.
+    static func fieldText(_ typed: String) -> String {
+        var kept = ""
+        for (index, character) in typed.enumerated()
+        where ("0"..."9").contains(character) || (index == 0 && "+−-".contains(character)) {
+            kept.append(character)
+        }
+        return kept
+    }
+
+    /// The field's text after an edit is one it can hold, so the edit goes
+    /// in; otherwise the field blocks it before it shows.
+    static func fieldAccepts(_ proposed: String) -> Bool { fieldText(proposed) == proposed }
+
+    /// An offset typed in a speaker's delay field, clamped to S175's range;
+    /// nil for text the field ignores.
+    static func parseOffset(_ text: String) -> Double? { wholeMs(text).flatMap(sanitizedOffset) }
+
+    // MARK: Migration (S179)
+
+    /// What the one-time migration stores.
+    struct Migration: Equatable {
+        /// Offsets by device UID; none for the reference, nor for a UID that
+        /// had no stored delay and was neither switched on nor listed.
+        var offsets: [String: Double]
+        /// L_new, the AirPlay delay of the older builds that shipped the
+        /// bundled engine: it sets the offsets of the outputs without a
+        /// stored delay, and is stored under its own key for those builds.
+        var airPlayDelayMs: Double
+        /// The AirPlay sender's adjustment.
+        var nativeAdjustmentMs: Double
+    }
+
+    /// The stored absolute delays (S77, by device UID) as offsets relative to
+    /// `reference`, and the AirPlay settings that keep a setup tuned for
+    /// AirPlay sounding as before. `legacyDelayMs` is the older single delay,
+    /// when one is stored; `enabled` and `listed` are the local speakers
+    /// switched on and the devices listed at this moment. Nil only when the
+    /// core refuses the input.
+    static func migrate(storedDelays: [String: Double], legacyDelayMs: Double?, enabled: Set<String>,
+                        listed: [String], reference: String?) -> Migration? {
+        let uids = Set(storedDelays.keys).union(enabled).union(listed).filter { !$0.isEmpty }.sorted()
+        let entries = uids.map { uid in
+            AscStoredDelay(is_reference: uid == reference, has_stored_delay: storedDelays[uid] != nil,
+                           stored_delay_ms: storedDelays[uid] ?? 0)
+        }
+        var migrated = [AscMigratedOffset](repeating: AscMigratedOffset(store: false, offset_ms: 0),
+                                           count: entries.count)
+        var result = AscDelayMigration(airplay_delay_ms: 0, native_adjustment_ms: 0)
+        let ok = entries.withUnsafeBufferPointer { list in
+            migrated.withUnsafeMutableBufferPointer { out in
+                asc_local_delay_migrate(list.baseAddress, list.count, legacyDelayMs != nil, legacyDelayMs ?? 0,
+                                        out.baseAddress, &result)
+            }
+        }
+        guard ok else { return nil }
+        var offsets: [String: Double] = [:]
+        for (uid, entry) in zip(uids, migrated) where entry.store { offsets[uid] = entry.offset_ms }
+        return Migration(offsets: offsets, airPlayDelayMs: result.airplay_delay_ms,
+                         nativeAdjustmentMs: result.native_adjustment_ms)
+    }
+}
+
+/// The switched-on local speakers whose devices left the list less than
+/// `holdSeconds` ago (S328). Each still counts among the speakers taking part,
+/// at its offset, so a brief loss and return re-time no other speaker. Times
+/// are the host's uptime in seconds. The hold is the core's
+/// (`asc_brief_losses_*`); main thread only.
+final class LocalBriefLoss {
+    static let holdSeconds = Double(ASC_BRIEF_LOSS_HOLD_MS) / 1000
+
+    private let core: OpaquePointer = asc_brief_losses_create()
+
+    deinit { asc_brief_losses_destroy(core) }
+
+    /// A device list came in at `now`. A speaker that took part at the last
+    /// listing, wasn't the reference then, is still switched on and is
+    /// missing now is held from `now`; one listed again, or switched off, no
+    /// longer is.
+    func noteListing(_ listed: [String], enabled: Set<String>, reference: String?, now: Double) {
+        let copies = (listed + Array(enabled) + [reference].compactMap { $0 }).map { strdup($0) }
+        defer { copies.forEach { free($0) } }
+        let pointers: [UnsafePointer<CChar>?] = copies.map { $0.map { UnsafePointer($0) } }
+        let referenceAt = listed.count + enabled.count
+        pointers.withUnsafeBufferPointer { all in
+            let switchedOn = all.baseAddress.map { $0 + listed.count }
+            asc_brief_losses_note_listing(core, all.baseAddress, listed.count, switchedOn, enabled.count,
+                                          reference == nil ? nil : all[referenceAt], now)
+        }
+    }
+
+    /// Speaker `uid` was switched off: it stops counting at once. True when
+    /// it was held, so the others re-time.
+    func switchedOff(_ uid: String) -> Bool { asc_brief_losses_switched_off(core, uid) }
+
+    /// Ends the holds `holdSeconds` old at `now`. True when any ended, so the
+    /// others re-time once.
+    func expire(now: Double) -> Bool { asc_brief_losses_expire(core, now) }
+
+    /// The switched-on speakers went from `old` to `new`: each one switched
+    /// off stops counting at once, also when it is switched on again before
+    /// its device is back.
+    func followSwitches(from old: Set<String>, to new: Set<String>) {
+        for uid in old.subtracting(new) { _ = switchedOff(uid) }
+    }
+
+    /// Whether the start lead held for lost speaker `uid` (lost at `lostAt`)
+    /// still counts at `now`: not once it is switched off or the reference,
+    /// still missing after its brief loss ended, listed with a new renderer
+    /// that published its own lead (`publishedAgain`), or 10 s old.
+    func keepsLead(of uid: String, lostAt: Double, now: Double, listed: Bool, enabled: Bool, isReference: Bool,
+                   publishedAgain: Bool) -> Bool {
+        enabled && !isReference && (listed ? !publishedAgain : held.contains(uid)) && now - lostAt < Self.holdSeconds
+    }
+
+    /// A session restart (S20): no speaker is held any longer, and the new
+    /// session counts only the devices listed then.
+    func restart() { asc_brief_losses_restart(core) }
+
+    /// The held speakers.
+    var held: Set<String> {
+        Set((0..<asc_brief_losses_held_count(core)).compactMap { index in
+            asc_brief_losses_held_id(core, index).map { String(cString: $0) }
+        })
+    }
+
+    /// When the next hold ends, if any is held.
+    var nextExpiry: Double? {
+        var at = 0.0
+        return asc_brief_losses_next_expiry_s(core, &at) ? at : nil
+    }
+
+    /// When the holds and the start leads `held` since their uptimes (S328)
+    /// need checking next, at `now`; nil when nothing is held. A held
+    /// speaker `playing` again lets its lead go once its renderer publishes one.
+    func nextCheck(now: Double, held: [String: Double], playing: [String]) -> Double? {
+        let replaying = held.keys.contains { playing.contains($0) } ? [now + 0.5] : []
+        return ([nextExpiry].compactMap { $0 } + replaying + held.values.map { $0 + Self.holdSeconds }).min()
+    }
+}
+
+/// The AirPlay delay (S178), which the window shows as one field (S181): an
+/// adjustment A on top of the latency the AirPlay sender reports, so it stays
+/// right when that latency changes.
+struct AirPlayDelay: Equatable {
+    /// A, −2000…20 000 ms.
+    var adjustmentMs = 0.0
+
+    /// L, which the field shows, for the sender's latency `senderMs`.
+    func latencyMs(senderMs: Double) -> Double {
+        asc_local_native_latency_ms(senderMs, adjustmentMs)
+    }
+
+    /// The user entered `ms` in the field: A becomes the difference to the
+    /// sender's latency of this moment, so the field then shows `ms` (unless
+    /// clamped). False, changing nothing, when `ms` isn't finite.
+    mutating func enter(_ ms: Double, senderMs: Double) -> Bool {
+        var adjustment = 0.0
+        guard asc_local_native_adjustment_ms(ms, senderMs, &adjustment) else { return false }
+        adjustmentMs = adjustment
+        return true
+    }
+}
+
+/// A delay field's typed text (S181). Keystrokes only change the text; the
+/// value applies on commit (Return, Command-S, the focus leaving the field,
+/// its panel closing; see `DelayPanels`), once, so typing "220" doesn't re-time the outputs at 2 and
+/// 22 ms on the way. Text the field can't read, or the saved value typed
+/// again, applies nothing, and the field shows the saved value again.
+struct DelayFieldDraft: Equatable {
+    /// What the field shows.
+    private(set) var text = ""
+    /// The text holds typing not yet committed.
+    private(set) var isEditing = false
+
+    /// A keystroke or a paste: the text becomes what the field keeps of it
+    /// (`LocalDelay.fieldText`), nothing applies.
+    mutating func type(_ value: String) {
+        text = LocalDelay.fieldText(value)
+        isEditing = true
+    }
+
+    /// Return, Command-S, the focus leaving or its panel closing: the value to apply (clamped
+    /// to the delay's range by `sanitize`, and shown that way), or nil when
+    /// there is nothing to apply. A second commit without typing in between
+    /// returns nil.
+    mutating func commit(saved: Double, sanitize: (Double) -> Double?,
+                         format: (Double) -> String) -> Double? {
+        guard isEditing else { return nil }
+        isEditing = false
+        guard let typed = LocalDelay.wholeMs(text), let value = sanitize(typed), value != saved else {
+            text = format(saved)
+            return nil
+        }
+        text = format(value)
+        return value
+    }
+
+    /// The field holds typed text that isn't the saved value as the field
+    /// shows it: a draft that applies only when committed, which the field
+    /// marks so typing doesn't look applied.
+    func isPending(saved: Double, format: (Double) -> String) -> Bool {
+        isEditing && text != format(saved)
+    }
+
+    /// The typed number is outside the delay's range, so a commit applies the
+    /// nearest value in it: the field gets a red outline. Empty text or a
+    /// lone sign is typing on its way, not an error.
+    func isOutOfRange(sanitize: (Double) -> Double?) -> Bool {
+        guard isEditing, let typed = LocalDelay.wholeMs(text) else { return false }
+        return sanitize(typed) != typed
+    }
+
+    /// The saved value changed (or the field appeared): show it, unless the
+    /// user is typing.
+    mutating func show(_ saved: Double, format: (Double) -> String) {
+        guard !isEditing else { return }
+        text = format(saved)
+    }
+
+    /// The keyboard focus came to the field or left it: leaving commits
+    /// like Return, whatever took the focus (Tab, another field, a click on
+    /// a control).
+    mutating func focusChanged(to focused: Bool, saved: Double, sanitize: (Double) -> Double?,
+                               format: (Double) -> String) -> Double? {
+        focused ? nil : commit(saved: saved, sanitize: sanitize, format: format)
+    }
+
+    /// A step button: `delta` on top of the typed value when it reads, else
+    /// on the saved one, so typing 100 and then +10 applies 110, once. Nil
+    /// when the result is the saved value (a step past the range's end).
+    mutating func step(_ delta: Double, saved: Double, sanitize: (Double) -> Double?,
+                       format: (Double) -> String) -> Double? {
+        let typed = isEditing ? LocalDelay.wholeMs(text).flatMap(sanitize) : nil
+        isEditing = false
+        guard let value = sanitize((typed ?? saved) + delta), value != saved else {
+            text = format(saved)
+            return nil
+        }
+        text = format(value)
+        return value
+    }
+
+    /// Drop the typing and show the saved value.
+    mutating func discard(saved: Double, format: (Double) -> String) {
+        isEditing = false
+        text = format(saved)
+    }
+
+    /// Escape or quit: the typing goes, applied nowhere, so the panel
+    /// closing after it commits nothing.
+    mutating func drop() { isEditing = false }
+}
+
+/// The ring around a delay field, from whether its text is invalid (out of
+/// range, or a keystroke just blocked) and whether it has the keyboard focus:
+/// one at most. While invalid, a red outline replaces the focus ring and,
+/// focused, sits where the focus ring goes, so it marks the focus too.
+struct DelayFieldRings: Equatable {
+    /// A ring in the system's focus color.
+    let focusRing: Bool
+    /// Red outlines drawn around the field.
+    let redOutlines: Int
+    /// The red outline sits outside the bezel, where the focus ring goes,
+    /// rather than on it.
+    let redOutsideBezel: Bool
+    /// AppKit draws its own focus ring for the field. Never: turned off while
+    /// the field was being edited, it stayed under the red outline (Mac check,
+    /// 2026-10-21), so `focusRing` draws in its place.
+    static let appKitRing = false
+
+    init(invalid: Bool, focused: Bool) {
+        focusRing = focused && !invalid
+        redOutlines = invalid ? 1 : 0
+        redOutsideBezel = invalid && focused
+    }
+}
+
+/// The delay panels that are open (S181). A click on a row's delay value or
+/// anywhere on its row (its open panel's blank space included) toggles that
+/// row's panel, and every other panel's typing applies first, those panels
+/// staying open. A click in the window outside every speaker row closes them
+/// all, applying each one's typing; Escape drops every typed delay and closes
+/// them all. Return, Command-S and leaving a field for another control apply
+/// without closing.
+struct DelayPanels: Equatable {
+    private(set) var open: Set<String> = []
+
+    func isOpen(_ id: String) -> Bool { open.contains(id) }
+
+    /// Its delay value or its row was clicked: the other open panels, whose
+    /// typing applies before this one opens or closes.
+    @discardableResult
+    mutating func toggle(_ id: String) -> Set<String> {
+        let others = open.subtracting([id])
+        if open.remove(id) == nil { open.insert(id) }
+        return others
+    }
+
+    mutating func closeAll() { open = [] }
+
+    /// A click while row `typingIn`'s field holds the focus ends its typing
+    /// first (applying it), unless it lands in a text field, which takes the
+    /// focus itself, or on a step of that same panel, which builds on the
+    /// typing and applies once (`DelayFieldDraft.step`).
+    static func clickEndsTyping(typingIn row: String, onField: Bool, onStepOf stepRow: String?) -> Bool {
+        !onField && stepRow != row
+    }
+
+    /// The panel a click on the note under a speaker list toggles: the note
+    /// belongs to the last row's box, so that row's panel, or nil (a click
+    /// outside every row) when that row has no delay or the note is alone.
+    static func noteTarget(under rows: [(id: String, hasDelay: Bool)]) -> String? {
+        guard let last = rows.last, last.hasDelay else { return nil }
+        return last.id
+    }
+}
+
+/// A row's delay value (S181), looked up by the row's ID in the latest model
+/// values: a copy of the row taken when the list was built can lag behind a
+/// delay applied while the row's panel stays open.
+enum DelayBadge {
+    /// The saved delay: L for the AirPlay delay row, the offset for a local
+    /// speaker; nil for a row without a delay field or one no longer listed.
+    static func savedMs(of id: String, airPlayID: String, airPlayMs: Double,
+                        rows: [(id: String, offsetMs: Double?)]) -> Double? {
+        if id == airPlayID { return airPlayMs }
+        return rows.first { $0.id == id }.flatMap { $0.offsetMs }
+    }
+
+    /// The saved delay as the row shows it and VoiceOver reads it.
+    static func text(of id: String, airPlayID: String, airPlayMs: Double,
+                     rows: [(id: String, offsetMs: Double?)], text: UIStrings) -> String? {
+        guard let ms = savedMs(of: id, airPlayID: airPlayID, airPlayMs: airPlayMs, rows: rows) else { return nil }
+        return id == airPlayID ? text.delayValue(ms: ms) : text.offsetValue(ms: ms)
+    }
+
+    /// The debug-log line for a change of what a row shows; an empty value is
+    /// the nil `text(of:)` gives the reference speaker or a row no longer listed.
+    static func traceLine(id: String, shows: String) -> String {
+        "[AudioSync] delay value \(id) shows \(shows.isEmpty ? "none (reference speaker or no longer listed)" : shows)"
+    }
+}

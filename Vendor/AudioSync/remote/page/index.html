@@ -1,0 +1,1489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F1F7F6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1E1E1E" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="AudioSync">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="format-detection" content="telephone=no">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<title>AudioSync</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --background: #F1F7F6;
+  --surface: #FFFFFF;
+  --text: #292929;
+  --muted: #525C5A;
+  --accent-text: #147167;
+  --accent: #147167;
+  --on-accent: #FFFFFF;
+  --control-border: #6B7573;
+  --separator: #D9DEDD;
+  --notice: #FFF2E0;
+  --error: #C42B1C;
+  --focus: #147167;
+  --knob: #FFFFFF;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #1E1E1E;
+    --surface: #2B2B2B;
+    --text: #F6F6F6;
+    --muted: #B8C2C0;
+    --accent-text: #3CCBB9;
+    --accent: #3CCBB9;
+    --on-accent: #1E1E1E;
+    --control-border: #8A9492;
+    --separator: #3D3D3D;
+    --notice: #443927;
+    --error: #FF99A4;
+    --focus: #63DAC2;
+    --knob: #1E1E1E;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+/* manipulation drops double-tap zoom (quick taps on the delay steps zoomed iOS Safari in) and keeps pinch zoom. */
+html, body, button, input, select, label, .switch { touch-action: manipulation; }
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--text);
+  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  accent-color: var(--accent);
+}
+main {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+}
+h1 { font-size: 1.25rem; margin: 4px 0 16px; letter-spacing: -0.01em; }
+h1 span { color: var(--accent-text); }
+h2 { font-size: 1rem; margin: 0; overflow-wrap: anywhere; }
+p { margin: 0; }
+.muted { color: var(--muted); }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--separator);
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+}
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+button, input, select { font: inherit; color: inherit; }
+button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 16px;
+  border-radius: 10px;
+  border: 1px solid var(--control-border);
+  background: var(--surface);
+  color: var(--accent-text);
+  font-weight: 600;
+  cursor: pointer;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button:disabled, input:disabled, select:disabled { cursor: default; }
+/* Disabled text keeps 4.5:1 in both themes; a faded control would not. */
+button:disabled, input[type=text]:disabled, input[type=number]:disabled { color: var(--muted); border-color: var(--separator); }
+select:disabled { color: var(--muted); border-color: var(--separator); }
+button.primary:disabled { background: var(--surface); border-color: var(--separator); color: var(--muted); }
+input[type=range]:disabled, input[role=switch]:disabled { opacity: 0.5; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+input[type=text], input[type=number], select {
+  min-height: 44px;
+  border: 1px solid var(--control-border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 0 12px;
+  /* Below 16 px iOS zooms in on focus. */
+  font-size: max(16px, 1rem);
+}
+input[type=range] { width: 100%; min-width: 0; height: 44px; margin: 0; background: transparent; }
+.source select { display: block; width: 100%; min-width: 0; margin-top: 8px; }
+.source .status { margin-top: 8px; }
+.source > button { margin-top: 8px; }
+.mix-list { margin-top: 8px; }
+.mix-list label { display: flex; align-items: center; gap: 12px; min-height: 44px; overflow-wrap: anywhere; }
+.mix-list label.off { color: var(--muted); }
+.mix-list input { flex: none; width: 20px; height: 20px; margin: 0; }
+.mix-actions { display: flex; gap: 8px; margin-top: 8px; }
+.pair label { display: block; font-weight: 600; margin: 16px 0 8px; }
+.pair-line { display: flex; gap: 8px; }
+.pair-line input { flex: 1; min-width: 0; font-size: 1.5rem; letter-spacing: 0.2em; text-align: center; font-variant-numeric: tabular-nums; }
+.error { color: var(--error); margin-top: 8px; }
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--notice);
+  border-radius: 12px;
+  padding: 8px 8px 8px 16px;
+  margin-bottom: 12px;
+}
+.banner p { flex: 1; }
+.banner.app { padding: 12px 16px; }
+.playing { margin-bottom: 12px; }
+.playing .title { font-weight: 600; overflow-wrap: anywhere; }
+.playing .detail { overflow-wrap: anywhere; }
+.slider-line { display: grid; grid-template-columns: 1fr auto; align-items: center; column-gap: 12px; margin-top: 8px; }
+.slider-line input { grid-row: 2; grid-column: 1 / -1; }
+.slider-line output { font-variant-numeric: tabular-nums; }
+.speaker-head { display: flex; align-items: center; gap: 12px; min-height: 44px; }
+.speaker-head .names { flex: 1; min-width: 0; }
+.kind { font-size: 0.875rem; }
+.switch { flex: none; display: flex; align-items: center; justify-content: center; min-width: 60px; min-height: 44px; cursor: pointer; }
+input[role=switch] {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  width: 52px;
+  height: 32px;
+  margin: 0;
+  border-radius: 16px;
+  border: 2px solid var(--control-border);
+  background: var(--surface);
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+input[role=switch]::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--control-border);
+  transition: transform 0.15s;
+}
+input[role=switch]:checked { background: var(--accent); border-color: var(--accent); }
+input[role=switch]:checked::before { background: var(--knob); transform: translateX(20px); }
+.delay-line { display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 4px 8px; margin-top: 4px; }
+.delay-line label { grid-column: 1 / -1; }
+.delay-line input { min-width: 0; width: 100%; text-align: center; font-variant-numeric: tabular-nums; }
+.delay-line button { padding: 0; font-size: 1.25rem; }
+.notice { background: var(--notice); border-radius: 8px; padding: 8px 12px; margin-top: 8px; }
+.calibrating { background: var(--notice); color: var(--text); font-weight: 600; border-radius: 12px; padding: 12px 16px; margin-bottom: 12px; }
+.preset-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.zone-members { font-size: 0.875rem; overflow-wrap: anywhere; }
+.speaker.off-line { background: var(--background); border-style: dashed; border-color: var(--control-border); }
+.speaker.off-line h2 { color: var(--muted); }
+.state-text { padding: 24px 0; text-align: center; }
+.setup-head { display: flex; align-items: center; gap: 12px; }
+.setup-head h2 { flex: 1; }
+.setup ol { margin: 8px 0; padding-left: 1.5em; }
+.setup li + li { margin-top: 4px; }
+footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
+footer .error { flex-basis: 100%; margin-top: 0; }
+@media (prefers-reduced-motion: reduce) {
+  input[role=switch], input[role=switch]::before { transition: none; }
+}
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+</style>
+</head>
+<body>
+<main>
+<h1 id="title" tabindex="-1" aria-label="AudioSync">audio<span>sync</span></h1>
+<p id="live" class="sr-only" aria-live="polite"></p>
+
+<section id="setup" class="setup card" aria-labelledby="setup-title" hidden>
+<div class="setup-head">
+<h2 id="setup-title" data-text="setupTitle"></h2>
+<button id="setup-hide" type="button" aria-describedby="setup-title" data-text="hide"></button>
+</div>
+<ol id="setup-steps"></ol>
+<p id="setup-order" class="muted"></p>
+</section>
+
+<form id="pair" class="pair card" hidden novalidate>
+<p id="pair-hint"></p>
+<label for="code" data-text="codeLabel"></label>
+<div class="pair-line">
+<input id="code" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="6" aria-describedby="pair-error">
+<button id="pair-button" class="primary" type="submit" data-text="pair"></button>
+</div>
+<p id="pair-error" class="error" hidden></p>
+</form>
+
+<section id="remote" hidden>
+<div id="banner" class="banner" hidden>
+<p id="banner-text" data-text="lost"></p>
+<button id="retry" type="button" data-text="retry"></button>
+</div>
+<p id="loading" class="state-text muted" data-text="connecting"></p>
+<fieldset id="controls" hidden>
+<p id="calibrating" class="calibrating" tabindex="-1" data-text="calibrating" hidden></p>
+<div id="notices"></div>
+<fieldset id="writes">
+<section class="playing card" aria-labelledby="playing-label">
+<h2 id="playing-label" class="sr-only" data-text="nowPlaying"></h2>
+<p id="playing-title" class="title"></p>
+<p id="playing-detail" class="detail muted"></p>
+<div class="slider-line">
+<label for="master" data-text="masterVolume"></label>
+<input id="master" type="range" min="0" max="100" step="1">
+<output id="master-value" for="master"></output>
+</div>
+<p id="master-error" class="error" hidden></p>
+</section>
+<section class="source card" aria-labelledby="source-title">
+<h2 id="source-title" tabindex="-1" data-text="source"></h2>
+<select id="source" aria-labelledby="source-title" aria-describedby="source-status source-error"></select>
+<p id="source-empty" class="status muted" data-text="noSources" hidden></p>
+<button id="mix-open" type="button" aria-expanded="false" aria-controls="mix" data-text="severalApps" hidden></button>
+<div id="mix" role="group" aria-labelledby="mix-open" hidden>
+<div id="mix-list" class="mix-list"></div>
+<div class="mix-actions">
+<button id="mix-play" class="primary" type="button" data-text="play" disabled></button>
+<button id="mix-cancel" type="button" data-text="cancel"></button>
+</div>
+</div>
+<p id="source-status" class="status muted" hidden></p>
+<p id="source-error" class="error" hidden></p>
+</section>
+<section id="presets" class="card" aria-labelledby="presets-title" hidden>
+<h2 id="presets-title" data-text="presets"></h2>
+<div id="preset-list" class="preset-list"></div>
+<p id="preset-error" class="error" hidden></p>
+</section>
+<section id="zones" aria-labelledby="zones-title" hidden>
+<h2 id="zones-title" class="sr-only" data-text="zones"></h2>
+<div id="zone-list"></div>
+</section>
+<p id="empty" class="state-text muted" data-text="noSpeakers" hidden></p>
+<div id="speakers"></div>
+</fieldset>
+<footer>
+<p id="computer" class="muted"></p>
+<button id="unpair" type="button" aria-describedby="unpair-error" data-text="unpair"></button>
+<p id="unpair-error" class="error" hidden></p>
+</footer>
+</fieldset>
+</section>
+</main>
+<script>
+"use strict";
+
+const TEXT = {
+  setupTitle: "Add AudioSync to the Home Screen",
+  hide: "Hide",
+  codeLabel: "Pairing code",
+  pair: "Pair",
+  retry: "Retry",
+  connecting: "Connecting to AudioSync…",
+  nowPlaying: "Now playing",
+  paused: "Paused",
+  masterVolume: "Master Volume",
+  source: "Audio Source",
+  noSources: "AudioSync hasn't listed any sources yet.",
+  noSource: "No source chosen",
+  sourceApps: "Apps",
+  sourceInputs: "Input Devices",
+  sourceWithNotice: (name, notice) => `${name} (${notice})`,
+  switching: (name) => `Switching to ${name}…`,
+  switched: (name) => `Playing from ${name}.`,
+  notSwitched: "AudioSync didn't switch the source. Try again.",
+  severalApps: "Several Apps…",
+  appNotRunning: (name) => `${name} (not running)`,
+  play: "Play",
+  cancel: "Cancel",
+  noSpeakers: "No speakers found",
+  allHidden: "Every speaker is hidden. Open AudioSync and choose Hidden Speakers to show one again.",
+  unpair: "Unpair this phone",
+  hintBrowser: "Add to Home Screen first, then open it from there and enter the code.",
+  hintStandalone: "Enter the code AudioSync shows.",
+  codeShape: "The code has 6 digits.",
+  pairing: "Pairing…",
+  paired: "Paired.",
+  unpaired: "This phone was unpaired.",
+  unpairedHere: "This phone is unpaired.",
+  unpairConfirm: "Unpair this phone? You'll need a new code from AudioSync to use it again.",
+  lost: "Can't reach AudioSync. Retrying…",
+  noUpdates: "AudioSync answers but isn't sending updates. Retrying…",
+  replaced: "This remote is open in another tab or window. Choose Retry to use it here.",
+  busy: "AudioSync is serving too many connections. Retrying…",
+  waiting: "AudioSync is starting. Retrying…",
+  back: "Connected to AudioSync.",
+  unreachable: "Can't reach AudioSync.",
+  failed: "That didn't work. Try again.",
+  nothingPlaying: "Nothing playing",
+  computer: (name) => `AudioSync on ${name}`,
+  volume: "Volume",
+  delay: "Delay",
+  ms: "ms",
+  lessDelay: "10 ms less delay",
+  moreDelay: "10 ms more delay",
+  delayRange: (min, max) => `Delay must be from ${min} to ${max} ms.`,
+  unavailable: "Not available right now.",
+  percent: (value) => `${value}%`,
+  stepOpened: "Open this page on your phone. You've done this one.",
+  stepHomeIPhone: "Add the page to your Home Screen: tap the options button left of Safari's address bar, then Share, View More and Add to Home Screen.",
+  stepHomeOther: "Add the page to your Home screen: in the browser's menu, tap Add to Home screen or Install app.",
+  stepOpen: "Open AudioSync from the new icon and enter the pairing code.",
+  orderIPhone: "Do step 2 before you enter the code: a pairing made in Safari doesn't carry over to the Home Screen app, so you would pair again there.",
+  orderOther: "Do step 2 before you enter the code, so you pair in the app you'll use.",
+  calibrating: "AudioSync is calibrating. The controls come back when it's done.",
+  calibrationDone: "Calibration is done. The controls are back.",
+  presets: "Presets",
+  zones: "Zones",
+  zoneVolume: "Zone volume",
+  turnOn: "Turn on",
+  turnOff: "Turn off",
+  zoneCount: (on, total) => `${on} of ${total} on`,
+  zoneWaiting: (count) => `, ${count} waiting`,
+  zoneNoneHere: (all) => `None of ${all} found`,
+  zoneEmpty: "No speakers",
+};
+
+const RETRY_STEPS_MS = [1000, 2000, 5000, 10000];
+// Two missed pings: the server sends one after 15 s without a state.
+const STALE_MS = 35000;
+const SEND_EVERY_MS = 100;
+// The server answers once the change is queued, not applied; snapshots from that gap still carry the old value.
+const SETTLE_MS = 1000;
+// How long after a failed volume send a snapshot of a level this phone set earlier counts as trailing its own sends.
+const LATE_ECHO_MS = 3000;
+const DELAY_STEP_MS = 10;
+// A switch restarts the capture; past this the app has dropped or refused the pick.
+const SWITCH_WAIT_MS = 5000;
+const PAIRED_KEY = "audiosync.paired";
+const SETUP_HIDDEN_KEY = "audiosync.setupHidden";
+
+const byId = (id) => document.getElementById(id);
+const ui = {
+  title: byId("title"),
+  live: byId("live"),
+  setup: byId("setup"),
+  setupHide: byId("setup-hide"),
+  setupSteps: byId("setup-steps"),
+  setupOrder: byId("setup-order"),
+  pair: byId("pair"),
+  pairHint: byId("pair-hint"),
+  code: byId("code"),
+  pairButton: byId("pair-button"),
+  pairError: byId("pair-error"),
+  remote: byId("remote"),
+  banner: byId("banner"),
+  bannerText: byId("banner-text"),
+  notices: byId("notices"),
+  retry: byId("retry"),
+  loading: byId("loading"),
+  controls: byId("controls"),
+  calibrating: byId("calibrating"),
+  writes: byId("writes"),
+  presets: byId("presets"),
+  presetList: byId("preset-list"),
+  presetError: byId("preset-error"),
+  zones: byId("zones"),
+  zoneList: byId("zone-list"),
+  playingTitle: byId("playing-title"),
+  playingDetail: byId("playing-detail"),
+  master: byId("master"),
+  masterValue: byId("master-value"),
+  masterError: byId("master-error"),
+  sourceTitle: byId("source-title"),
+  source: byId("source"),
+  sourceEmpty: byId("source-empty"),
+  sourceStatus: byId("source-status"),
+  sourceError: byId("source-error"),
+  mixOpen: byId("mix-open"),
+  mix: byId("mix"),
+  mixList: byId("mix-list"),
+  mixPlay: byId("mix-play"),
+  mixCancel: byId("mix-cancel"),
+  empty: byId("empty"),
+  speakers: byId("speakers"),
+  computer: byId("computer"),
+  unpair: byId("unpair"),
+  unpairError: byId("unpair-error"),
+};
+
+let events = null;
+let retryTimer = null;
+let staleTimer = null;
+let lastMessage = 0;
+let failures = 0;
+let lost = false;
+let streamed = false;
+let streamReplaced = false;
+// A check still out would answer after a reconnect and start yet another one.
+let checking = false;
+let focusAfterPair = false;
+let snapshot = null;
+let calibrating = false;
+let rowCount = 0;
+const rows = new Map();
+const zoneRows = new Map();
+const presetButtons = new Map();
+let sourceList = "";
+let switchingTo = null;
+let switchTimer = null;
+let shownSource = null;
+// From a touch or click on the source picker until it is left or picked from. A flag, not the focus,
+// since a select that loses focus with its window still is document.activeElement.
+let pickerOpen = false;
+// The checked apps' names while a mix waits, else null.
+let mixing = null;
+let mixAppsShown = "";
+
+function remember(paired) {
+  try {
+    if (paired) { localStorage.setItem(PAIRED_KEY, "1"); } else { localStorage.removeItem(PAIRED_KEY); }
+  } catch (_) { /* storage can be off in private mode; the page works without it */ }
+}
+
+function wasPaired() {
+  try { return localStorage.getItem(PAIRED_KEY) === "1"; } catch (_) { return false; }
+}
+
+function announce(message) {
+  ui.live.textContent = "";
+  window.setTimeout(() => { ui.live.textContent = message; }, 50);
+}
+
+function showError(element, message) {
+  element.textContent = message || "";
+  element.hidden = !message;
+}
+
+function isStandalone() {
+  if (window.navigator.standalone === true) { return true; }
+  try { return window.matchMedia("(display-mode: standalone)").matches; } catch (_) { return false; }
+}
+
+// Only iOS Safari defines navigator.standalone; a Home Screen app there keeps its own cookies.
+function isIOS() {
+  return typeof window.navigator.standalone === "boolean";
+}
+
+function setupHidden() {
+  try { return localStorage.getItem(SETUP_HIDDEN_KEY) === "1"; } catch (_) { return false; }
+}
+
+function showSetup() {
+  if (isStandalone() || setupHidden()) { return; }
+  const ios = isIOS();
+  for (const step of [TEXT.stepOpened, ios ? TEXT.stepHomeIPhone : TEXT.stepHomeOther, TEXT.stepOpen]) {
+    const item = document.createElement("li");
+    item.textContent = step;
+    ui.setupSteps.append(item);
+  }
+  ui.setupOrder.textContent = ios ? TEXT.orderIPhone : TEXT.orderOther;
+  ui.setup.hidden = false;
+}
+
+ui.setupHide.addEventListener("click", () => {
+  ui.setup.hidden = true;
+  try { localStorage.setItem(SETUP_HIDDEN_KEY, "1"); } catch (_) { /* it shows again next time */ }
+  ui.title.focus();
+});
+
+function stopStream() {
+  window.clearTimeout(retryTimer);
+  retryTimer = null;
+  window.clearInterval(staleTimer);
+  staleTimer = null;
+  if (events) { events.close(); events = null; }
+}
+
+// After a sleep or a resume from the background the stream can be dead without an error event.
+function streamStale() {
+  return Date.now() - lastMessage > STALE_MS;
+}
+
+function showPairing(message) {
+  stopStream();
+  snapshot = null;
+  endSwitch("");
+  lost = false;
+  focusAfterPair = false;
+  ui.banner.hidden = true;
+  ui.controls.disabled = false;
+  ui.remote.hidden = true;
+  ui.pair.hidden = false;
+  ui.pairHint.textContent = isStandalone() ? TEXT.hintStandalone : TEXT.hintBrowser;
+  ui.pairButton.disabled = false;
+  showError(ui.pairError, message);
+  // The app unpaired the phone mid-use: focus was in the remote, which is now hidden.
+  if (message) { announce(message); ui.code.focus(); }
+}
+
+function showRemote() {
+  ui.pair.hidden = true;
+  ui.remote.hidden = false;
+  ui.loading.hidden = snapshot !== null || lost;
+  ui.controls.hidden = snapshot === null;
+}
+
+function clearErrors() {
+  showError(ui.masterError, "");
+  showError(ui.unpairError, "");
+  showError(ui.sourceError, "");
+  for (const row of rows.values()) { showError(row.error, ""); }
+  for (const row of zoneRows.values()) { showError(row.error, ""); }
+  showError(ui.presetError, "");
+}
+
+function setLost(value, message) {
+  const text = message || TEXT.lost;
+  if (value && (!lost || ui.bannerText.textContent !== text)) { announce(text); }
+  if (!value && lost) {
+    announce(TEXT.back);
+    clearErrors();
+  }
+  if (value) { ui.bannerText.textContent = text; }
+  lost = value;
+  ui.banner.hidden = !value;
+  ui.loading.hidden = value || snapshot !== null;
+  // A disabled fieldset drops focus to the page top; keep it on Retry instead.
+  if (value && ui.controls.contains(document.activeElement)) { ui.retry.focus(); }
+  ui.controls.disabled = value;
+}
+
+function connect() {
+  stopStream();
+  streamReplaced = false;
+  showRemote();
+  events = new EventSource("/api/events");
+  lastMessage = Date.now();
+  staleTimer = window.setInterval(() => {
+    if (streamStale()) {
+      stopStream();
+      checkAccess();
+    }
+  }, 5000);
+  events.addEventListener("ping", () => { lastMessage = Date.now(); });
+  events.addEventListener("state", (event) => {
+    lastMessage = Date.now();
+    let next;
+    try { next = JSON.parse(event.data); } catch (_) { return; }
+    failures = 0;
+    streamed = true;
+    remember(true);
+    // Retry and the pairing form hide now, which would drop focus to the page top.
+    const focused = document.activeElement;
+    const stranded = focusAfterPair || ui.banner.contains(focused) || ui.pair.contains(focused);
+    focusAfterPair = false;
+    setLost(false);
+    render(next);
+    const now = document.activeElement;
+    if (stranded && (!now || now === document.body || ui.banner.contains(now) || ui.pair.contains(now))) {
+      if (calibrating) { ui.calibrating.focus(); } else { ui.master.focus(); }
+    }
+  });
+  // Sent when a newer page of this device took the stream; reconnecting would take it back.
+  events.addEventListener("replaced", () => {
+    stopStream();
+    streamReplaced = true;
+    setLost(true, TEXT.replaced);
+  });
+  events.onerror = () => {
+    stopStream();
+    checkAccess();
+  };
+}
+
+function checkAccess() {
+  checking = true;
+  fetch("/api/state", { cache: "no-store", credentials: "same-origin" }).then((response) => {
+    if (response.status === 401) {
+      unpairedByApp();
+    } else if (response.ok) {
+      retryLater(TEXT.noUpdates);
+    } else {
+      return response.json().then((answer) => answer, () => ({})).then((answer) => {
+        if (response.status === 403) {
+          setLost(true, answer.message || TEXT.unreachable);
+        } else if (answer.error === "busy") {
+          retryLater(TEXT.busy);
+        } else if (answer.error === "not_ready") {
+          retryLater(TEXT.waiting);
+        } else {
+          retryLater(TEXT.lost);
+        }
+      });
+    }
+  }, () => retryLater(TEXT.lost)).finally(() => { checking = false; });
+}
+
+function unpairedByApp() {
+  const message = streamed || wasPaired() ? TEXT.unpaired : "";
+  remember(false);
+  showPairing(message);
+}
+
+function retryLater(message) {
+  const wait = RETRY_STEPS_MS[Math.min(failures, RETRY_STEPS_MS.length - 1)];
+  failures += 1;
+  if (snapshot !== null || failures >= 2) { setLost(true, message); }
+  retryTimer = window.setTimeout(connect, wait);
+}
+
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    cache: "no-store",
+    body: JSON.stringify(body),
+  }).then((response) => {
+    if (response.ok) { return response; }
+    if (response.status === 401) {
+      unpairedByApp();
+      throw null;
+    }
+    return response.json().then(
+      (answer) => { throw new Error(answer.message || TEXT.failed); },
+      () => { throw new Error(TEXT.failed); },
+    );
+  }, () => { throw new Error(TEXT.unreachable); });
+}
+
+// One request at a time per control, at most one every SEND_EVERY_MS, and
+// only the newest value waits: two requests in flight could reach the app in
+// the wrong order and leave the older value applied.
+function sender(send, onFail, onSettle = () => {}) {
+  let lastSent = 0;
+  let timer = null;
+  let pending = null;
+  let sentValue = null;
+  let inFlight = false;
+  let settleTimer = null;
+  const release = () => {
+    window.clearTimeout(settleTimer);
+    settleTimer = null;
+  };
+  const fire = () => {
+    window.clearTimeout(timer);
+    timer = null;
+    if (pending === null || inFlight) { return; }
+    const wait = lastSent + SEND_EVERY_MS - Date.now();
+    if (wait > 0) {
+      timer = window.setTimeout(fire, wait);
+      return;
+    }
+    const value = pending;
+    pending = null;
+    sentValue = value;
+    lastSent = Date.now();
+    inFlight = true;
+    release();
+    send(value).then(() => {
+      inFlight = false;
+      settleTimer = window.setTimeout(() => {
+        settleTimer = null;
+        if (pending === null) { onSettle(); }
+      }, SETTLE_MS);
+      fire();
+    }, (problem) => {
+      inFlight = false;
+      onFail(problem, pending === null);
+      fire();
+    });
+  };
+  return {
+    set(value) {
+      if (inFlight && pending === null && value === sentValue) { return; }
+      pending = value;
+      if (timer === null) { fire(); }
+    },
+    busy(reported) {
+      if (!inFlight && reported === sentValue) { release(); }
+      return inFlight || pending !== null || settleTimer !== null;
+    },
+  };
+}
+
+function rangeControl(input, output, read, write, onFail) {
+  let held = false;
+  const showPercent = (value) => {
+    output.value = TEXT.percent(value);
+    input.setAttribute("aria-valuetext", TEXT.percent(value));
+  };
+  // A snapshot can trail this phone's own sends, so a level it set earlier says nothing about a later failure.
+  const delivered = [];
+  let failedAt = -Infinity;
+  const send = sender((value) => write(value).then((reply) => {
+    delivered.push(value);
+    if (delivered.length > 8) { delivered.shift(); }
+    return reply;
+  }), (problem, settled) => {
+    if (problem) {
+      failedAt = Date.now();
+      onFail(problem.message);
+    }
+    if (settled && !held) { control.show(read()); }
+  }, () => {
+    if (!held) { control.show(read()); }
+  });
+  const control = {
+    held: (reported) => held || send.busy(Math.round(reported)),
+    lateEcho: (reported) => Date.now() - failedAt < LATE_ECHO_MS && delivered.includes(Math.round(reported)),
+    show(value) {
+      input.value = String(Math.round(value));
+      showPercent(Math.round(value));
+    },
+  };
+  input.addEventListener("pointerdown", () => { held = true; });
+  input.addEventListener("input", () => {
+    const value = Number(input.value);
+    showPercent(value);
+    send.set(value);
+  });
+  input.addEventListener("change", () => {
+    held = false;
+    send.set(Number(input.value));
+  });
+  input.addEventListener("pointerup", () => { held = false; });
+  input.addEventListener("pointercancel", () => { held = false; });
+  return control;
+}
+
+function makeRow(speaker) {
+  rowCount += 1;
+  const key = `s${rowCount}`;
+  const root = document.createElement("article");
+  root.className = "speaker card";
+  root.setAttribute("aria-labelledby", `${key}-name`);
+
+  const head = document.createElement("div");
+  head.className = "speaker-head";
+  const names = document.createElement("div");
+  names.className = "names";
+  const name = document.createElement("h2");
+  name.id = `${key}-name`;
+  name.tabIndex = -1;
+  const kind = document.createElement("p");
+  kind.className = "kind muted";
+  names.append(name, kind);
+  const switchLabel = document.createElement("label");
+  switchLabel.className = "switch";
+  const power = document.createElement("input");
+  power.type = "checkbox";
+  power.setAttribute("role", "switch");
+  power.setAttribute("aria-labelledby", `${key}-name`);
+  switchLabel.append(power);
+  head.append(names, switchLabel);
+
+  const body = document.createElement("div");
+
+  const volumeLine = document.createElement("div");
+  volumeLine.className = "slider-line";
+  const volumeLabel = document.createElement("label");
+  volumeLabel.id = `${key}-volume-label`;
+  volumeLabel.htmlFor = `${key}-volume`;
+  volumeLabel.textContent = TEXT.volume;
+  const volume = document.createElement("input");
+  volume.type = "range";
+  volume.id = `${key}-volume`;
+  volume.min = "0";
+  volume.max = "100";
+  volume.step = "1";
+  volume.setAttribute("aria-labelledby", `${key}-volume-label ${key}-name`);
+  const volumeValue = document.createElement("output");
+  volumeValue.htmlFor = volume.id;
+  volumeLine.append(volumeLabel, volume, volumeValue);
+
+  const delayLine = document.createElement("div");
+  delayLine.className = "delay-line";
+  const delayLabel = document.createElement("label");
+  delayLabel.id = `${key}-delay-label`;
+  delayLabel.htmlFor = `${key}-delay`;
+  delayLabel.textContent = TEXT.delay;
+  const less = document.createElement("button");
+  less.type = "button";
+  less.textContent = "−";
+  const delay = document.createElement("input");
+  delay.type = "number";
+  delay.id = `${key}-delay`;
+  delay.step = "1";
+  delay.setAttribute("aria-labelledby", `${key}-delay-label ${key}-name`);
+  delay.setAttribute("aria-describedby", `${key}-ms`);
+  const unit = document.createElement("span");
+  unit.id = `${key}-ms`;
+  unit.className = "muted";
+  unit.textContent = TEXT.ms;
+  const more = document.createElement("button");
+  more.type = "button";
+  more.textContent = "+";
+  delayLine.append(delayLabel, less, delay, unit, more);
+
+  body.append(volumeLine, delayLine);
+
+  const notice = document.createElement("p");
+  notice.className = "notice";
+  const error = document.createElement("p");
+  error.className = "error";
+  error.hidden = true;
+  root.append(head, body, notice, error);
+
+  const row = { id: speaker.id, root, name, kind, power, body, volume, delayLine, less, delay, more, notice, error, speaker };
+
+  const fail = (message) => {
+    showError(row.error, message);
+    announce(`${row.speaker.name}: ${message}`);
+  };
+  const change = (fields) => {
+    showError(row.error, "");
+    return post(`/api/speakers/${encodeURIComponent(row.id)}`, fields);
+  };
+
+  row.volumeControl = rangeControl(volume, volumeValue, () => row.speaker.volume,
+    (value) => change({ volume: value }), fail);
+  // A Cast device has its own volume step; the range keeps step 1 so a
+  // reported level shows as it is.
+  volume.addEventListener("keydown", (event) => {
+    const direction = { ArrowUp: 1, ArrowRight: 1, ArrowDown: -1, ArrowLeft: -1 }[event.key];
+    const deviceStep = row.speaker.volume_step;
+    if (!direction || !(deviceStep > 0) || deviceStep === 1) { return; }
+    event.preventDefault();
+    const next = Math.min(100, Math.max(0, Number(volume.value) + direction * deviceStep));
+    volume.value = String(Math.round(next));
+    volume.dispatchEvent(new Event("input"));
+    volume.dispatchEvent(new Event("change"));
+  });
+
+  row.powerSender = sender((on) => change({ on }), (problem, settled) => {
+    if (problem) { fail(problem.message); }
+    if (settled) { power.checked = row.speaker.on; }
+  }, () => { power.checked = row.speaker.on; });
+  power.addEventListener("change", () => row.powerSender.set(power.checked));
+
+  row.delaySender = sender((value) => change({ delay_ms: value }), (problem, settled) => {
+    if (problem) { fail(problem.message); }
+    if (settled) { showDelay(row, row.speaker.delay_ms); }
+  }, () => { if (document.activeElement !== row.delay) { showDelay(row, row.speaker.delay_ms); } });
+
+  const sendDelay = (value) => {
+    const min = row.speaker.delay_min_ms;
+    const max = row.speaker.delay_max_ms;
+    if (!Number.isInteger(value) || value < min || value > max) {
+      showDelay(row, row.speaker.delay_ms);
+      fail(TEXT.delayRange(min, max));
+      return;
+    }
+    showDelay(row, value);
+    row.delaySender.set(value);
+  };
+  const step = (direction) => {
+    const now = Number(delay.value);
+    const min = row.speaker.delay_min_ms;
+    const max = row.speaker.delay_max_ms;
+    sendDelay(Math.min(max, Math.max(min, Math.round(now) + direction * DELAY_STEP_MS)));
+  };
+  less.addEventListener("click", () => step(-1));
+  more.addEventListener("click", () => step(1));
+  delay.addEventListener("change", () => sendDelay(Number(delay.value.trim() === "" ? NaN : delay.value)));
+  delay.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { delay.blur(); }
+  });
+
+  return row;
+}
+
+function showDelay(row, value) {
+  if (document.activeElement !== row.delay || Number(row.delay.value) !== value) {
+    row.delay.value = String(value);
+  }
+  row.less.disabled = value <= row.speaker.delay_min_ms;
+  row.more.disabled = value >= row.speaker.delay_max_ms;
+}
+
+function updateRow(row, speaker) {
+  // A change made elsewhere settles whatever this phone's last change failed at.
+  const was = row.speaker;
+  if (speaker.on !== was.on || (speaker.volume !== was.volume && !row.volumeControl.lateEcho(speaker.volume)) || speaker.delay_ms !== was.delay_ms) { showError(row.error, ""); }
+  row.speaker = speaker;
+  row.name.textContent = speaker.name;
+  row.kind.textContent = speaker.kind;
+  row.root.classList.toggle("off-line", !speaker.available);
+  // Hiding the focused control drops focus to the page top; keep it on this speaker.
+  const focused = document.activeElement;
+  // The reference output and a Cast group have no delay of their own to change.
+  const fixedDelay = speaker.delay_min_ms === speaker.delay_max_ms;
+  if ((!speaker.available && (row.body.contains(focused) || row.power.parentElement.contains(focused)))
+    || (fixedDelay && row.delayLine.contains(focused))) {
+    row.name.focus();
+  }
+  row.delayLine.hidden = fixedDelay;
+  row.body.hidden = !speaker.available;
+  row.power.parentElement.hidden = !speaker.available;
+  row.less.setAttribute("aria-label", `${TEXT.lessDelay}, ${speaker.name}`);
+  row.more.setAttribute("aria-label", `${TEXT.moreDelay}, ${speaker.name}`);
+  row.delay.min = String(speaker.delay_min_ms);
+  row.delay.max = String(speaker.delay_max_ms);
+  // The numeric keypad has no minus sign; without inputmode a number field gets one.
+  if (speaker.delay_min_ms < 0) { row.delay.removeAttribute("inputmode"); } else { row.delay.inputMode = "numeric"; }
+
+  const reason = speaker.available ? speaker.notice : (speaker.notice || TEXT.unavailable);
+  row.notice.textContent = reason || "";
+  row.notice.hidden = !reason;
+  if (!speaker.available) { showError(row.error, ""); return; }
+
+  if (!row.powerSender.busy(speaker.on)) { row.power.checked = speaker.on; }
+  if (!row.volumeControl.held(speaker.volume)) { row.volumeControl.show(speaker.volume); }
+  const editing = document.activeElement === row.delay;
+  if (!row.delaySender.busy(speaker.delay_ms) && !editing) { showDelay(row, speaker.delay_ms); }
+}
+
+// Removing the focused card drops focus to the page top; move it to the next card, else the previous one, else the title.
+function focusNeighbor(order, gone) {
+  const at = order.indexOf(gone);
+  const alive = (root) => root.isConnected;
+  const neighbor = order.slice(at + 1).find(alive) || order.slice(0, at).reverse().find(alive);
+  const row = neighbor && [...rows.values()].find((candidate) => candidate.root === neighbor);
+  (row ? row.name : ui.title).focus();
+}
+
+// The phone never dismisses one: it goes when the app clears it (S454).
+function showNotices(list) {
+  const texts = Array.isArray(list) ? list.filter((text) => typeof text === "string" && text) : [];
+  const shown = Array.from(ui.notices.children, (banner) => banner.textContent);
+  if (JSON.stringify(texts) === JSON.stringify(shown)) { return; }
+  const fresh = texts.filter((text) => !shown.includes(text));
+  ui.notices.replaceChildren(...texts.map((text) => {
+    const banner = document.createElement("div");
+    banner.className = "banner app";
+    const line = document.createElement("p");
+    line.textContent = text;
+    banner.append(line);
+    return banner;
+  }));
+  if (fresh.length > 0) { announce(fresh.join(" ")); }
+}
+
+function showComputer(name) {
+  const shown = (typeof name === "string" && name.trim()) || localName;
+  ui.computer.textContent = shown ? TEXT.computer(shown) : "";
+  ui.computer.hidden = !shown;
+}
+
+// A disabled fieldset drops focus to the page top; the calibrating line takes it instead.
+function showCalibrating(value) {
+  const now = value === true;
+  if (now === calibrating) { return; }
+  calibrating = now;
+  ui.calibrating.hidden = !now;
+  if (now) {
+    clearErrors();
+    if (ui.writes.contains(document.activeElement)) { ui.calibrating.focus(); }
+  }
+  ui.writes.disabled = now;
+  announce(now ? TEXT.calibrating : TEXT.calibrationDone);
+}
+
+function makeZone(zone) {
+  rowCount += 1;
+  const key = `z${rowCount}`;
+  const root = document.createElement("article");
+  root.className = "zone card";
+  root.setAttribute("aria-labelledby", `${key}-name`);
+  const head = document.createElement("div");
+  head.className = "speaker-head";
+  const names = document.createElement("div");
+  names.className = "names";
+  const name = document.createElement("h2");
+  name.id = `${key}-name`;
+  name.tabIndex = -1;
+  const count = document.createElement("p");
+  count.className = "kind muted";
+  names.append(name, count);
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  head.append(names, toggle);
+  const members = document.createElement("p");
+  members.className = "zone-members muted";
+  const volumeLine = document.createElement("div");
+  volumeLine.className = "slider-line";
+  const volumeLabel = document.createElement("label");
+  volumeLabel.id = `${key}-volume-label`;
+  volumeLabel.htmlFor = `${key}-volume`;
+  volumeLabel.textContent = TEXT.zoneVolume;
+  const volume = document.createElement("input");
+  volume.type = "range";
+  volume.id = `${key}-volume`;
+  volume.min = "0";
+  volume.max = "100";
+  volume.step = "1";
+  volume.setAttribute("aria-labelledby", `${key}-volume-label ${key}-name`);
+  const volumeValue = document.createElement("output");
+  volumeValue.htmlFor = volume.id;
+  volumeLine.append(volumeLabel, volume, volumeValue);
+  const error = document.createElement("p");
+  error.className = "error";
+  error.hidden = true;
+  root.append(head, members, volumeLine, error);
+
+  const row = { id: zone.id, root, name, count, toggle, members, error, zone };
+  const fail = (message) => {
+    showError(row.error, message);
+    announce(`${row.zone.name}: ${message}`);
+  };
+  const change = (fields) => {
+    showError(row.error, "");
+    return post(`/api/zones/${encodeURIComponent(row.id)}`, fields);
+  };
+  row.volumeControl = rangeControl(volume, volumeValue, () => row.zone.volume,
+    (value) => change({ volume: value }), fail);
+  row.toggleSender = sender(() => change({ toggle: true }), (problem) => {
+    if (problem) { fail(problem.message); }
+  });
+  toggle.addEventListener("click", () => row.toggleSender.set(true));
+  return row;
+}
+
+function updateZone(row, zone, speakers) {
+  if ((zone.volume !== row.zone.volume && !row.volumeControl.lateEcho(zone.volume)) || zone.counts.on !== row.zone.counts.on) { showError(row.error, ""); }
+  row.zone = zone;
+  row.name.textContent = zone.name;
+  const counts = zone.counts;
+  const present = counts.total > 0;
+  row.count.textContent = present
+    ? TEXT.zoneCount(counts.on, counts.total) + (counts.waiting > 0 ? TEXT.zoneWaiting(counts.waiting) : "")
+    : counts.all > 0 ? TEXT.zoneNoneHere(counts.all) : TEXT.zoneEmpty;
+  const label = present && counts.on === counts.total ? TEXT.turnOff : TEXT.turnOn;
+  row.toggle.textContent = label;
+  row.toggle.setAttribute("aria-label", `${label}, ${zone.name}`);
+  if (!present && document.activeElement === row.toggle) { row.name.focus(); }
+  row.toggle.disabled = !present;
+  const names = zone.members.map((id) => speakers.get(id)).filter(Boolean);
+  row.members.textContent = names.join(", ");
+  row.members.hidden = names.length === 0;
+  if (!row.volumeControl.held(zone.volume)) { row.volumeControl.show(zone.volume); }
+}
+
+function renderZones(next) {
+  const zones = Array.isArray(next.zones) ? next.zones : [];
+  const speakers = new Map(next.speakers.map((speaker) => [speaker.id, speaker.name]));
+  const focusedGone = [...zoneRows.values()].find((row) => row.root.contains(document.activeElement));
+  const seen = new Set();
+  let previous = null;
+  for (const zone of zones) {
+    seen.add(zone.id);
+    let row = zoneRows.get(zone.id);
+    if (!row) {
+      row = makeZone(zone);
+      zoneRows.set(zone.id, row);
+    }
+    updateZone(row, zone, speakers);
+    const place = previous ? previous.root.nextSibling : ui.zoneList.firstChild;
+    if (place !== row.root) { ui.zoneList.insertBefore(row.root, place); }
+    previous = row;
+  }
+  for (const [id, row] of zoneRows) {
+    if (!seen.has(id)) { row.root.remove(); zoneRows.delete(id); }
+  }
+  if (focusedGone && !focusedGone.root.isConnected) { ui.title.focus(); }
+  ui.zones.hidden = zones.length === 0;
+}
+
+function renderPresets(next) {
+  const presets = Array.isArray(next.presets) ? next.presets : [];
+  const focused = document.activeElement;
+  const hadFocus = ui.presetList.contains(focused);
+  const seen = new Set();
+  let previous = null;
+  for (const preset of presets) {
+    seen.add(preset.id);
+    let button = presetButtons.get(preset.id);
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      const id = preset.id;
+      button.addEventListener("click", () => {
+        showError(ui.presetError, "");
+        post(`/api/presets/${encodeURIComponent(id)}`, { recall: true }).catch((problem) => {
+          if (problem) {
+            showError(ui.presetError, problem.message);
+            announce(problem.message);
+          }
+        });
+      });
+      presetButtons.set(preset.id, button);
+    }
+    button.textContent = preset.name;
+    if ((button.getAttribute("aria-current") === "true") !== (preset.current === true)) { showError(ui.presetError, ""); }
+    // The current preset is filled, not only tinted, and named current to screen readers.
+    button.classList.toggle("primary", preset.current === true);
+    if (preset.current === true) { button.setAttribute("aria-current", "true"); } else { button.removeAttribute("aria-current"); }
+    const place = previous ? previous.nextSibling : ui.presetList.firstChild;
+    if (place !== button) { ui.presetList.insertBefore(button, place); }
+    previous = button;
+  }
+  for (const [id, button] of presetButtons) {
+    if (!seen.has(id)) { button.remove(); presetButtons.delete(id); showError(ui.presetError, ""); }
+  }
+  if (hadFocus && !focused.isConnected) { (previous || ui.title).focus(); }
+  ui.presets.hidden = presets.length === 0;
+}
+
+function sourceName(id) {
+  const list = snapshot && Array.isArray(snapshot.sources) ? snapshot.sources : [];
+  const source = list.find((entry) => entry.id === id);
+  return source ? source.name : "";
+}
+
+function sourceOption(source) {
+  const option = document.createElement("option");
+  option.value = source.id;
+  const reason = source.available === false ? (source.notice || TEXT.unavailable) : source.notice;
+  option.textContent = reason ? TEXT.sourceWithNotice(source.name, reason) : source.name;
+  option.disabled = source.available === false;
+  return option;
+}
+
+// Rebuilt only when the list changes, so a picker open on the phone isn't replaced under the finger.
+function fillSources(list, listed) {
+  const key = JSON.stringify([list, listed]);
+  if (key === sourceList) { return; }
+  sourceList = key;
+  const options = [];
+  if (!listed) {
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = TEXT.noSource;
+    none.disabled = true;
+    options.push(none);
+  }
+  const headings = { app: TEXT.sourceApps, input: TEXT.sourceInputs };
+  let group = null;
+  for (const source of list) {
+    const heading = headings[source.kind];
+    if (!heading) {
+      group = null;
+      options.push(sourceOption(source));
+    } else {
+      if (!group || group.dataset.kind !== source.kind) {
+        group = document.createElement("optgroup");
+        group.label = heading;
+        group.dataset.kind = source.kind;
+        options.push(group);
+      }
+      group.append(sourceOption(source));
+    }
+  }
+  ui.source.replaceChildren(...options);
+}
+
+function showCurrentSource() {
+  if (pickerOpen) { return; }
+  const wanted = switchingTo || (snapshot && snapshot.source_id) || "";
+  if (ui.source.value !== wanted) { ui.source.value = wanted; }
+}
+
+function endSwitch(message) {
+  window.clearTimeout(switchTimer);
+  switchTimer = null;
+  switchingTo = null;
+  mixing = null;
+  ui.source.removeAttribute("aria-busy");
+  ui.sourceStatus.textContent = "";
+  ui.sourceStatus.hidden = true;
+  if (message) {
+    showError(ui.sourceError, message);
+    announce(message);
+  }
+  showCurrentSource();
+}
+
+function showSources(next) {
+  const list = Array.isArray(next.sources) ? next.sources : [];
+  const listed = list.some((source) => source.id === next.source_id);
+  if (switchingTo !== null && next.source_id === switchingTo) {
+    const name = sourceName(switchingTo);
+    endSwitch("");
+    announce(TEXT.switched(name));
+  } else if (switchingTo !== null && !list.some((source) => source.id === switchingTo)) {
+    endSwitch(TEXT.notSwitched);
+  } else if (mixing !== null && next.source_id !== shownSource) {
+    const name = sourceName(next.source_id) || mixing;
+    endSwitch("");
+    announce(TEXT.switched(name));
+  } else if (switchingTo === null && next.source_id !== shownSource) {
+    // A switch that landed after the wait: the error it left no longer holds.
+    showError(ui.sourceError, "");
+  }
+  shownSource = next.source_id;
+  const empty = list.length === 0;
+  if (empty && document.activeElement === ui.source) { ui.sourceTitle.focus(); }
+  ui.source.hidden = empty;
+  ui.sourceEmpty.hidden = !empty;
+  fillSources(list, listed);
+  if (pickerOpen) { ui.source.selectedIndex = -1; }
+  showCurrentSource();
+}
+
+// A mix has no page ID to wait for (id null): any other source in use ends its wait.
+function startSwitch(id, name) {
+  window.clearTimeout(switchTimer);
+  switchingTo = id;
+  mixing = id === null ? name : null;
+  ui.source.setAttribute("aria-busy", "true");
+  const status = TEXT.switching(name);
+  ui.sourceStatus.textContent = status;
+  ui.sourceStatus.hidden = false;
+  announce(status);
+  switchTimer = window.setTimeout(() => endSwitch(TEXT.notSwitched), SWITCH_WAIT_MS);
+  showCurrentSource();
+}
+
+// Each sender ends only its own wait: a failure after the other kind of switch started leaves that one be.
+const sourceSender = sender((id) => post("/api/source", { id }), (problem, settled) => {
+  if (settled && mixing === null) { endSwitch(problem ? problem.message : ""); }
+});
+
+const mixSender = sender((apps) => post("/api/mix", { apps }), (problem, settled) => {
+  if (settled && switchingTo === null) { endSwitch(problem ? problem.message : ""); }
+});
+
+// A native select fires change only for a pick that differs from the selection it opened with, so a
+// touch or click opens it with none selected and a pick of the source shown is sent again.
+ui.source.addEventListener("pointerdown", () => { pickerOpen = true; ui.source.selectedIndex = -1; });
+ui.source.addEventListener("blur", () => { pickerOpen = false; showCurrentSource(); });
+// A picker closed without a pick keeps the focus, so no blur comes.
+ui.source.addEventListener("keydown", (event) => { if (event.key === "Escape") { pickerOpen = false; showCurrentSource(); } });
+document.addEventListener("pointerdown", (event) => { if (pickerOpen && event.target !== ui.source) { pickerOpen = false; showCurrentSource(); } });
+
+ui.source.addEventListener("change", () => {
+  pickerOpen = false;
+  const id = ui.source.value;
+  if (!snapshot || id === "") { return; }
+  showError(ui.sourceError, "");
+  if (id === snapshot.source_id) {
+    // Back to the source in use: no snapshot will name a change, so nothing waits for one.
+    endSwitch("");
+    sourceSender.set(id);
+    return;
+  }
+  startSwitch(id, sourceName(id));
+  sourceSender.set(id);
+});
+
+function mixApps() {
+  return snapshot && Array.isArray(snapshot.mix_apps) ? snapshot.mix_apps : [];
+}
+
+function checkedApps() {
+  return Array.from(ui.mixList.querySelectorAll("input:checked"), (box) => box.value);
+}
+
+function showPlay() {
+  const none = checkedApps().length === 0;
+  if (none && document.activeElement === ui.mixPlay) { ui.mixCancel.focus(); }
+  ui.mixPlay.disabled = none;
+}
+
+function closeMix() {
+  ui.mix.hidden = true;
+  ui.mixOpen.setAttribute("aria-expanded", "false");
+}
+
+// Rebuilt only when the list changes; checks and focus survive a rebuild.
+function showMix() {
+  const apps = mixApps();
+  const offered = apps.some((app) => app.running === true);
+  const focused = document.activeElement;
+  if (!offered && (ui.mixOpen === focused || ui.mix.contains(focused))) { ui.sourceTitle.focus(); }
+  if (!offered) { closeMix(); }
+  ui.mixOpen.hidden = !offered;
+  const key = JSON.stringify(apps);
+  if (key === mixAppsShown) { return; }
+  mixAppsShown = key;
+  const checked = checkedApps();
+  const focusedId = ui.mixList.contains(focused) ? focused.value : null;
+  ui.mixList.replaceChildren(...apps.map((app) => {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = app.id;
+    box.disabled = app.running !== true;
+    box.checked = !box.disabled && checked.includes(app.id);
+    label.classList.toggle("off", box.disabled);
+    label.append(box, box.disabled ? TEXT.appNotRunning(app.name) : app.name);
+    return label;
+  }));
+  if (focusedId !== null) {
+    const box = Array.from(ui.mixList.querySelectorAll("input:enabled")).find((found) => found.value === focusedId);
+    (box || ui.mixOpen).focus();
+  }
+  showPlay();
+}
+
+ui.mixOpen.addEventListener("click", () => {
+  if (!ui.mix.hidden) {
+    closeMix();
+    return;
+  }
+  for (const box of ui.mixList.querySelectorAll("input")) { box.checked = false; }
+  showPlay();
+  ui.mix.hidden = false;
+  ui.mixOpen.setAttribute("aria-expanded", "true");
+  const first = ui.mixList.querySelector("input:enabled");
+  if (first) { first.focus(); }
+});
+
+ui.mixList.addEventListener("change", showPlay);
+
+ui.mixCancel.addEventListener("click", () => {
+  closeMix();
+  ui.mixOpen.focus();
+});
+
+ui.mixPlay.addEventListener("click", () => {
+  const apps = checkedApps();
+  const names = mixApps().filter((app) => apps.includes(app.id)).map((app) => app.name);
+  closeMix();
+  ui.mixOpen.focus();
+  showError(ui.sourceError, "");
+  if (apps.length === 1 && `app:${apps[0]}` === snapshot.source_id) {
+    // The app in use: no snapshot will name a change, so nothing waits for one.
+    endSwitch("");
+  } else {
+    startSwitch(null, names.join(", "));
+  }
+  mixSender.set(apps);
+});
+
+function render(next) {
+  snapshot = next;
+  showRemote();
+  showComputer(next.computer_name);
+  showNotices(next.notices);
+
+  const playing = next.now_playing;
+  const paused = playing && playing.playing === false;
+  if (playing && (playing.title || playing.artist)) {
+    ui.playingTitle.textContent = playing.title || playing.artist;
+    ui.playingDetail.textContent = [playing.title ? playing.artist : "", playing.source, paused ? TEXT.paused : ""].filter(Boolean).join(" · ");
+  } else {
+    ui.playingTitle.textContent = TEXT.nothingPlaying;
+    ui.playingDetail.textContent = playing && playing.source ? playing.source : "";
+  }
+  ui.playingDetail.hidden = ui.playingDetail.textContent === "";
+  if (!masterControl.held(next.master.volume)) { masterControl.show(next.master.volume); }
+  showSources(next);
+  showMix();
+
+  const order = Array.from(ui.speakers.children);
+  const focusedRow = [...rows.values()].find((row) => row.root.contains(document.activeElement));
+  const seen = new Set();
+  let previous = null;
+  for (const speaker of next.speakers) {
+    seen.add(speaker.id);
+    let row = rows.get(speaker.id);
+    if (!row) {
+      row = makeRow(speaker);
+      rows.set(speaker.id, row);
+    }
+    updateRow(row, speaker);
+    const place = previous ? previous.root.nextSibling : ui.speakers.firstChild;
+    if (place !== row.root) { ui.speakers.insertBefore(row.root, place); }
+    previous = row;
+  }
+  for (const [id, row] of rows) {
+    if (!seen.has(id)) { row.root.remove(); rows.delete(id); }
+  }
+  if (focusedRow && !focusedRow.root.isConnected) { focusNeighbor(order, focusedRow.root); }
+  ui.empty.hidden = next.speakers.length > 0;
+  ui.empty.textContent = TEXT[next.hidden_speakers > 0 ? "allHidden" : "noSpeakers"];
+  renderPresets(next);
+  renderZones(next);
+  showCalibrating(next.calibrating);
+}
+
+const masterControl = rangeControl(ui.master, ui.masterValue, () => (snapshot ? snapshot.master.volume : 0),
+  (value) => {
+    showError(ui.masterError, "");
+    return post("/api/master", { volume: value });
+  },
+  (message) => {
+    showError(ui.masterError, message);
+    announce(message);
+  });
+
+ui.pair.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const code = ui.code.value.replace(/\s+/g, "");
+  if (!/^[0-9]{6}$/.test(code)) {
+    showError(ui.pairError, TEXT.codeShape);
+    announce(TEXT.codeShape);
+    ui.code.focus();
+    return;
+  }
+  ui.pairButton.disabled = true;
+  showError(ui.pairError, "");
+  announce(TEXT.pairing);
+  fetch("/api/pair", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    cache: "no-store",
+    body: JSON.stringify({ code }),
+  }).then((response) => {
+    if (response.ok) {
+      remember(true);
+      ui.code.value = "";
+      announce(TEXT.paired);
+      failures = 0;
+      focusAfterPair = true;
+      connect();
+      return null;
+    }
+    return response.json().then((answer) => answer.message || TEXT.failed, () => TEXT.failed);
+  }, () => TEXT.unreachable).then((message) => {
+    ui.pairButton.disabled = false;
+    if (message) {
+      showError(ui.pairError, message);
+      announce(message);
+      ui.code.focus();
+    }
+  });
+});
+
+ui.retry.addEventListener("click", connect);
+
+ui.unpair.addEventListener("click", () => {
+  if (!window.confirm(TEXT.unpairConfirm)) { return; }
+  showError(ui.unpairError, "");
+  post("/api/unpair", {}).then(() => {
+    remember(false);
+    showPairing("");
+    announce(TEXT.unpairedHere);
+  }, (problem) => {
+    if (problem) {
+      showError(ui.unpairError, problem.message);
+      announce(problem.message);
+    }
+  });
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && ui.pair.hidden && events === null && !streamReplaced && !checking) {
+    failures = 0;
+    connect();
+  } else if (document.visibilityState === "visible" && events !== null && streamStale()) {
+    stopStream();
+    checkAccess();
+  }
+});
+
+const host = window.location.hostname.replace(/\.$/, "");
+const localName = host.toLowerCase().endsWith(".local") ? host.slice(0, -".local".length) : "";
+for (const element of document.querySelectorAll("[data-text]")) { element.textContent = TEXT[element.dataset.text]; }
+showComputer("");
+showSetup();
+
+connect();
+</script>
+</body>
+</html>

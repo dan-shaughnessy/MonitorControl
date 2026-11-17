@@ -1,0 +1,616 @@
+import Foundation
+
+/// What AudioSync remembers between launches: the source, the speakers that
+/// are on, every volume and delay, the groups, auto-connect and the two view
+/// choices. The equalizer is kept under `Keys.equalizer` as JSON
+/// (`StoredEqualizer`), read and written by its own code.
+///
+/// Every value is checked as it is read, so a damaged or hand-edited setting
+/// never reaches the engine: a number that isn't finite is dropped, volumes
+/// are clamped to 0…100, offsets to −2000…20 000 ms and the AirPlay delays
+/// to their ranges (spec S76, S175, S178). Clause numbers refer to
+/// docs/ENGINE_SPEC.md.
+struct AppSettings: Equatable {
+
+    /// The UserDefaults keys. Every key AudioSync stores lives here, and
+    /// existing installs depend on each string: a rename loses that setting.
+    enum Keys {
+        /// `AudioSource.defaultsValue` (S12): "" or missing is the whole system.
+        static let source = "audioSourceBundleID"
+        /// The chosen input device's name, kept to show while it is unplugged.
+        static let sourceInputName = "audioSourceInputName"
+        /// The last source of several apps in use (S354), as `source` stores a mix.
+        static let lastMix = "lastMixSource"
+        /// App IDs (`NativeAirPlayID`) of the AirPlay speakers that are on, as an array.
+        static let enabledAirPlay = "enabledAirPlayIds"
+        /// Device UIDs of the local speakers that are on, as an array.
+        static let enabledLocal = "enabledLocalUIDs"
+        /// The device ID (`CastDevice.id`) of the Cast speaker that is on (C112).
+        static let enabledCast = "enabledCastID"
+        /// The master slider's position, 0…100.
+        static let master = "masterVolume"
+        /// Each local speaker's slider position (0…100), by device UID.
+        static let localVolumes = "localVolumePosByUID"
+        /// Each local speaker's absolute delay in ms, by device UID, from
+        /// before the local delay model (S77). Read once by the migration
+        /// (S179), never written; left in place for older builds.
+        static let localDelays = "localDelayMsByUID"
+        /// Each AirPlay speaker's own volume s, unrounded, by output ID (S290).
+        static let airplayVolumes = "airPlayVolumeByID"
+        /// `[SpeakerGroup]` as JSON (S149). Left as it is when the groups
+        /// become zones, for older builds (S248).
+        static let groups = "speakerGroups"
+        /// `[SpeakerZone]` as JSON (S245).
+        static let zones = "speakerZones"
+        /// True once the groups were moved to `zones` (S248); written last.
+        static let zonesMigrated = "speakerZonesMigrated"
+        /// True from a migration that made zones until the next launch says
+        /// so in a notice; removed once shown.
+        static let zonesNoticeDue = "speakerZonesNoticeDue"
+        /// `[SpeakerPreset]` as JSON (S251).
+        static let presets = "speakerPresets"
+        /// True once the groups that lost a member to the zones became
+        /// presets (S254); written last.
+        static let presetsMigrated = "speakerPresetsMigrated"
+        /// Speaker keys (`SpeakerKey`) marked for auto-connect, as an array.
+        static let autoConnect = "autoConnectSpeakers"
+        /// The names the user gave speakers, by speaker key (`SpeakerNames`).
+        static let speakerNames = "speakerNamesByKey"
+        /// The speakers hidden with Hide Speaker (`HiddenSpeakers.stored`):
+        /// an array of key, name and kind.
+        static let hiddenSpeakers = "hiddenSpeakers"
+        static let showVirtualDevices = "showVirtualOutputDevices"
+        /// Volume Keys Control AudioSync (S429), on unless turned off.
+        static let volumeKeys = "volumeKeysControlAudioSync"
+        /// `AppAppearance.defaultsValue` (S155).
+        static let appearance = "appearance"
+        /// The channel pair (`InputChannelPair.index`) each input device plays,
+        /// by device UID; devices on channels 1-2 are left out.
+        static let inputChannelPairs = "inputChannelPairByUID"
+        /// `Equalizer.Settings` as JSON (S24, `StoredEqualizer`).
+        static let equalizer = "equalizerSettings"
+        /// The saved equalizer curves (S270, `StoredCurves`).
+        static let equalizerCurves = "equalizerCurves"
+        static let webRemote = "webRemoteEnabled"
+        static let webRemotePort = "webRemotePort"
+        /// Google Cast devices added by address (C18), as `CastManualAddress.text` strings.
+        static let castManualAddresses = "castManualAddresses"
+        /// The `id` a browse found at each of those addresses (C18), by
+        /// `CastManualAddress.text`; missing when none.
+        static let castFoundIDs = "castFoundIDs"
+        /// One delay in ms for every local speaker, from before delays were
+        /// per speaker: where a speaker without its own delay started (S77).
+        /// Read once by the migration (S179), never written.
+        static let legacyDelayMs = "delayMs"
+        /// Local volumes as linear gain in percent (0…150), from before the
+        /// volume curve. Converted to `localVolumes` once, then removed (S75).
+        static let legacyLocalGains = "localGainByUID"
+        /// "swift" or "rust", from builds that offered a choice of audio
+        /// engine. Never written now; a value left there has no effect, is
+        /// noted once and removed (`RetiredEngineChoice`).
+        static let retiredEngineChoice = "engineImpl"
+        /// "native" or the old engine's value, from builds that offered a
+        /// choice of AirPlay sender. Never written now; a value left there has
+        /// no effect, is noted once and removed (`RetiredAirPlayChoice`).
+        static let retiredAirPlayChoice = "airplayImpl"
+        /// Each local speaker's offset in ms relative to the reference
+        /// (−2000…20 000), by device UID (S175). Missing is 0.
+        static let localOffsets = "localOffsetMsByUID"
+        /// The AirPlay delay of the older builds that shipped the bundled
+        /// engine, L itself, in ms. Written once by the migration (S179), for
+        /// those builds; never read now.
+        static let airPlayDelay = "airPlayDelayMs"
+        /// The AirPlay delay, an adjustment on top of the latency the AirPlay
+        /// sender reports, in ms (−2000…20 000, 0 when missing; S178).
+        static let nativeAirPlayAdjustment = "nativeAirPlayAdjustmentMs"
+        /// True once the delays of `localDelays` and `legacyDelayMs` were
+        /// migrated to offsets and the AirPlay delays (S179); written last.
+        static let localDelaysMigrated = "localDelayModelMigrated"
+        /// True once a first install's device list was seen, whether or not
+        /// it switched This Mac on (`SettingsStore.speakerOnAtInstall`).
+        static let speakerOnAtInstall = "thisMacOnAtInstall"
+        /// Every local output UID listed so far, for the Bluetooth seed's
+        /// first listing (S455); missing until a build with the seed lists one.
+        static let seenLocalOutputs = "seenLocalOutputUIDs"
+    }
+
+    /// Where a speaker without a volume of its own starts (S71, S399).
+    static let defaultVolume: Double = 60
+    static let defaultMaster: Double = 100
+    /// Where a local speaker without a delay of its own started before the
+    /// local delay model, unless an older single delay was stored (S77).
+    static let standardDelayMs: Double = 2000
+    static let maxDelayMs: Double = 20_000
+
+    var source = AudioSource.system
+    var lastMix: AudioSource?
+    var enabledAirPlay: Set<String> = []
+    var enabledLocal: Set<String> = []
+    var enabledCast: String?
+    /// The Cast speaker to turn on once listed: the one saved as on, unless hidden (C112).
+    var castOnAtLaunch: String? { enabledCast.flatMap { hiddenSpeakers.contains(CastID.app($0)) ? nil : $0 } }
+    var master = AppSettings.defaultMaster
+    var localVolumes: [String: Double] = [:]
+    /// The absolute delays from before the local delay model (S77), as the
+    /// migration reads them.
+    var localDelays: [String: Double] = [:]
+    var airplayVolumes: [String: Double] = [:]
+    var groups: [SpeakerGroup] = []
+    var zones: [SpeakerZone] = []
+    /// The groups became zones and no launch said so yet.
+    var zonesNoticeDue = false
+    var presets: [SpeakerPreset] = []
+    var autoConnect: Set<String> = []
+    var speakerNames = SpeakerNames()
+    var hiddenSpeakers = HiddenSpeakers()
+    var showVirtualDevices = false
+    var volumeKeys = true
+    var appearance = AppAppearance.system
+    var inputPairs: [String: Int] = [:]
+    var webRemote = false
+    var webRemotePort = RemotePort.default
+
+    /// Whether AUDIOSYNC_AIRPLAY2=1 turns the sender's AirPlay 2 path on; the
+    /// core reads it too, and CI and debug runs use it (P2).
+    static func airPlay2On(environment: [String: String]) -> Bool {
+        environment["AUDIOSYNC_AIRPLAY2"] == "1"
+    }
+    /// D0 of the migration: what a local speaker without a delay of its own
+    /// played with before the local delay model (S77, S179).
+    var defaultDelayMs = AppSettings.standardDelayMs
+    /// Offsets relative to the reference, by device UID (S175).
+    var localOffsets: [String: Double] = [:]
+    var airPlayDelay = AirPlayDelay()
+    /// The migration to offsets ran (S179).
+    var localDelaysMigrated = false
+
+    /// The settings a launch starts from. `holdingSpeakersOff` (a debug launch
+    /// without auto-connect, `LaunchAutoConnect`) leaves every speaker off,
+    /// whatever was saved as on.
+    func atLaunch(holdingSpeakersOff: Bool) -> AppSettings {
+        guard holdingSpeakersOff else { return self }
+        var held = self
+        held.enabledAirPlay = []
+        held.enabledLocal = []
+        held.enabledCast = nil
+        return held
+    }
+
+    /// Reads every setting through `read`, which returns what is stored for a
+    /// key (UserDefaults' `object(forKey:)`), or nil.
+    static func load(_ read: (String) -> Any?) -> AppSettings {
+        var s = AppSettings()
+        s.source = AudioSource(defaultsValue: read(Keys.source) as? String)
+        s.lastMix = LastMix.restored(read(Keys.lastMix) as? String)
+        s.enabledAirPlay = ids(read(Keys.enabledAirPlay))
+        s.enabledLocal = ids(read(Keys.enabledLocal))
+        s.enabledCast = read(Keys.enabledCast) as? String
+        s.autoConnect = ids(read(Keys.autoConnect))
+        s.speakerNames = SpeakerNames(stored: read(Keys.speakerNames))
+        s.hiddenSpeakers = HiddenSpeakers(stored: read(Keys.hiddenSpeakers))
+        s.master = read(Keys.master).flatMap(number).map(volume) ?? defaultMaster
+        s.localVolumes = levels(read(Keys.localVolumes), volume)
+        s.localDelays = levels(read(Keys.localDelays), delay)
+        s.defaultDelayMs = read(Keys.legacyDelayMs).flatMap(number).map(delay) ?? standardDelayMs
+        s.localOffsets = levels(read(Keys.localOffsets)) { LocalDelay.sanitizedOffset($0) ?? 0 }
+        s.airPlayDelay.adjustmentMs = read(Keys.nativeAirPlayAdjustment).flatMap(number)
+            .flatMap(LocalDelay.sanitizedAdjustment) ?? 0
+        s.localDelaysMigrated = read(Keys.localDelaysMigrated) as? Bool ?? false
+        s.airplayVolumes = levels(read(Keys.airplayVolumes), airPlayOwn)
+        s.groups = decodeGroups(read(Keys.groups) as? Data)
+        s.zones = decodeZones(read(Keys.zones) as? Data)
+        s.zonesNoticeDue = read(Keys.zonesNoticeDue) as? Bool ?? false
+        s.presets = decodePresets(read(Keys.presets) as? Data)
+        s.showVirtualDevices = read(Keys.showVirtualDevices) as? Bool ?? false
+        s.volumeKeys = read(Keys.volumeKeys) as? Bool ?? true
+        s.appearance = AppAppearance(defaultsValue: read(Keys.appearance) as? String)
+        s.inputPairs = channelPairs(read(Keys.inputChannelPairs))
+        s.webRemote = read(Keys.webRemote) as? Bool ?? false
+        s.webRemotePort = read(Keys.webRemotePort).flatMap(number).flatMap(RemotePort.stored) ?? RemotePort.default
+        return s
+    }
+
+    // MARK: - Reading single values
+
+    /// A stored number, whichever way it was stored; nil for anything else
+    /// and for NaN or infinity.
+    static func number(_ value: Any) -> Double? {
+        let n: Double
+        if let d = value as? Double { n = d }
+        else if let i = value as? Int { n = Double(i) }
+        else if let ns = value as? NSNumber { n = ns.doubleValue }
+        else { return nil }
+        return n.isFinite ? n : nil
+    }
+
+    /// A slider position, clamped to 0…100.
+    static func volume(_ value: Double) -> Double { min(100, max(0, value)) }
+
+    /// An AirPlay speaker's own volume, at least 0 and unbounded above: it may
+    /// pass 100 by up to 100 / (zone × master) (S290).
+    static func airPlayOwn(_ value: Double) -> Double { max(0, value) }
+
+    /// A delay in ms, clamped to 0…`maxDelayMs`.
+    static func delay(_ value: Double) -> Double { min(maxDelayMs, max(0, value)) }
+
+    /// An older linear gain in percent (0…150) as a slider position: the
+    /// position whose gain is that percentage, so 100 % and more are 100 (S75).
+    static func position(percent: Double) -> Double {
+        volume(VolumeCurve.position(gain: percent / 100))
+    }
+
+    /// A stored array of IDs as a set; anything that isn't a string is skipped.
+    static func ids(_ value: Any?) -> Set<String> {
+        guard let list = value as? [Any] else { return [] }
+        return Set(list.compactMap { $0 as? String })
+    }
+
+    /// A stored dictionary of numbers by ID, each passed through `clean`;
+    /// entries that aren't finite numbers are dropped.
+    static func levels(_ value: Any?, _ clean: (Double) -> Double) -> [String: Double] {
+        guard let dict = value as? [String: Any] else { return [:] }
+        var out: [String: Double] = [:]
+        for (id, raw) in dict {
+            if let n = number(raw) { out[id] = clean(n) }
+        }
+        return out
+    }
+
+    /// The stored channel pairs by device UID: whole numbers above 0 only, as
+    /// a missing entry already means channels 1-2.
+    static func channelPairs(_ value: Any?) -> [String: Int] {
+        guard let dict = value as? [String: Any] else { return [:] }
+        var out: [String: Int] = [:]
+        for (uid, raw) in dict {
+            guard let n = number(raw), n.rounded() == n, n >= 1, n <= Double(InputChannelPair.maxStored) else { continue }
+            out[uid] = Int(n)
+        }
+        return out
+    }
+
+    /// The stored groups without a group that can't be read; none when the
+    /// data is missing or isn't a list.
+    static func decodeGroups(_ data: Data?) -> [SpeakerGroup] {
+        decodeList(SpeakerGroup.self, data, key: Keys.groups)
+    }
+
+    /// The stored zones as S245 keeps them, without a zone that can't be
+    /// read; none when the data is missing or isn't a list.
+    static func decodeZones(_ data: Data?) -> [SpeakerZone] {
+        SpeakerZone.normalized(decodeList(SpeakerZone.self, data, key: Keys.zones))
+    }
+
+    /// The stored presets as S251 keeps them, without a preset that can't be
+    /// read; none when the data is missing or isn't a list.
+    static func decodePresets(_ data: Data?) -> [SpeakerPreset] {
+        SpeakerPreset.normalized(decodeList(SpeakerPreset.self, data, key: Keys.presets))
+    }
+
+    /// The stored list without the elements that can't be read as `T`; none
+    /// when the data is missing or isn't a list. The debug log names what
+    /// didn't read under `key`; `log` takes the line for a list that didn't.
+    static func decodeList<T: Decodable>(_ type: T.Type, _ data: Data?, key: String,
+                                         log: (String) -> Void = { DebugTrace.log($0) }) -> [T] {
+        let decoder = JSONDecoder()
+        decoder.userInfo[StoredTrace.settingsKey] = key
+        guard let data else { return [] }
+        guard let list = try? decoder.decode([LossyDecoded<T>].self, from: data) else {
+            log("[AudioSync] settings: \(key) unreadable, nothing kept")
+            return []
+        }
+        return list.compactMap(\.value)
+    }
+}
+
+/// One stored element read as `T`, or nil when it can't be, so a list of
+/// them loses only the elements that can't be read.
+struct LossyDecoded<T: Decodable>: Decodable {
+    let value: T?
+
+    init(from decoder: Decoder) throws {
+        value = try? T(from: decoder)
+        if value == nil { StoredTrace.log(decoder, decoder.codingPath, "dropped") }
+    }
+}
+
+/// Debug lines for stored settings that didn't read, by settings key and path
+/// only: never a value, a name or a map's key (privacy).
+enum StoredTrace {
+    static let settingsKey = CodingUserInfoKey(rawValue: "settingsKey")!
+    private static let fieldNames: Set = ["members", "zones", "memberNames", "volume", "master", "name"]
+
+    static func log(_ decoder: Decoder, _ path: [CodingKey], _ outcome: String) {
+        DebugTrace.log("[AudioSync] settings: \((decoder.userInfo[settingsKey] as? String) ?? "?")\(pathText(path)) unreadable, \(outcome)")
+    }
+
+    static func pathText(_ path: [CodingKey]) -> String {
+        zip([""] + path.map(\.stringValue), path).map { parent, key in
+            // A map's key may be numeric text, so its intValue says nothing.
+            if parent == "memberNames" { return "[key]" }
+            if let index = key.intValue { return "[\(index)]" }
+            return fieldNames.contains(key.stringValue) ? "." + key.stringValue : "[key]"
+        }.joined()
+    }
+}
+
+extension KeyedDecodingContainer {
+    /// The list under `key` without the elements that can't be read as `T`;
+    /// throws when there is no list there.
+    func decodeLossyList<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> [T] {
+        try decode([LossyDecoded<T>].self, forKey: key).compactMap(\.value)
+    }
+
+    /// The number under `key`, NaN when it is missing or isn't one: the S245
+    /// and S251 clamps turn NaN into the default, which `decoder`'s debug log
+    /// line says.
+    func decodeNumberOrNaN(forKey key: Key, of decoder: Decoder) -> Double {
+        if let number = try? decodeIfPresent(Double.self, forKey: key) { return number }
+        StoredTrace.log(decoder, codingPath + [key as CodingKey], "default used")
+        return .nan
+    }
+}
+
+/// The writes of a `SettingsStore.memoryOnly()` store; a removed key holds nil.
+private final class WrittenInMemory {
+    var values: [String: Any?] = [:]
+}
+
+/// Where the settings are read and written: UserDefaults in the app, a plain
+/// dictionary in the logic tests. Each save writes one key, in the form
+/// `AppSettings.load` reads back.
+struct SettingsStore {
+    typealias Keys = AppSettings.Keys
+
+    let read: (String) -> Any?
+    /// Stores a value for a key; nil removes it.
+    let write: (Any?, String) -> Void
+
+    static var standard: SettingsStore {
+        SettingsStore(read: { UserDefaults.standard.object(forKey: DeskAudio.embedded ? "deskAudio." + $0 : $0) },
+                      write: { UserDefaults.standard.set($0, forKey: DeskAudio.embedded ? "deskAudio." + $1 : $1) })
+    }
+
+    /// This store with every write kept in memory for the run: reads see the
+    /// run's own changes, and nothing reaches `self`. A debug launch without
+    /// auto-connect (`LaunchAutoConnect`) leaves the saved settings as they were.
+    func memoryOnly() -> SettingsStore {
+        let written = WrittenInMemory()
+        return SettingsStore(read: { key in written.values[key] ?? self.read(key) },
+                             write: { value, key in _ = written.values.updateValue(value, forKey: key) })
+    }
+
+    /// Brings older forms up to date (`migrate`, `migrateZones`,
+    /// `migratePresets`), then reads every setting.
+    func load() -> AppSettings {
+        migrate()
+        migrateZones()
+        migratePresets()
+        return AppSettings.load(read)
+    }
+
+    /// The one-time move of the groups that lost a member to the zones to
+    /// presets (S254), after `migrateZones`: without the mark, the presets
+    /// become `PresetMigration`'s, then the mark is written. A run cut short
+    /// before the mark runs again to the same presets; once marked, nothing
+    /// changes.
+    func migratePresets() {
+        guard !isMarked(Keys.presetsMigrated) else { return }
+        let local = AppSettings.levels(read(Keys.localVolumes), AppSettings.volume)
+        let airplay = AppSettings.levels(read(Keys.airplayVolumes), AppSettings.airPlayOwn)
+        let volume: (String) -> Double? = { key in
+            guard let (id, kind) = SpeakerKey.parseAny(key) else { return nil }
+            switch kind {
+            case .local: return local[id]
+            case .airplay: return airplay[id]
+            case .cast: return nil
+            }
+        }
+        let presets = PresetMigration.presets(
+            from: AppSettings.decodeGroups(read(Keys.groups) as? Data),
+            zones: AppSettings.decodeZones(read(Keys.zones) as? Data),
+            volume: volume,
+            master: read(Keys.master).flatMap(AppSettings.number).map(AppSettings.volume) ?? AppSettings.defaultMaster,
+            gains: StoredEqualizer.decode(read(Keys.equalizer) as? Data).gains)
+        save(presets: presets)
+        write(true, Keys.presetsMigrated)
+    }
+
+    /// The one-time move of the groups to zones (S248): without the mark, the
+    /// stored groups become the stored zones, then the mark is written. The
+    /// groups stay as they are. A run cut short before the mark runs again
+    /// from the same groups, to the same zones; once marked, nothing changes.
+    /// Zones made this way leave the notice due.
+    func migrateZones() {
+        guard !isMarked(Keys.zonesMigrated) else { return }
+        let zones = ZoneMigration.zones(from: AppSettings.decodeGroups(read(Keys.groups) as? Data))
+        save(zones: zones)
+        if !zones.isEmpty { write(true, Keys.zonesNoticeDue) }
+        write(true, Keys.zonesMigrated)
+    }
+
+    /// Set unless missing or a stored boolean false (`as? Bool` alone reads a number 0 as false too) (S248, S254).
+    private func isMarked(_ key: String) -> Bool {
+        guard let value = read(key) else { return false }
+        return CFGetTypeID(value as CFTypeRef) != CFBooleanGetTypeID() || value as? Bool != false
+    }
+
+    /// The groups-became-zones notice was shown.
+    func zonesNoticeShown() { write(nil, Keys.zonesNoticeDue) }
+
+    /// Local volumes stored as linear gain become slider positions under
+    /// `Keys.localVolumes`, and the old key goes (S75). Positions already
+    /// stored win; the old key is removed either way.
+    func migrate() {
+        guard let gains = read(Keys.legacyLocalGains) else { return }
+        if read(Keys.localVolumes) == nil {
+            save(levels: AppSettings.levels(gains, AppSettings.position(percent:)), forKey: Keys.localVolumes)
+        }
+        write(nil, Keys.legacyLocalGains)
+    }
+
+    func save(source: AudioSource) { write(source.defaultsValue, Keys.source) }
+
+    func save(lastMix: AudioSource) { write(lastMix.defaultsValue, Keys.lastMix) }
+
+    /// A set of IDs, sorted so the stored array doesn't churn.
+    func save(ids: Set<String>, forKey key: String) { write(ids.sorted(), key) }
+
+    func save(cast id: String?) { write(id, Keys.enabledCast) }
+
+    /// Saves the Cast speaker that is on whenever it changes, by the user or
+    /// on its own, and the `id`s a browse found at the addresses added by hand.
+    func save(cast model: CastModel, was old: CastModel) {
+        // One left to come back on once listed (`savedOn`) stays saved as on (C112).
+        if model.enabled != old.enabled, model.enabled != nil || model.savedOn != old.enabled {
+            save(cast: model.enabled)
+        } else if model.enabled == nil, old.savedOn != nil, model.savedOn == nil {
+            save(cast: nil)   // a recall left it off (S246, S252)
+        }
+        if model.foundIDs != old.foundIDs { write(model.foundIDs.isEmpty ? nil : model.foundIDs, Keys.castFoundIDs) }
+    }
+
+    func save(levels: [String: Double], forKey key: String) { write(levels, key) }
+
+    func save(master: Double) { write(master, Keys.master) }
+
+    /// Removed once every input device is back on channels 1-2.
+    func save(inputPairs: [String: Int]) {
+        write(inputPairs.isEmpty ? nil : inputPairs, Keys.inputChannelPairs)
+    }
+
+    func save(groups: [SpeakerGroup]) { writeJSON(groups, Keys.groups) }
+
+    // Saved as load keeps them: JSONEncoder throws on a volume that is NaN or infinite.
+    func save(zones: [SpeakerZone]) { writeJSON(SpeakerZone.normalized(zones), Keys.zones) }
+
+    func save(presets: [SpeakerPreset]) { writeJSON(SpeakerPreset.normalized(presets), Keys.presets) }
+
+    private func writeJSON<T: Encodable>(_ value: T, _ key: String) {
+        do { write(try JSONEncoder().encode(value), key) } catch {
+            DebugTrace.log("[AudioSync] settings: \(key) not saved: \(error)")
+        }
+    }
+
+    /// Removed once no speaker has a name of the user's.
+    func save(speakerNames: SpeakerNames) {
+        write(speakerNames.custom.isEmpty ? nil : speakerNames.custom, Keys.speakerNames)
+    }
+
+    /// Removed once nothing is hidden.
+    func save(hiddenSpeakers: HiddenSpeakers) {
+        write(hiddenSpeakers.isEmpty ? nil : hiddenSpeakers.stored, Keys.hiddenSpeakers)
+    }
+
+    func save(showVirtualDevices: Bool) { write(showVirtualDevices, Keys.showVirtualDevices) }
+
+    func save(volumeKeys: Bool) { write(volumeKeys, Keys.volumeKeys) }
+
+    func save(appearance: AppAppearance) { write(appearance.defaultsValue, Keys.appearance) }
+
+    func save(webRemote: Bool) { write(webRemote, Keys.webRemote) }
+
+    func save(webRemotePort: Int) { write(webRemotePort, Keys.webRemotePort) }
+
+    /// On a first install the Mac's own output starts on, once: the UID to
+    /// switch on, or nil. An empty list (Core Audio not answering yet) waits
+    /// for the next; after a list without a built-in output the chance passes,
+    /// so a speaker the user switched off is never switched on again.
+    func speakerOnAtInstall(listed: [AudioDevices.Device], firstInstall: Bool) -> String? {
+        guard firstInstall, read(Keys.speakerOnAtInstall) == nil, !listed.isEmpty else { return nil }
+        write(true, Keys.speakerOnAtInstall)
+        return listed.first { SpeakerTag(transport: $0.transport).isThisMac }?.uid
+    }
+
+    /// The AirPlay delay (S178).
+    func save(airPlayDelay: AirPlayDelay) {
+        write(airPlayDelay.adjustmentMs, Keys.nativeAirPlayAdjustment)
+    }
+
+    /// The local outputs listed so far (S455), or nil when none was noted yet.
+    var seenLocalOutputs: Set<String>? { read(Keys.seenLocalOutputs).map { AppSettings.ids($0) } }
+
+    /// The one-time migration of the absolute delays to offsets (S179), the
+    /// first time a device list is in: `listed` holds its UIDs, `reference`
+    /// the reference chosen from it (S173). It reads the old delays, the
+    /// older single delay and the speakers that are on, stores the offsets
+    /// and the AirPlay delays under their own keys and then the mark, and
+    /// returns what it stored. The old keys stay as they are, for older
+    /// builds. Nil, changing nothing, once the mark is set; a migration cut
+    /// short before the mark runs again from the same old values.
+    @discardableResult
+    func migrateLocalDelays(listed: [String], reference: String?) -> LocalDelay.Migration? {
+        guard !isMarked(Keys.localDelaysMigrated) else { return nil }
+        guard let migration = LocalDelay.migrate(
+            storedDelays: AppSettings.levels(read(Keys.localDelays), AppSettings.delay),
+            legacyDelayMs: read(Keys.legacyDelayMs).flatMap(AppSettings.number),
+            enabled: AppSettings.ids(read(Keys.enabledLocal)), listed: listed, reference: reference)
+        else { return nil }
+        save(levels: migration.offsets, forKey: Keys.localOffsets)
+        write(migration.airPlayDelayMs, Keys.airPlayDelay)
+        save(airPlayDelay: AirPlayDelay(adjustmentMs: migration.nativeAdjustmentMs))
+        write(true, Keys.localDelaysMigrated)
+        return migration
+    }
+}
+
+/// The audio engine choice of older builds: the `engineImpl` setting and the
+/// `AUDIOSYNC_ENGINE` environment variable, "swift" or "rust". Every session
+/// runs on the Rust core now, so either one is only noted in the debug log:
+/// the variable at every launch that has it, the setting once, since that
+/// launch removes it (`SettingsStore.retiredChoiceNotes`).
+enum RetiredEngineChoice {
+    static let defaultsKey = AppSettings.Keys.retiredEngineChoice
+    static let environmentKey = "AUDIOSYNC_ENGINE"
+
+    /// The debug log line for a launch that finds either one set (an empty
+    /// value counts as unset), or nil when neither is.
+    static func launchNote(environment: String?, stored: String?) -> String? {
+        var found: [String] = []
+        if let value = environment, !value.isEmpty { found.append("\(environmentKey)=\(value)") }
+        if let value = stored, !value.isEmpty { found.append("the \(defaultsKey) setting \"\(value)\"") }
+        guard !found.isEmpty else { return nil }
+        return "[AudioSync] " + found.joined(separator: " and ")
+            + (found.count == 1 ? " no longer chooses" : " no longer choose")
+            + " the audio engine: every session runs on the Rust core"
+    }
+}
+
+/// The AirPlay sender choice of older builds: the `airplayImpl` setting and
+/// the `AUDIOSYNC_AIRPLAY` environment variable, "native" or the old engine's value.
+/// AudioSync's own sender is the only one now, so either one is only noted in
+/// the debug log: the variable at every launch that has it, the setting once,
+/// since that launch removes it (`SettingsStore.retiredChoiceNotes`).
+enum RetiredAirPlayChoice {
+    static let defaultsKey = AppSettings.Keys.retiredAirPlayChoice
+    static let environmentKey = "AUDIOSYNC_AIRPLAY"
+
+    /// The debug log line for a launch that finds either one set (an empty
+    /// value counts as unset), or nil when neither is.
+    static func launchNote(environment: String?, stored: String?) -> String? {
+        var found: [String] = []
+        if let value = environment, !value.isEmpty { found.append("\(environmentKey)=\(value)") }
+        if let value = stored, !value.isEmpty { found.append("the \(defaultsKey) setting \"\(value)\"") }
+        guard !found.isEmpty else { return nil }
+        return "[AudioSync] " + found.joined(separator: " and ")
+            + (found.count == 1 ? " no longer chooses" : " no longer choose")
+            + " the AirPlay sender: AudioSync's own sender is the only one"
+    }
+}
+
+extension SettingsStore {
+    /// The debug log lines for the retired engine and AirPlay sender choices
+    /// at launch. A stored choice is removed once read, whatever its value,
+    /// so the next launch notes only an environment variable still set.
+    func retiredChoiceNotes(environment: [String: String]) -> [String] {
+        let engine = read(RetiredEngineChoice.defaultsKey)
+        let airPlay = read(RetiredAirPlayChoice.defaultsKey)
+        if engine != nil { write(nil, RetiredEngineChoice.defaultsKey) }
+        if airPlay != nil { write(nil, RetiredAirPlayChoice.defaultsKey) }
+        return [
+            RetiredEngineChoice.launchNote(environment: environment[RetiredEngineChoice.environmentKey],
+                                           stored: engine as? String),
+            RetiredAirPlayChoice.launchNote(environment: environment[RetiredAirPlayChoice.environmentKey],
+                                            stored: airPlay as? String),
+        ].compactMap { $0 }
+    }
+}

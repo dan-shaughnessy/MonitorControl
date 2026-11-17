@@ -1,0 +1,332 @@
+name: CI
+
+on:
+  push:
+    branches: ['**', '!wip/**']
+  pull_request:
+
+# A newer push to a feature branch cancels that branch's older run; every
+# commit on main keeps its own group, so main's runs are never cancelled.
+# The group starts with the file name, which stays unique when a name: is copied.
+concurrency:
+  group: ci.yml-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  proven:
+    # main skips the rest for a commit this workflow already passed on an integ/* train.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Was this commit green on an integ/* train?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          SHA: ${{ github.sha }}
+        # Any API error leaves skip=false, so main runs everything.
+        run: |
+          skip=false
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            wf=${WORKFLOW_REF%@*}
+            if n=$(gh api "repos/$REPO/actions/workflows/${wf##*/}/runs?head_sha=$SHA&status=success&per_page=100" \
+                --jq '[.workflow_runs[] | select(.event == "push" and .head_repository.full_name == $ENV.REPO and (.head_branch | startswith("integ/")))] | length') &&
+              [ "$n" -gt 0 ] 2>/dev/null; then
+              skip=true
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+  swift-changes:
+    # Off main, integ/* trains and release/ branches, the macOS build runs only for a push that touches the Swift app.
+    needs: proven
+    if: needs.proven.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      swift: ${{ steps.diff.outputs.swift }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Does this push touch Sources/, Tests/, Package.swift or build.sh?
+        id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=$(git merge-base origin/main HEAD)
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+            BEFORE=$base
+          fi
+          # Files main brought in through a merge are not the branch's own change.
+          files=$(comm -12 <(git diff --name-only "$BEFORE" HEAD | sort) <(git diff --name-only "$base" HEAD | sort))
+          if printf '%s\n' "$files" | grep -qE '^(Sources/|Tests/|Package\.swift$|build\.sh$)'; then
+            echo swift=true >> "$GITHUB_OUTPUT"
+          else
+            echo swift=false >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-test:
+    needs: [proven, swift-changes]
+    if: ${{ needs.proven.outputs.skip != 'true' && (!cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/integ/') || startsWith(github.ref, 'refs/heads/release/') || needs.swift-changes.outputs.swift == 'true')) }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Toolchain versions (Swift)
+        run: swift --version
+
+      - name: Rust toolchain (1.99.1, with the Apple silicon and Intel targets)
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+
+      - name: Audio core (universal static library)
+        run: scripts/build_core.sh
+
+      - name: App, release build
+        run: swift build -c release
+
+      - name: The app links the audio core
+        run: nm -gU .build/release/AudioSync | grep -x '[0-9a-f]* T _asc_version'
+
+      - name: The screenshot renderers still compile against the app sources
+        run: scripts/screenshots/render.sh --typecheck
+
+      - name: Install the pinned shellcheck (Tests/run-tests.sh requires it)
+        run: |
+          scripts/shellcheck.sh --install "$RUNNER_TEMP/shellcheck"
+          echo "$RUNNER_TEMP/shellcheck" >> "$GITHUB_PATH"
+
+      - name: Tests (shellcheck, logic and the core's app-side parts)
+        run: Tests/run-tests.sh
+
+      - name: A panic inside an AirPlay sender call stops at the C boundary in the shipped library build (panic probe, S205)
+        run: |
+          # The app's library, prelinked the same way, plus one entry that
+          # panics inside a sender call's guard, in a folder of its own.
+          AUDIOSYNC_CORE_PROBE=1 scripts/build_core.sh
+          probe_lib=core/target/universal-apple-darwin/probe/libaudiosync_core.a
+          app_lib=core/target/universal-apple-darwin/release/libaudiosync_core.a
+          for arch in arm64 x86_64; do
+            xcrun nm -gU --no-llvm-bc -arch "$arch" "$probe_lib" | grep -q ' T _asc_airplay_panic_probe$'
+            # The app's library and the app itself never have the probe, not even as
+            # a hidden local symbol (no -g: local symbols count too).
+            # Captured first, so a failing nm stops the step instead of reading as no probe.
+            app_syms=$(xcrun nm -U --no-llvm-bc -arch "$arch" "$app_lib")
+            if grep -q '_asc_airplay_panic_probe' <<< "$app_syms"; then
+              echo "the app's core library ($arch) has the panic probe"; exit 1
+            fi
+          done
+          app_syms=$(nm -U .build/release/AudioSync)
+          if grep -q '_asc_airplay_panic_probe' <<< "$app_syms"; then
+            echo "the app has the panic probe"; exit 1
+          fi
+          for arch in arm64 x86_64; do
+            cc -arch "$arch" -std=c11 -Wall -Wextra -Werror -I core/include Tests/panic-probe.c "$probe_lib" \
+              -framework Security -framework CoreFoundation -o "$RUNNER_TEMP/panic-probe-$arch"
+          done
+          # Status 0 only: a panic that got past the guard aborts.
+          "$RUNNER_TEMP/panic-probe-arm64"
+          if arch -x86_64 /usr/bin/true 2> /dev/null; then
+            arch -x86_64 "$RUNNER_TEMP/panic-probe-x86_64"
+          else
+            echo "No Rosetta on this runner: the Intel build was linked, not run."
+          fi
+
+      - name: make-dmg.sh packages a signed bundle into an image that mounts with the app, an Applications link and the README
+        # The Finder window layout scripts Finder; a stuck Apple event must not hold the runner.
+        timeout-minutes: 10
+        run: |
+          # A stand-in bundle around the release binary, signed ad hoc: the
+          # real bundle is build.sh's, which the app-bundle job checks.
+          work="$RUNNER_TEMP/dmg-check"
+          app="$work/AudioSync.app"
+          mkdir -p "$app/Contents/MacOS" "$work/mnt"
+          cp .build/release/AudioSync "$app/Contents/MacOS/AudioSync"
+          plist="$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string AudioSync" \
+            -c "Add :CFBundleIdentifier string io.github.yassersutojoyo.audiosync.dmgcheck" \
+            -c "Add :CFBundlePackageType string APPL" \
+            -c "Add :CFBundleShortVersionString string 0.0.0" "$plist"
+          cp -R "$app" "$work/Unsigned.app"
+          codesign --remove-signature "$work/Unsigned.app/Contents/MacOS/AudioSync"
+          codesign --force --sign - "$app"
+
+          # Refusals, each for its own reason: an unsigned bundle, and an
+          # output name without .dmg.
+          if said=$(./make-dmg.sh --app "$work/Unsigned.app" --out "$work/unsigned.dmg" 2>&1); then
+            echo "an unsigned bundle was packaged"; exit 1
+          fi
+          echo "$said"
+          grep -q "no valid code signature" <<< "$said"
+          if said=$(./make-dmg.sh --app "$app" --out "$work/AudioSync.img" 2>&1); then
+            echo "an output name without .dmg was accepted"; exit 1
+          fi
+          echo "$said"
+          grep -q "must end in .dmg" <<< "$said"
+
+          # A lone path is the app; the default output is AudioSync.dmg in the
+          # repository root (RELEASE.md).
+          rm -f AudioSync.dmg
+          # The runner may not allow Finder scripting; the plain image passes too,
+          # and the log shows which one was made.
+          if ! said=$(./make-dmg.sh "$app" 2>&1); then
+            echo "$said"; exit 1
+          fi
+          echo "$said"
+          grep "Finder window:" <<< "$said"
+          test -f AudioSync.dmg
+          hdiutil imageinfo AudioSync.dmg | grep -E '^ *Format: UDZO$'
+
+          trap 'hdiutil detach -force "$work/mnt" 2>/dev/null || true' EXIT
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$work/mnt" AudioSync.dmg
+          ls -la "$work/mnt"
+          diskutil info "$work/mnt" | grep -E 'Volume Name: +AudioSync$'
+          test "$(ls "$work/mnt" | tr '\n' ' ')" = "Applications AudioSync.app README.md "
+          test "$(readlink "$work/mnt/Applications")" = /Applications
+          cmp "$app/Contents/MacOS/AudioSync" "$work/mnt/AudioSync.app/Contents/MacOS/AudioSync"
+          codesign --verify --strict --verbose=1 "$work/mnt/AudioSync.app"
+          # The README keeps the install guide, with its links made absolute.
+          readme="$work/mnt/README.md"
+          grep -q "Open Anyway" "$readme"
+          grep -qF '(https://github.com/yassersutojoyo/audiosync/blob/main/docs/DEVELOPMENT.md)' "$readme"
+          grep -qF 'src="https://github.com/yassersutojoyo/audiosync/raw/main/docs/images/main-window-light.png"' "$readme"
+          if grep -nE ']\((\.?/)?[A-Za-z0-9_.][^):#"<> ]*[)# ]|(src|href)="(\.?/)?[A-Za-z0-9_.][^:#"<> ]*"' "$readme"; then
+            echo "README.md in the image still has relative links"; exit 1
+          fi
+          hdiutil detach "$work/mnt" || { sleep 2; hdiutil detach -force "$work/mnt"; }
+          rm -f AudioSync.dmg
+
+      - name: Python syntax
+        run: python3 -I -m py_compile scripts/brand/compose.py scripts/brand/tidy-svg.py scripts/brand/tokens.py scripts/brand/ico.py scripts/brand/guide_art.py scripts/windows_notices.py scripts/core_notices.py scripts/privacy_check.py scripts/text_check.py scripts/spec_markers.py scripts/swift_macros.py scripts/check_appcast.py
+
+      - name: Generated brand files are up to date (SVGs, the SwiftUI mark, the Guide art and the design tokens)
+        run: |
+          python3 -I scripts/brand/compose.py
+          swift scripts/brand/wordmark.swift
+          cp brand/audiosync-wordmark.svg site/wordmark.svg
+          cp brand/audiosync-wordmark-dark.svg site/wordmark-dark.svg
+          python3 -I scripts/brand/tokens.py
+          python3 -I scripts/brand/guide_art.py --check
+          git diff --exit-code -- brand Sources/AudioSync/BrandMark.swift site/wordmark.svg site/wordmark-dark.svg \
+            Sources/AudioSync/BrandTokens.swift desktop/ui/tokens.slint desktop/src/tokens.rs site/index.html
+
+      - name: The icon scripts reproduce the committed app and site icons
+        run: scripts/brand/check-icons.sh
+
+      - name: Whitespace / conflict markers (whole tree)
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+  app-bundle:
+    # build.sh end to end, without touching /Applications or quitting anything:
+    # the core, signing with the local identity make-local-cert.sh
+    # creates, then the bundle is checked and started once, and a local
+    # identity that can't sign must stop the build.
+    needs: proven
+    if: needs.proven.outputs.skip != 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/integ/') || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain (1.99.1, with the Apple silicon and Intel targets)
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build the app (./build.sh --no-install, with the local identity make-local-cert.sh creates)
+        run: |
+          security list-keychains -d user > "$RUNNER_TEMP/keychains-before"
+          ./build.sh --no-install
+          security list-keychains -d user > "$RUNNER_TEMP/keychains-after"
+          # The signing keychain was in the search list only while signing.
+          diff "$RUNNER_TEMP/keychains-before" "$RUNNER_TEMP/keychains-after"
+
+      - name: Check the bundle and start it once
+        run: Tests/check-app-bundle.sh --launch --signer "AudioSync Local Code Signing" .build/app/AudioSync.app
+
+      - name: Nothing was installed
+        run: test ! -e /Applications/AudioSync.app && test ! -e "$HOME/Applications/AudioSync.app"
+
+      - name: A local identity that can't sign stops the build before anything is installed
+        run: |
+          pass="$HOME/Library/Application Support/AudioSync/signing-keychain.pass"
+          cp "$pass" "$RUNNER_TEMP/pass"
+          echo wrong > "$pass"
+          security lock-keychain "$HOME/Library/Keychains/audiosync-signing.keychain-db"
+          security list-keychains -d user > "$RUNNER_TEMP/keychains-before"
+          status=0
+          AUDIOSYNC_INSTALL_DIR="$RUNNER_TEMP/apps" ./build.sh > "$RUNNER_TEMP/broken.log" 2>&1 || status=$?
+          cp "$RUNNER_TEMP/pass" "$pass"
+          tail -n 5 "$RUNNER_TEMP/broken.log"
+          test "$status" != 0
+          grep -q 'Nothing was quit or installed' "$RUNNER_TEMP/broken.log"
+          if grep -q 'SIGNING AD-HOC' "$RUNNER_TEMP/broken.log"; then exit 1; fi
+          test ! -e "$RUNNER_TEMP/apps/AudioSync.app"
+          security list-keychains -d user > "$RUNNER_TEMP/keychains-after"
+          diff "$RUNNER_TEMP/keychains-before" "$RUNNER_TEMP/keychains-after"
+
+  shellcheck:
+    needs: proven
+    if: needs.proven.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install the pinned shellcheck
+        run: |
+          scripts/shellcheck.sh --install "$RUNNER_TEMP/shellcheck"
+          echo "$RUNNER_TEMP/shellcheck" >> "$GITHUB_PATH"
+      - name: Lint shell scripts (the list in scripts/shellcheck-files.txt)
+        run: scripts/shellcheck.sh
+
+  private-refs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the commit-message check reads the pushed range
+      # The forbidden-name rule keeps only salted hashes in
+      # scripts/forbidden-names.txt, so the self-test proves it on made-up names.
+      - name: No private references (home paths on either host, LAN names, private IPs, private names)
+        run: |
+          python3 -I scripts/privacy_check.py --self-test
+          python3 -I scripts/privacy_check.py
+      - name: No em dashes in public docs
+        run: |
+          python3 -I scripts/text_check.py --self-test
+          python3 -I scripts/text_check.py
+      - name: Host spec markers name real clauses
+        run: |
+          python3 -I scripts/spec_markers.py --self-test
+          python3 -I scripts/spec_markers.py
+      - name: No SwiftUI macros the Command Line Tools can't build
+        run: |
+          python3 -I scripts/swift_macros.py --self-test
+          python3 -I scripts/swift_macros.py
+      - name: Release appcast checker
+        run: python3 -I scripts/check_appcast.py --self-test
+      - name: Commit messages of this push or pull request (forbidden names)
+        env:
+          RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || format('{0}..{1}', github.event.before, github.sha) }}
+        run: python3 -I scripts/privacy_check.py --commits "$RANGE"

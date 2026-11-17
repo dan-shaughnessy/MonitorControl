@@ -1,0 +1,1052 @@
+import AppKit
+import ApplicationServices
+import AVFoundation
+import ServiceManagement
+import SwiftUI
+
+// The app's windows and the bridge to its views: the menu bar item, the main
+// window, the equalizer and the Guide; the model snapshots the views render;
+// the actions they send back; and the commands in the app menus.
+
+extension AppDelegate {
+
+    // MARK: - Setup
+
+    /// Builds what the views need before any window opens: the equalizer
+    /// (with its saved settings, handed to the engine), Now Playing's
+    /// callbacks, the view actions, the menu bar item and the first model
+    /// snapshot.
+    func setUpMenuBar() {
+        let settings = StoredEqualizer.decode(store.read(Keys.equalizer) as? Data)
+        engine.updateEqualizer(settings)
+        let curves = StoredCurves.decode(store.read(Keys.equalizerCurves) as? Data)
+        equalizerModel = EqualizerModel(settings: settings, curves: curves)
+        equalizerModel.onChange = { [weak self] new in self?.equalizerChanged(new) }
+        equalizerModel.onCurvesChange = { [weak self] new in self?.equalizerCurvesChanged(new) }
+        equalizerWindow = EqualizerWindowController(model: equalizerModel)
+
+        nowPlaying.onChange = { [weak self] track in self?.nowPlayingChanged(track) }
+        nowPlaying.onReading = { [weak self] startedAt in self?.nowPlayingRead(startedAt: startedAt) }
+        nowPlaying.onAutomationDenied = { [weak self] bundleID, denied in
+            self?.automationChanged(bundleID, denied: denied)
+        }
+        nowPlaying.onAutomationVerdict = { [weak self] bundleID, verdict in
+            self?.automationVerdicts[bundleID] = verdict
+            self?.refreshSetup()
+        }
+        nowPlaying.mayRaisePrompt = permissions.mayRaiseAutomationPrompt
+        nowPlaying.onPromptHeld = { [weak self] in
+            _ = self?.permissionAllows(.automation, state: .notAsked, origin: .automatic)
+        }
+        // No target set here: setting one makes Now Playing read the players
+        // at once. `syncTrackInfo` sets it right before polling starts.
+
+        appModel.text = text
+        appModel.actions = makeActions()
+        let saved = AppSettings.load(store.read)
+        let remote = WebRemote(model: appModel, store: store, enabled: saved.webRemote, port: saved.webRemotePort)
+        remote.onNowPlayingNeedChange = { [weak self] in self?.syncTrackInfo() }
+        remote.host.zones = { [weak self] in
+            guard let self else { return [] }
+            return SpeakerZone.withoutHidden(zones, isHidden: self.isHidden)
+        }
+        remote.host.presets = { [weak self] in
+            guard let self else { return [] }
+            let members = Dictionary(presets.map { ($0.id, $0.members.map(\.key)) }, uniquingKeysWith: { first, _ in first })
+            return presetSnapshot().map {
+                RemotePresetRow(id: $0.id, name: $0.name, current: $0.current, members: members[$0.id] ?? [])
+            }
+        }
+        remote.host.setZoneVolume = { [weak self] id, position in self?.setZoneVolume(id, position) }
+        remote.host.toggleZone = { [weak self] id, keepOff, origin in
+            self?.toggleZone(id, keepingOff: keepOff, origin: origin)
+        }
+        // A phone's recall starts as `.remote` either way (S266).
+        remote.host.recallPreset = { [weak self] id, keepOff, _ in
+            self?.recallPreset(id, from: .phone, keepingOff: keepOff)
+        }
+        webRemote = remote
+        webRemoteWindow = WebRemoteWindowController(remote: remote, text: text)
+        settingsWindow = MainActor.assumeIsolated {
+            SettingsWindowController(model: appModel) { [weak self] in self?.openPermissionSetup() }
+        }
+        if !DeskAudio.embedded { menuBar = MenuBarController(model: appModel) }
+        pushSources()
+        pushModel()
+    }
+
+    /// The Now Playing art moves while the main window or the panel shows it.
+    private func followSoundTide() {
+        // An input device's peaks belong to the input meter; the art rests then.
+        SoundTide.shared.follow(nowPlayingOnScreen || panelOnScreen ? { [weak self] in
+            guard let self, self.engine.isRunning else { return nil }
+            if case .input = self.audioSource { return nil }
+            return self.engine.takePeak()
+        } : nil)
+    }
+
+    private func equalizerChanged(_ settings: Equalizer.Settings) {
+        let switched = engine.equalizerSettings.switches(to: settings)
+        engine.updateEqualizer(settings)
+        reapplyLocalGains()   // the headroom cut given back changes with the curve (S26)
+        if switched { logLocalGains() }
+        nativeAirPlay?.setEqualizer(settings)
+        castSender?.setEqualizer(settings)
+        if let data = StoredEqualizer.encode(settings) {
+            store.write(data, Keys.equalizer)
+        }
+        publish(\.equalizerOn, settings.enabled)
+        publishEqualizerCurve()
+        publishPresets()   // a band change moves the current mark (S264)
+    }
+
+    private func equalizerCurvesChanged(_ curves: [Equalizer.Curve]) {
+        if let data = StoredCurves.encode(curves) {
+            store.write(data, Keys.equalizerCurves)
+        }
+        publishEqualizerCurve()
+    }
+
+    private func publishEqualizerCurve() {
+        guard let equalizerModel else { return }
+        publish(\.equalizerCurve, text.equalizerCurveName(equalizerModel.shownCurve, saved: equalizerModel.curves))
+    }
+
+    /// After the speaker rows, which the current mark is worked out from.
+    private func publishPresets() {
+        let rows = presetSnapshot()
+        followPresetNotice(current: rows.first(where: \.current)?.id)
+        publish(\.presets, rows)
+        MainActor.assumeIsolated { PresetsMenu.update(rows) }
+    }
+
+    /// macOS refuses (or allows again) AudioSync's Apple Events to a player:
+    /// a notice with a button to the Automation settings, until it is allowed.
+    private func automationChanged(_ bundleID: String, denied: Bool) {
+        let subject = Notice.automation(bundleID)
+        guard denied else {
+            clearNotices([subject])
+            return
+        }
+        postNotice(text.automationDenied(SourceApps.name(for: bundleID)), subject: subject,
+                   settings: .automation)
+    }
+
+    // MARK: - Permission explanations
+
+    /// Whether a feature may use `permission` now. True: go on, and macOS
+    /// asks itself if it still has to. False: the feature waits, after Not
+    /// Now on the explanation, or while the window and the panel offer it
+    /// (`PermissionCard`), whose Continue resumes it. Callers handle a
+    /// denied permission themselves, so `state` is `.notAsked` or `.unknown`.
+    func permissionAllows(_ permission: Permission, state: PermissionState, origin: StartOrigin) -> Bool {
+        switch permissions.step(permission, state: state, userAction: origin == .user) {
+        case .go, .denied:
+            return true
+        case .explain:
+            return explainPermission(permission)
+        case .offer:
+            permissions.hold(permission)
+            showPermissionOffer()
+            return false
+        }
+    }
+
+    /// The explanation right after the user's click, before macOS asks: a
+    /// modal alert is fine here, since the user is waiting on this answer.
+    private func explainPermission(_ permission: Permission) -> Bool {
+        menuBar?.close()   // the panel floats above alerts and would cover this one
+        NSApp.activate(ignoringOtherApps: true)
+        let prompt = NSAlert()
+        prompt.messageText = text.permissionTitle(permission)
+        prompt.informativeText = text.permissionReason(permission)
+        prompt.addButton(withTitle: text.permissionContinue)
+        prompt.addButton(withTitle: text.permissionNotNow).keyEquivalent = "\u{1b}"
+        guard prompt.runModal() == .alertFirstButtonReturn else {
+            declinePermission(permission)
+            return false
+        }
+        acceptPermission(permission)
+        return true
+    }
+
+    private func acceptPermission(_ permission: Permission) {
+        permissions.accept(permission)
+        permissions.save(store)
+        showPermissionOffer()
+        if permission == .automation { nowPlaying.mayRaisePrompt = true }
+    }
+
+    /// Continue on the offered explanation: the feature that waited goes on.
+    private func resumeAfterPermission(_ permission: Permission) {
+        acceptPermission(permission)
+        switch permission {
+        case .localNetwork:
+            reconcileAirPlaySpeakers()
+        case .audioCapture, .microphone:
+            if !engine.isRunning { startEngine(origin: .user) }
+        case .automation:
+            nowPlaying.refresh()
+        case .accessibility:
+            askAccessibility()
+        }
+    }
+
+    private func declinePermission(_ permission: Permission) {
+        permissions.decline(permission)
+        showPermissionOffer()
+    }
+
+    private func showPermissionOffer() {
+        // The setup window asks for these itself while it is open.
+        let offer = setupWindow?.isOpen == true ? nil : permissions.offer
+        guard appModel.permissionOffer != offer else { return }
+        DebugTrace.log("Permission card: \(offer?.rawValue ?? "none")")
+        appModel.permissionOffer = offer
+    }
+
+    // MARK: - Permission setup window
+
+    /// Opens by itself once, on a first install (`PermissionSetup.showsAtLaunch`).
+    func openPermissionSetupIfFirstRun() {
+        let seen = store.read(PermissionSetup.seenKey) as? Bool ?? false
+        guard PermissionSetup.showsAtLaunch(permissions, seen: seen) else { return }
+        store.write(true, PermissionSetup.seenKey)
+        openPermissionSetup(checking: false)
+    }
+
+    /// The window with every permission and its state; Check Setup… opens it
+    /// again, with a summary in place of the first install's explanation.
+    func openPermissionSetup(checking: Bool = true) {
+        menuBar?.close()
+        let setup = setupWindow ?? makeSetupWindow()
+        setupWindow = setup
+        setup.model.checking = checking
+        refreshSetup()
+        setup.show()
+        showPermissionOffer()
+    }
+
+    private func makeSetupWindow() -> SetupWindowController {
+        let model = PermissionSetupModel(text: text)
+        model.actions.allow = { [weak self] in self?.setupAllow() }
+        model.actions.allowMicrophone = { [weak self] in self?.setupAllowMicrophone() }
+        model.actions.openSettings = { permission in NSWorkspace.shared.open(permission.pane.url) }
+        let setup = SetupWindowController(model: model)
+        model.actions.close = { [weak setup] in setup?.close() }
+        setup.onClose = { [weak self] in
+            self?.setupAsking = false
+            self?.showPermissionOffer()   // a skipped permission's card comes back where a feature waits on it
+        }
+        setup.onBecomeKey = { [weak self] in
+            self?.recheckLocalNetwork()   // back from System Settings
+            self?.refreshSetup()
+        }
+        return setup
+    }
+
+    private func setupRows() -> [Permission: SetupRowState] {
+        let asked = { (permission: Permission) in
+            self.permissions.step(permission, state: .unknown, userAction: false) == .go
+        }
+        return [
+            .localNetwork: PermissionSetup.localNetwork(localNetworkProbe.access, asked: asked(.localNetwork)),
+            .audioCapture: PermissionSetup.audioCapture(heard: SourceCapture.runHeard, asked: asked(.audioCapture)),
+            .microphone: PermissionSetup.microphone(microphonePermission(), asking: setupMicrophoneAsking),
+            .accessibility: PermissionSetup.accessibility(trusted: AXIsProcessTrusted(),
+                                                          asked: permissions.explained.contains(.accessibility)),
+            .automation: PermissionSetup.automation(setupPlayers()),
+        ]
+    }
+
+    private func setupPlayers() -> [AutomationConsent.Verdict] {
+        PermissionSetup.players.map { automationVerdicts[$0] ?? .undecided }
+    }
+
+    /// From every model update while the window exists.
+    func refreshSetup() {
+        guard let setup = setupWindow else { return }
+        let model = setup.model
+        let rows = setupRows()
+        if model.rows != rows {
+            if setup.isOpen {
+                for permission in PermissionSetup.announced(from: model.rows, to: rows, volumeKeys: volumeKeys) {
+                    AccessibilityNotification.Announcement(
+                        text.setupAnnouncement(permission, rows[permission, default: .notAsked])).post()
+                }
+            }
+            model.rows = rows
+        }
+        let players = setupPlayers()
+        if model.players != players { model.players = players }
+        if model.volumeKeys != volumeKeys { model.volumeKeys = volumeKeys }
+        if model.asking != setupAsking { model.asking = setupAsking }
+        if setupAsking, localNetworkProbe.access != .unknown { setupAskCapture() }
+    }
+
+    /// Allow: Local Network first, through the sender's discovery as a
+    /// feature would; audio capture once macOS answered that, or after
+    /// `setupStepWait` without an answer.
+    private func setupAllow() {
+        guard let next = PermissionSetup.next(setupRows()) else { return }
+        guard next == .localNetwork else { return setupAskCapture() }
+        DebugTrace.log("[AudioSync] permission setup: asking for Local Network")
+        setupAsking = true
+        acceptPermission(.localNetwork)
+        reconcileAirPlaySpeakers(origin: .user)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.setupStepWait) { [weak self] in
+            guard let self, self.setupAsking else { return }
+            self.setupAskCapture()
+        }
+        refreshSetup()
+    }
+
+    /// How long Allow waits for the Local Network answer before it asks for
+    /// audio capture anyway; macOS queues the second prompt behind the first.
+    static let setupStepWait: TimeInterval = 15
+
+    private func setupAskCapture() {
+        setupAsking = false
+        guard PermissionSetup.next(setupRows()) == .audioCapture else { return refreshSetup() }
+        DebugTrace.log("[AudioSync] permission setup: asking for audio capture")
+        acceptPermission(.audioCapture)
+        probeAudioCapture()
+        refreshSetup()
+    }
+
+    /// A tap's first capture raises macOS's audio capture prompt, so a
+    /// whole-system capture with no speaker runs for `captureProbeLength`.
+    /// Streaming that already captures has raised it.
+    private func probeAudioCapture() {
+        guard !engine.isRunning, setupCaptureProbe == nil, let parts = EngineParts.make() else { return }
+        let probe = SourceCapture()
+        do {
+            try probe.start(source: .system, parts: parts)
+        } catch {
+            DebugTrace.log("[AudioSync] permission setup: capture probe failed: \(error)")
+            return
+        }
+        setupCaptureProbe = probe
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.captureProbeLength) { [weak self] in
+            self?.setupCaptureProbe?.halt()
+            self?.setupCaptureProbe = nil
+            self?.refreshSetup()   // a tap that heard sound proves the permission
+        }
+    }
+
+    /// Long enough to raise the prompt; the tap mutes what it captures meanwhile.
+    static let captureProbeLength: TimeInterval = 1.5
+
+    private func setupAllowMicrophone() {
+        acceptPermission(.microphone)
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else { return refreshSetup() }
+        setupMicrophoneAsking = true
+        refreshSetup()
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.setupMicrophoneAsking = false
+                self?.refreshSetup()
+            }
+        }
+    }
+
+    private func microphonePermission() -> PermissionState {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: return .allowed
+        case .notDetermined: return .notAsked
+        default: return .denied
+        }
+    }
+
+    /// What the window and the panel can ask for, each mapped to the
+    /// AppDelegate method that does it.
+    private func makeActions() -> AppModel.Actions {
+        var a = AppModel.Actions()
+        a.setPower = { [weak self] on in self?.setStreaming(on) }
+        a.selectSource = { [weak self] id, origin in
+            self?.setSource(AudioSource(defaultsValue: id), origin: origin)
+            self?.pushSources()
+        }
+        a.selectInputPair = { [weak self] index in self?.setInputPair(index) }
+        a.toggleMixApp = { [weak self] id in self?.toggleMixApp(id) }
+        a.setMixMode = { [weak self] mode in self?.setMixMode(mode) }
+        a.setMaster = { [weak self] position in self?.setMasterVolume(position) }
+        a.setAirPlayEnabled = { [weak self] id, on, origin in self?.setNativeAirPlayEnabled(id, on, origin: origin) }
+        a.setAirPlayVolume = { [weak self] id, volume in self?.setNativeAirPlayVolume(id, volume) }
+        a.setAirPlayVolumeDragging = { [weak self] id, dragging in self?.setNativeAirPlayVolumeDragging(id, dragging) }
+        a.forgetAirPlayPairing = { [weak self] id in self?.forgetNativePairing(id) }
+        a.setLocalEnabled = { [weak self] uid, on, origin in self?.setLocalEnabled(uid, on, origin: origin) }
+        a.setLocalVolume = { [weak self] uid, position in self?.setLocalVolume(uid, position) }
+        a.localVolumeSettled = { [weak self] uid in self?.logLocalVolume(uid) }
+        a.setLocalOffset = { [weak self] uid, ms in self?.setLocalOffset(uid, ms) }
+        a.calibrate = { [weak self] uid in self?.startCalibration(uid) }
+        a.cancelCalibration = { [weak self] in self?.cancelCalibration() }
+        a.calibrateAll = { [weak self] in self?.startCalibrateAll() }
+        a.cancelCalibrateAll = { [weak self] in self?.cancelCalibrateAll() }
+        a.measureAgain = { [weak self] row in self?.measureAgain(row) }
+        a.includeInCalibrateAll = { [weak self] id, on in self?.includeInCalibrateAll(id, on) }
+        a.applyCalibrateAll = { [weak self] in self?.applyCalibrateAll() }
+        a.undoCalibrateAll = { [weak self] in self?.undoCalibrateAll() }
+        a.closeCalibrateAll = { [weak self] in self?.closeCalibrateAll() }
+        a.setAirPlayDelay = { [weak self] ms in self?.setAirPlayDelay(ms) }
+        a.setCastEnabled = { [weak self] id, on, origin in self?.setCastEnabled(id, on, origin: origin) }
+        a.setCastVolume = { [weak self] id, position in self?.setCastVolume(id, position) }
+        a.stepCastVolume = { [weak self] id, up in self?.stepCastVolume(id, up: up) }
+        a.setCastMuted = { [weak self] id, muted in self?.setCastMuted(id, muted) }
+        a.resyncCast = { [weak self] id in self?.resyncCast(id) }
+        a.setCastOffset = { [weak self] id, ms in self?.setCastOffset(id, ms) }
+        a.addCastAddress = { [weak self] typed, done in
+            guard let self else { return done(.notFound) }
+            self.addCastAddress(typed, completion: done)
+        }
+        a.removeCastAddress = { [weak self] id in self?.removeCastAddress(id) }
+        a.openMainWindow = { [weak self] in self?.showMainWindow() }
+        a.openGuide = { [weak self] in self?.openGuideWindow() }
+        a.openEqualizer = { [weak self] in self?.openEqualizerWindow() }
+        a.openWebRemote = { [weak self] in self?.openWebRemoteWindow() }
+        a.openSettings = { [weak self] in self?.openSettingsWindow() }
+        a.refreshDevices = { [weak self] in self?.rescanDevices() }
+        a.refreshExternalState = { [weak self] done in self?.rereadExternalState(then: done) }
+        a.refreshModel = { [weak self] in self?.pushModel() }
+        a.mainWindowVisible = { [weak self] visible in
+            guard let self, visible != self.nowPlayingOnScreen else { return }
+            self.nowPlayingOnScreen = visible   // Now Playing polls only while someone sees it
+            self.syncTrackInfo()
+            self.appModel.inputLevel.setVisible(visible)
+            MarkBreath.shared.mainOnScreen = visible
+            self.followSoundTide()
+        }
+        a.panelVisible = { [weak self] visible in
+            guard let self, visible != self.panelOnScreen else { return }
+            self.panelOnScreen = visible
+            MarkBreath.shared.panelOnScreen = visible
+            self.syncTrackInfo()
+            self.followSoundTide()
+        }
+        a.dismissNotice = { [weak self] subject in self?.clearNotices([subject]) }
+        a.permissionContinue = { [weak self] permission in self?.resumeAfterPermission(permission) }
+        a.permissionNotNow = { [weak self] permission in self?.declinePermission(permission) }
+        a.dismissAllNotices = { [weak self] in
+            guard let self, !self.appModel.notices.isEmpty else { return }
+            self.appModel.notices.clearAll()
+        }
+        a.toggleZone = { [weak self] id in self?.toggleZone(id) }
+        a.deleteZone = { [weak self] id in self?.deleteZone(id) }
+        a.renameZone = { [weak self] id, typed in self?.renameZone(id, to: typed) }
+        a.calibrateZone = { [weak self] id in self?.calibrateZone(id) }
+        a.setZoneVolume = { [weak self] id, position in self?.setZoneVolume(id, position) }
+        a.newZone = { [weak self] in self?.promptNewZone() }
+        a.newZoneWithSpeaker = { [weak self] key, name in self?.promptNewZone(with: key, name: name) }
+        a.moveToZone = { [weak self] key, id in self?.moveToZone(key, id) }
+        a.removeFromZone = { [weak self] key in self?.removeFromZone(key) }
+        a.onlyThisSpeaker = { [weak self] key in self?.onlyThisSpeaker(key) }
+        a.recallPreset = { [weak self] id in self?.recallPreset(id, from: .app) }
+        a.savePreset = { [weak self] in self?.promptSavePreset() }
+        a.renamePreset = { [weak self] id in self?.promptRenamePreset(id) }
+        a.updatePreset = { [weak self] id in self?.updatePreset(id) }
+        a.deletePreset = { [weak self] id in self?.deletePreset(id) }
+        a.useTargetInstead = { [weak self] id, key in self?.useTargetInstead(in: id, for: key) }
+        a.setAutoConnect = { [weak self] key, on in self?.setAutoConnect(key, on) }
+        a.renameSpeaker = { [weak self] key, system, typed in self?.renameSpeaker(key, system: system, to: typed) }
+        a.hideSpeaker = { [weak self] key, name, kind in self?.hideSpeaker(key, name: name, kind: kind) }
+        a.unhideSpeaker = { [weak self] key in self?.unhideSpeaker(key) }
+        a.setLaunchAtLogin = { [weak self] on in self?.setLaunchAtLogin(on) }
+        a.setShowVirtualDevices = { [weak self] on in self?.setShowVirtualDevices(on) }
+        a.setVolumeKeys = { [weak self] on in self?.setVolumeKeys(on) }
+        a.openAccessibilitySettings = { NSWorkspace.shared.open(PrivacyPane.accessibility.url) }
+        a.setAppearance = { [weak self] choice in self?.setAppearance(choice) }
+        a.transport = { [weak self] command in self?.sendTransport(command) }
+        a.quit = { NSApp.terminate(nil) }
+        a.retryAirPlay = { [weak self] in
+            self?.retryNativeAirPlay()
+            self?.pushModel()
+        }
+        a.fixDeviceVolume = { [weak self] uid in self?.fixDeviceVolume(uid) }
+        a.fixCalibrationVolume = { [weak self] in
+            if let uid = self?.localReference { self?.fixDeviceVolume(uid) }
+        }
+        return a
+    }
+
+    // MARK: - Actions behind the views
+
+    /// The power switch. Switching off by hand also keeps auto-connect from
+    /// starting streaming again until the user turns it back on.
+    private func setStreaming(_ on: Bool, fromMenu: Bool = false) {
+        defer { pushModel() }
+        guard on else {
+            userStopped = true
+            stopEngine(fromMenu ? .menuItem : .powerSwitch, detail: Self.inputEventNote())
+            return
+        }
+        startEngine(origin: .user)
+    }
+
+    /// The event AppKit is handling, for the debug log, so a stop by a key
+    /// press or a script can be told from a click.
+    private static func inputEventNote() -> String {
+        guard let event = NSApp.currentEvent else { return "no input event" }
+        let window = event.window.map { String(describing: type(of: $0)) } ?? "no window"
+        switch event.type {
+        case .keyDown, .keyUp: return "key code \(event.keyCode) in \(window)"
+        case .leftMouseDown, .leftMouseUp: return "click in \(window)"
+        default: return "event type \(event.type.rawValue) in \(window)"
+        }
+    }
+
+    /// Lists the outputs afresh, asks the AirPlay sender again and reads the
+    /// sources. A virtual device already listed stays, even when switched off.
+    private func rescanDevices() {
+        nativeAirPlay?.rebrowse()   // S352
+        let cast = castSender
+        cast?.rebrowse { [weak self] browsing in
+            guard let self, browsing, self.castSender === cast else { return }
+            let before = self.castModel.discovery
+            self.castModel.discovery = before.afterRebrowse(now: Date())
+            guard self.castModel.discovery != before else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + CastModel.noneFoundAfter + 0.5) { [weak self] in
+                self?.pushModel()
+            }
+            self.pushModel()
+        }
+        reconcileLocal(keepListed: true)
+        reconcileAirPlaySpeakers(origin: .user)
+        pushSources()
+    }
+
+    /// The panel opened or the window became key: the login item, Local
+    /// Network access and the running apps may have changed while AudioSync
+    /// wasn't looking. Opening the panel doesn't activate AudioSync, so this
+    /// is also how a change made in System Settings shows after coming back
+    /// through the menu bar icon.
+    private func rereadExternalState(then done: @escaping () -> Void) {
+        let devices = self.devices
+        let ticket = externalReads.begin()
+        // Each read waits on another process; on the main thread they held the panel's scrolling title for 56-63 ms.
+        Self.externalReadQueue.async { [weak self] in
+            let login = SMAppService.mainApp.status == .enabled
+            let running = SourceApps.running()
+            let inputDevices = devices.allInputDevices()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.externalReads.applies(ticket) {
+                    if self.externalReads.loginApplies(ticket) {
+                        self.launchAtLogin = login
+                        if Notice.loginSettled(in: self.appModel.notices, enabled: login, self.text) {
+                            self.clearNotices([Notice.login])   // changed in System Settings meanwhile
+                        }
+                    }
+                    self.recheckLocalNetwork()
+                    if self.externalReads.sourcesApply(ticket) {
+                        self.pushSources(running: running, inputDevices: inputDevices)
+                    }
+                    self.pushModel()
+                }
+                done()
+            }
+        }
+    }
+
+    private static let externalReadQueue = DispatchQueue(label: "AudioSync.externalReads", qos: .userInitiated)
+
+    private func setAutoConnect(_ key: String, _ on: Bool) {
+        if on { autoConnect.insert(key) } else { autoConnect.remove(key) }
+        pushModel()
+    }
+
+    private func renameSpeaker(_ key: String, system: String, to typed: String) {
+        guard speakerNames.rename(key: key, to: typed, system: system) else { return }
+        pushModel()   // saved by `speakerNames`' didSet
+    }
+
+    /// An AirPlay speaker's name as the windows and notices show it: the
+    /// user's, else the one discovery reports.
+    func shownName(airPlay id: String) -> String {
+        speakerNames.shown(key: SpeakerKey.make(id: id, airplay: true), system: systemName(airPlay: id))
+    }
+
+    /// A local speaker's name as the windows and notices show it.
+    func shownName(local uid: String, system: String) -> String {
+        speakerNames.shown(key: SpeakerKey.make(id: uid, airplay: false), system: text.deviceName(system))
+    }
+
+    private func systemName(airPlay id: String) -> String {
+        airplayNames[id].map(text.deviceName) ?? text.unknownDevice
+    }
+
+    private func setShowVirtualDevices(_ on: Bool) {
+        guard on != showVirtualDevices else { return }
+        showVirtualDevices = on
+        // Turned off, the virtual devices nobody chose leave the list at once.
+        reconcileLocal(keepListed: false)
+    }
+
+    private func setAppearance(_ choice: AppAppearance) {
+        guard choice != appearance else { return }
+        appearance = choice   // applied by `appearance`'s didSet
+        pushModel()
+    }
+
+    // MARK: - Model snapshots
+
+    /// Copies the current state into `appModel`, which the main window, the
+    /// menu bar panel and the menu bar icon render. Values that didn't change
+    /// are left alone, so the views redraw only what moved. Every update also
+    /// decides whether Now Playing polls and AirPlay receivers get the track,
+    /// and when the next reconcile falls due (`scheduleDueReconcile`).
+    func pushModel() {
+        publish(\.running, engine.isRunning)
+        noteSessionSpeaker()
+        publish(\.noSpeakerOn, StreamingPolicy.showsNoSpeakerOn(
+            streaming: engine.isRunning, enabledAirPlay: playableAirPlay.union(castSwitchedOn), enabledLocal: enabledLocal))
+        publish(\.sourceID, audioSource.defaultsValue)
+        publish(\.inputPair, currentInputPair)
+        publish(\.master, masterVolume)
+        // Hidden speakers leave the rows here, so every list built from them loses them.
+        let hiddenKey = { (s: AppModel.Speaker) in HiddenSpeakers.key(id: s.id, tag: s.tag) }
+        let airplay = hiddenSpeakers.partition(airplaySnapshot(), key: hiddenKey)
+        let local = hiddenSpeakers.partition(localSnapshot(), key: hiddenKey)
+        let cast = hiddenSpeakers.partition(castSnapshot(), key: hiddenKey)
+        publish(\.airplay, airplay.shown)
+        publish(\.local, local.shown)
+        publish(\.cast, cast.shown)
+        publish(\.hidden, hiddenSnapshot(local: local.hidden, network: airplay.hidden + cast.hidden))
+        publish(\.castList, castModel.listState(now: Date()))
+        publish(\.castCanAdd, castSender != nil && castModel.discovery != .off)
+        appModel.speakersListed(Set(appModel.airplay.map(\.id) + appModel.local.map(\.id) + appModel.cast.map(\.id)))
+        publish(\.hasLocalReference, localReference != nil)
+        publish(\.airPlayDelayMs, airPlayLatencyMs.rounded())
+        // When the sender stopped after an internal error, the AirPlay
+        // section says so, with Retry.
+        publish(\.airplaySenderFailed, nativeStarts.stopped)
+        // The sender is up once it and its discovery started.
+        publish(\.localNetworkHint, LocalNetworkHint.decide(
+            access: localNetworkProbe.access, senderUp: nativeStarts.isUp,
+            emptySince: airplayEmptySince, now: Date()))
+        publish(\.airplaySearching, AirPlaySearch.isSearching(
+            access: localNetworkProbe.access, senderUp: nativeStarts.isUp,
+            emptySince: airplayEmptySince, now: Date()))
+        publish(\.airplaySenderUp, nativeStarts.isUp)
+        publish(\.airplayFoundNone, AirPlaySearch.foundNone(
+            access: localNetworkProbe.access, senderUp: nativeStarts.isUp,
+            emptySince: airplayEmptySince, now: Date()))
+        if let equalizerModel { publish(\.equalizerOn, equalizerModel.settings.enabled) }
+        publishEqualizerCurve()
+        rememberZoneNames()
+        publish(\.zones, zoneSnapshot())
+        appModel.zonesListed(Set(appModel.zones.map(\.id)))
+        publishPresets()
+        publish(\.launchAtLogin, launchAtLogin)
+        publish(\.showVirtualDevices, showVirtualDevices)
+        publish(\.volumeKeys, volumeKeys)
+        publish(\.volumeKeysNeedAccess, followVolumeKeys())
+        publish(\.appearance, appearance)
+        publish(\.deviceVolumes, followDeviceVolumes())
+        followCalibrationContext()
+        followCalibrateAll()
+        menuBar?.setRunning(engine.isRunning)
+        syncStreamingActivity()
+        syncTrackInfo()
+        scheduleDueReconcile()
+        refreshSetup()
+    }
+
+    /// Refreshes the source picker: apps come and go, input devices are
+    /// plugged in and out.
+    func pushSources(running: [SourceApps.Entry] = SourceApps.running(), inputDevices: [AudioDevices.Device]? = nil) {
+        externalReads.sourcesPushed()
+        let inputDevices = inputDevices ?? devices.allInputDevices()
+        let inputs = inputDevices.map {
+            SourceList.Input(uid: $0.uid, name: text.deviceName($0.name), transport: $0.transport,
+                             inputSubTransports: $0.inputSubTransports)
+        }
+        let inputLog = SourceList.logLines(inputs)
+        if inputLog != loggedInputs {   // the picker is refreshed often; the log hears only of changes
+            loggedInputs = inputLog
+            inputLog.forEach { DebugTrace.log($0) }
+        }
+        var waiting: String?
+        if case .input(let uid) = audioSource, engine.waitsForInput { waiting = uid }
+        let listed = inputDevices.map { InputListings.Input(uid: $0.uid, name: $0.name, transport: $0.transport) }
+        if let to = inputListings.take(listed, waiting: waiting, pairs: &inputPairs), let from = waiting {
+            DebugTrace.log("[AudioSync] the capture's input device is listed under a new UID (\(to), was \(from)): "
+                           + "the capture follows it")
+            audioSource = .input(uid: to)
+            engine.followInput(to: to)
+        }
+        var inputName = store.read(Keys.sourceInputName) as? String
+        if case .input(let uid) = audioSource, let plugged = inputs.first(where: { $0.uid == uid }),
+           plugged.name != inputName {
+            inputName = plugged.name
+            store.write(plugged.name, Keys.sourceInputName)
+        }
+        let channels = Dictionary(inputDevices.map { ($0.uid, $0.inputChannels) }, uniquingKeysWith: { first, _ in first })
+        let entries = SourceList.entries(systemName: text.sourceSystem,
+                                         apps: running.map { (bundleID: $0.bundleID, name: $0.name) },
+                                         inputs: inputs, chosen: audioSource,
+                                         chosenAppName: SourceApps.name(for:), mixName: text.sourceMixName,
+                                         unpluggedInputName: text.sourceNotConnected(inputName), lastMix: lastMix)
+        let icons = Dictionary(running.compactMap { app in app.icon.map { (app.bundleID, $0) } },
+                               uniquingKeysWith: { first, _ in first })
+        let sources = entries.map { entry -> AppModel.Source in
+            var icon: NSImage?
+            if entry.isInput {
+                icon = microphoneSymbol
+            } else if !entry.id.isEmpty {
+                icon = (icons[entry.id] ?? SourceApps.icon(for: entry.id)).map(Self.menuSized)
+            }
+            var pairs: [String] = []
+            if case .input(let uid) = AudioSource(defaultsValue: entry.id) {
+                pairs = InputChannelPair.offered(channels: channels[uid] ?? 0).map(text.inputChannelPair)
+            }
+            return AppModel.Source(id: entry.id, name: entry.name, icon: icon, isInput: entry.isInput, pairs: pairs,
+                                   connected: entry.connected,
+                                   deviceName: entry.connected ? nil : inputName ?? text.sourceInputDevice,
+                                   available: entry.available)
+        }
+        publish(\.sources, sources)
+        let mode = SourceMix.mode(of: audioSource, remembered: rememberedMixMode)
+        let checked = SourceMix.checked(audioSource, mode: mode)
+        let mixApps = SourceList.mixApps(running.map { (bundleID: $0.bundleID, name: $0.name) }, checked: checked,
+                                         chosenAppName: SourceApps.name(for:), chosen: audioSource, lastMix: lastMix)
+        publish(\.mixMode, mode)
+        publish(\.mixChecked, checked)
+        publish(\.mixApps, mixApps.map { entry in
+            AppModel.Source(id: entry.id, name: entry.name,
+                            icon: (icons[entry.id] ?? SourceApps.icon(for: entry.id)).map(Self.menuSized), isInput: false,
+                            available: entry.available)
+        })
+    }
+
+    /// Checks or unchecks an app in the several-apps menu.
+    func toggleMixApp(_ bundleID: String) {
+        let mode = SourceMix.mode(of: audioSource, remembered: rememberedMixMode)
+        setSource(SourceMix.toggle(bundleID, in: audioSource, mode: mode, ownBundleID: Bundle.main.bundleIdentifier),
+                  origin: .user)
+        pushSources()
+    }
+
+    /// Switches the several-apps menu between "only these" and "all except these".
+    func setMixMode(_ mode: AppMixMode) {
+        let current = SourceMix.mode(of: audioSource, remembered: rememberedMixMode)
+        rememberedMixMode = mode
+        guard mode != current else { return }
+        setSource(SourceMix.setMode(mode, from: current, of: audioSource, ownBundleID: Bundle.main.bundleIdentifier),
+                  origin: .user)
+        pushSources()
+    }
+
+    /// The picker's rows carry a 16-point icon; app icons come much larger.
+    private static func menuSized(_ icon: NSImage) -> NSImage {
+        let copy = icon.copy() as? NSImage ?? icon
+        copy.size = NSSize(width: 16, height: 16)
+        return copy
+    }
+
+    /// Input devices' rows show a microphone; the row's text names the device.
+    private var microphoneSymbol: NSImage? {
+        NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
+    }
+
+    private func airplaySnapshot() -> [AppModel.Speaker] {
+        let native = nativeAirPlay?.model
+        return airplayOrder.map { id in
+            let receiver = NativeAirPlayID.receiver(id)
+            return AppModel.Speaker(id: id,
+                                    name: shownName(airPlay: id),
+                                    tag: .airplay,
+                                    enabled: enabledAirPlay.contains(id),
+                                    volume: airPlayRowLevel(id),
+                                    offsetMs: nil,
+                                    autoConnect: autoConnect.contains(SpeakerKey.make(id: id, airplay: true)),
+                                    availability: receiver.flatMap { native?.targetCantPlay($0) }.map(SpeakerAvailability.cantPlay)
+                                        ?? SpeakerAvailability(airplayAccess[id] ?? .open,
+                                                               everyTime: receiver.map { native?.asksEveryTime($0) == true } ?? false,
+                                                               on: enabledAirPlay.contains(id)),
+                                    systemName: systemName(airPlay: id),
+                                    airPlay2: receiver.map { native?.reachedOverAirPlay2($0) == true } ?? false,
+                                    waitingForAirPlay2: receiver.map { native?.waitReason($0) == .tooManyAirPlay2 } ?? false,
+                                    waitingForPtp: receiver.map { native?.waitReason($0) == .ptpOtherNetwork } ?? false,
+                                    reconnecting: receiver.map { native?.isReconnecting($0) == true } ?? false,
+                                    codeWait: receiver.flatMap { native?.codeWait($0) },
+                                    unannounced: receiver.map { native?.isUnannounced($0) == true } ?? false,
+                                    paired: receiver.map { native?.isPaired($0) == true } ?? false,
+                                    holdsCredentials: receiver.map { native?.keepsCredentials($0) == true } ?? false,
+                                    holdsPassword: receiver.map { native?.holdsPassword($0) == true } ?? false,
+                                    refusedForCode: receiver.map { native?.refusedOff.contains($0) == true } ?? false,
+                                    airPlayTarget: receiver.flatMap { target in
+                                        native?.targetRow(target) { member in
+                                            self.speakerNames.renamed(key: SpeakerKey.make(id: NativeAirPlayID.app(member),
+                                                                                           airplay: true))
+                                        }
+                                    })
+        }
+    }
+
+    private func localSnapshot() -> [AppModel.Speaker] {
+        localOrder.compactMap { uid in
+            guard let device = localDevices[uid] else { return nil }
+            return AppModel.Speaker(id: uid,
+                                    name: shownName(local: uid, system: device.name),
+                                    tag: SpeakerTag(transport: device.transport),
+                                    enabled: enabledLocal.contains(uid),
+                                    volume: localVolume[uid] ?? defaultVolume,
+                                    offsetMs: LocalDelay.shownOffset(uid, reference: localReference,
+                                                                     offsets: localOffsetMs),
+                                    autoConnect: autoConnect.contains(SpeakerKey.make(id: uid, airplay: false)),
+                                    systemName: text.deviceName(device.name),
+                                    calibrationLeftOut: calibrationLeftOut(uid),
+                                    isReference: uid == localReference)
+        }
+    }
+
+    /// Sets one model value, only when it differs: every assignment to a
+    /// published property makes the views re-render.
+    private func publish<Value: Equatable>(_ path: ReferenceWritableKeyPath<AppModel, Value>, _ value: Value) {
+        if appModel[keyPath: path] != value { appModel[keyPath: path] = value }
+    }
+
+    // MARK: - Windows
+
+    /// Brings the main window up in front, wherever it was: closed, behind
+    /// other apps, minimized or hidden. Also how a second launch and a click
+    /// on the Dock icon end. The panel closes first, as it floats above.
+    func showMainWindow() {
+        menuBar?.close()
+        mainWindow?.show()
+    }
+
+    private func openEqualizerWindow() {
+        menuBar?.close()
+        equalizerWindow?.show()
+    }
+
+    private func openWebRemoteWindow() {
+        menuBar?.close()
+        webRemoteWindow?.show()
+    }
+
+    private func openSettingsWindow() {
+        menuBar?.close()
+        MainActor.assumeIsolated { settingsWindow?.show() }
+    }
+
+    /// The Guide: the help text in a window of its own, made once and kept
+    /// while AudioSync runs, so it opens where the user left it.
+    private func openGuideWindow() {
+        menuBar?.close()
+        let guide = helpWindow ?? makeGuideWindow()
+        helpWindow = guide
+        NSApp.activate(ignoringOtherApps: true)
+        guide.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeGuideWindow() -> NSWindow {
+        let frame = NSRect(origin: .zero, size: NSSize(width: 640, height: 600))
+        let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+        let window = GuideWindow(contentRect: frame, styleMask: style, backing: .buffered, defer: false)
+        window.title = text.guideTitle
+        window.isReleasedWhenClosed = false
+        // 440 keeps the 360 pt illustrations whole with an always-on scroller.
+        window.contentMinSize = NSSize(width: 440, height: 300)
+
+        let guideScroll = NSScrollView(frame: frame)
+        guideScroll.hasVerticalScroller = true
+        guideScroll.autohidesScrollers = true
+        guideScroll.borderType = .noBorder
+        guideScroll.autoresizingMask = [.width, .height]
+        let textView = GuideTextView(frame: frame)
+        textView.isEditable = false
+        textView.isSelectable = true   // so a step can be copied
+        textView.isRichText = true     // for the illustrations; the text stays read-only
+        textView.drawsBackground = true
+        textView.backgroundColor = .textBackgroundColor   // both follow light and dark
+        textView.textContainerInset = NSSize(width: 18, height: 16)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textStorage?.setAttributedString(guideText())
+        textView.showArtForAppearance()
+        textView.setAccessibilityLabel(text.guideTitle)
+        guideScroll.documentView = textView
+        window.contentView = guideScroll
+        window.initialFirstResponder = textView
+
+        let screens = NSScreen.screens.map(\.visibleFrame)
+        if !window.setFrameUsingName(GuideWindow.frameName)
+            || !WindowPlacement.isReachable(window.frame, screens: screens) {
+            window.center()
+        }
+        window.setFrameAutosaveName(GuideWindow.frameName)
+        return window
+    }
+
+    /// The Guide's text with its illustrations, in the light variant until the
+    /// text view picks the one for its appearance.
+    private func guideText() -> NSAttributedString {
+        let body: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let artParagraph = NSMutableParagraphStyle()
+        artParagraph.paragraphSpacingBefore = 6
+        artParagraph.paragraphSpacing = 14
+        var artAttributes = body
+        artAttributes[.paragraphStyle] = artParagraph
+
+        let guide = NSMutableAttributedString()
+        var firstPiece = true
+        var strings = text
+        strings.updatesOn = AppUpdater.isEnabled
+        for piece in GuideLayout.pieces(of: strings.helpText, anchor: strings.guideArtAnchor) {
+            let paragraphs = GuideLayout.paragraphs(of: piece.text)
+            let roles = GuideLayout.roles(of: paragraphs, opensText: firstPiece)
+            firstPiece = false
+            for (index, paragraph) in paragraphs.enumerated() {
+                let style = NSMutableParagraphStyle()
+                style.headIndent = (paragraph.hang as NSString).size(withAttributes: body).width
+                var attributes = body
+                switch roles[index] {
+                case .title: attributes[.font] = NSFont.systemFont(ofSize: NSFont.systemFontSize + 4, weight: .semibold)
+                case .heading: attributes[.font] = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+                case .body: break
+                }
+                attributes[.paragraphStyle] = style
+                let end = index < paragraphs.count - 1 ? "\n" : ""
+                guide.append(NSAttributedString(string: paragraph.text + end, attributes: attributes))
+            }
+            guard let art = piece.art else { continue }
+            let attachment = GuideArtAttachment(art: art, label: text.guideArtDescription(art), dark: false)
+            let image = NSMutableAttributedString(attachment: attachment)
+            image.append(NSAttributedString(string: "\n"))
+            image.addAttributes(artAttributes, range: NSRange(location: 0, length: image.length))
+            guide.append(image)
+        }
+        return guide
+    }
+
+    // MARK: - App menu commands
+
+    // Menu items without a target (MainMenu.swift) reach these through the
+    // responder chain, which ends at the app delegate.
+
+    @objc func showMainWindow(_ sender: Any?) { showMainWindow() }
+
+    @objc func showEqualizer(_ sender: Any?) { openEqualizerWindow() }
+
+    @objc func showGuide(_ sender: Any?) { openGuideWindow() }
+
+    @objc func showWebRemote(_ sender: Any?) { openWebRemoteWindow() }
+
+    @objc func showSettings(_ sender: Any?) { openSettingsWindow() }
+
+    @objc func toggleStreaming(_ sender: Any?) { setStreaming(!engine.isRunning, fromMenu: true) }
+
+    @objc func newZone(_ sender: Any?) { promptNewZone() }
+
+    @objc func refreshDevices(_ sender: Any?) { rescanDevices() }
+
+    /// The sheet belongs to the main window, as from the panel's row.
+    @objc func addCastByAddress(_ sender: Any?) {
+        showMainWindow()
+        if MainWindowSheet.castAdd.mayOpen(calibrateShown: appModel.calibrateAll.shown,
+                                           castAddShown: appModel.castAddShown) {
+            appModel.castAddShown = true
+        }
+    }
+
+    /// Command-S: the delays typed in the open delay panels apply, and the
+    /// panels stay open.
+    @objc func applyTypedDelay(_ sender: Any?) { appModel.applyDelayTyping() }
+
+    /// Keeps the menus current each time one opens: the check mark on the
+    /// current preset, the streaming item's wording, Apply Typed Delay only
+    /// while there is typing to apply.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(applyTypedDelay(_:)):
+            return appModel.hasDelayTyping
+        case #selector(toggleStreaming(_:)):
+            menuItem.title = engine.isRunning ? text.menuTurnStreamingOff : text.menuTurnStreamingOn
+        case #selector(addCastByAddress(_:)):
+            return appModel.castCanAdd
+        case #selector(recallPresetFromMenu(_:)):
+            let id = menuItem.representedObject as? String
+            menuItem.state = appModel.presets.contains { $0.id == id && $0.current } ? .on : .off
+        default:
+            break
+        }
+        return true
+    }
+}
+
+/// The Guide's text: swaps each illustration for its light or dark variant
+/// when the appearance changes.
+private final class GuideTextView: NSTextView {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        showArtForAppearance()
+    }
+
+    func showArtForAppearance() {
+        guard let storage = textStorage else { return }
+        let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        var stale: [(NSRange, GuideArtAttachment)] = []
+        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
+            if let attachment = value as? GuideArtAttachment, attachment.dark != dark {
+                stale.append((range, attachment))
+            }
+        }
+        guard !stale.isEmpty else { return }
+        storage.beginEditing()
+        for (range, old) in stale {
+            storage.addAttribute(.attachment, value: GuideArtAttachment(art: old.art, label: old.label, dark: dark),
+                                 range: range)
+        }
+        storage.endEditing()
+    }
+}
+
+/// One Guide illustration, drawn from its SVG, with a description for VoiceOver.
+private final class GuideArtAttachment: NSTextAttachment {
+    let art: GuideArt
+    let label: String
+    let dark: Bool
+
+    init(art: GuideArt, label: String, dark: Bool) {
+        self.art = art
+        self.label = label
+        self.dark = dark
+        super.init(data: nil, ofType: nil)
+        let picture = NSImage(data: Data((dark ? art.darkSVG : art.lightSVG).utf8))
+        picture?.accessibilityDescription = label
+        image = picture
+    }
+
+    required init?(coder: NSCoder) { return nil }
+}
+
+/// The Guide's window: Escape closes it, like a sheet of help.
+private final class GuideWindow: NSWindow {
+    static let frameName = "AudioSyncGuideWindow"
+
+    override func cancelOperation(_ sender: Any?) {
+        performClose(sender)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        closeOnEscape(event) || super.performKeyEquivalent(with: event)
+    }
+}
+
+extension NSWindow {
+    /// A text view would take Escape before `cancelOperation` reaches the
+    /// window, so `performKeyEquivalent` catches it, ahead of the first responder.
+    func closeOnEscape(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let isEscape = event.type == .keyDown && event.keyCode == 53 && modifiers.isEmpty   // 53: Escape
+        if isEscape { performClose(nil) }
+        return isEscape
+    }
+}

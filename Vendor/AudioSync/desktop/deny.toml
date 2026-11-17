@@ -1,0 +1,100 @@
+# cargo-deny configuration for the Windows app.
+#
+# `cargo deny check licenses` (run from desktop/, and in CI) fails when any
+# crate that goes into the x64 or ARM64 Windows build or the x64 Linux build,
+# build and development dependencies included, is under a license that is not
+# on this list.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+# Anything else needs a per-crate exception with a one-line reason, e.g.
+# { crate = "name", allow = ["MPL-2.0"] }, # why it is acceptable
+exceptions = [
+    # AudioSync's own code is GPL-3.0-or-later; the exception names only our
+    # own crates, so no third-party crate may bring a GPL license in.
+    { crate = "audiosync-desktop", allow = ["GPL-3.0-or-later"] },
+    { crate = "audiosync-core", allow = ["GPL-3.0-or-later"] },
+    { crate = "audiosync-airplay", allow = ["GPL-3.0-or-later"] },
+    { crate = "audiosync-cast", allow = ["GPL-3.0-or-later"] },
+    { crate = "audiosync-remote", allow = ["GPL-3.0-or-later"] },
+    # Slint's crates are "GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR
+    # LicenseRef-Slint-Software-3.0"; public builds take them under
+    # GPL-3.0-only, which only Slint's crates may use.
+    { crate = "i-slint-backend-selector", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-backend-testing", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-backend-winit", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-common", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-compiler", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-core", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-core-macros", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-renderer-femtovg", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-renderer-software", allow = ["GPL-3.0-only"] },
+    { crate = "slint", allow = ["GPL-3.0-only"] },
+    { crate = "slint-build", allow = ["GPL-3.0-only"] },
+    { crate = "slint-macros", allow = ["GPL-3.0-only"] },
+    # tray-icon shows the Linux tray icon through it; the Unlicense is a
+    # public-domain dedication with no conditions.
+    { crate = "ksni", allow = ["Unlicense"] },
+    # A build-time dependency of the PipeWire bindings' pkg-config lookup
+    # (system-deps through cfg-expr) on Linux; the LLVM exception only waives
+    # Apache-2.0 conditions for compiled code.
+    { crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] },
+]
+include-dev = true
+include-build = true
+# The list is a policy, not an inventory: a license nobody uses yet is fine.
+unused-allowed-license = "allow"
+
+[licenses.private]
+ignore = false
+
+# Gates main and integ/* in the Licenses job, weekly in advisories.yml; every ignore says why.
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = [
+    # A dev-dependency that only generates the fake receiver's test key; ring
+    # signs with it, and no shipped code runs RSA.
+    { id = "RUSTSEC-2023-0071", reason = "rsa only makes a test key; Marvin needs RSA decryption; no patched rsa version exists" },
+    # Slint parses styled text with ENABLE_STRIKETHROUGH only, never wikilinks.
+    { id = "RUSTSEC-2026-0414", reason = "Slint never sets ENABLE_WIKILINKS; 0.13.5 fixes it, kept out of this change, which bumps only the advisories it names" },
+    { id = "RUSTSEC-2026-0433", reason = "Slint never sets ENABLE_WIKILINKS; pulldown-cmark 0.13.6 fixes it, a lockfile bump left to its own change" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils: unmaintained, no safe upgrade, build-time only under Slint through spin_on" },
+    { crate = "clipboard-win@5.4.1", reason = "yanked; under Slint through arboard; cargo update -p clipboard-win clears it in its own change" },
+    # Linux-only, under Slint through winit's window decorations.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained, Linux-only, under Slint" },
+    # zbus 5 brings these; our MPRIS code uses it directly, as do the ksni tray
+    # and Slint's AT-SPI bridge. Nothing maintained replaces them yet.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, under zbus 5, no maintained replacement yet" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, under zbus 5, no maintained replacement yet" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, under zbus 5, no maintained replacement yet" },
+]
+
+[bans]
+wildcards = "deny"
+# Our own crates are path dependencies without a version; none is published.
+allow-wildcard-paths = true
+# Duplicates come from upstream crates we do not control.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

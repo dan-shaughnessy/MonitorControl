@@ -1,0 +1,2218 @@
+import Foundation
+import CAudioSyncCore
+
+/// Every user-facing string in one place, so a translation can be added later
+/// without hunting through view code.
+///
+/// Language decision: English only for now, as plain Swift strings. When a
+/// second language is added, move these to a String Catalog
+/// (`Localizable.xcstrings`) behind the same properties and functions, so the
+/// call sites stay unchanged. The `NS…UsageDescription` strings in Info.plist
+/// are localized by the system through `InfoPlist.strings`, not here.
+///
+/// Engine code never builds user-facing text: it reports typed reasons
+/// (`SourceCapture.CaptureError`, `AirPlayPairing.Reason`) that are mapped
+/// to messages here. Raw Swift errors and OSStatus codes go to the debug log only.
+struct UIStrings {
+
+    /// How numbers such as percentages are written: the user's locale (the
+    /// logic suite fixes one).
+    var locale = Locale.autoupdatingCurrent
+    /// Whether this build checks for updates, so the Guide names Check for
+    /// Updates… only when the app menu has it.
+    var updatesOn = false
+
+    // MARK: Main window
+
+    let appName = "AudioSync"
+    let mainWindowTitle = "AudioSync"
+    let streamingSwitch = "Streaming"
+    let turnOn = "Turn On"
+    let turnOff = "Turn Off"
+    let on = "On"
+    let off = "Off"
+    /// A speaker's accessibility value while it waits for streaming to start.
+    let willPlay = "Will play"
+    /// Tooltip on a speaker that waits for streaming to start.
+    let willPlayHelp = "Plays when streaming starts. Click to start streaming."
+    let statusOff = "Off"
+    let retry = "Retry"
+    let retryAirPlayHelp = "Start AirPlay again"
+    /// AudioSync's own AirPlay sender stopped after an internal error; shown
+    /// in place of the AirPlay speakers, with Retry.
+    let nativeAirPlayFailed = "AirPlay stopped after an internal error. Click Retry to start it again. If it keeps happening, restart AudioSync."
+    let alertOK = "OK"
+    let guideTitle = "AudioSync Guide"
+    let refreshDevices = "Refresh Devices"
+    let showVirtualDevices = "Show Virtual Devices"
+    let volumeKeys = "Volume Keys Control AudioSync"
+    let volumeKeysOn = "While streaming is on, the volume keys change AudioSync's master volume."
+    let volumeKeysOff = "When this is off, they change the Mac's volume as usual."
+    let volumeKeysNeedAccess = "The keys stay with macOS until AudioSync has Accessibility access."
+    /// The label of the level pop-up a volume key shows.
+    let volumePopupName = "AudioSync master volume"
+    func volumePopupLevel(_ level: Double) -> String { "\(Int(level.rounded()))%" }
+    let appearance = "Appearance"
+    func appearanceName(_ choice: AppAppearance) -> String {
+        switch choice {
+        case .system: return "Match System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+    let masterVolumeTitle = "Master Volume"
+    let moreOptions = "Options"
+    /// VoiceOver hint of the gear, a plain button that opens an AppKit menu.
+    let moreOptionsHint = "Opens a menu of options"
+    let dismissNotice = "Dismiss Notice"
+    /// VoiceOver name of a notice's close button: several notices can show at once.
+    func dismissNotice(_ title: String) -> String { "Dismiss: \(title)" }
+    /// A notice's `shortName`: Windows' words for the same notice, with the
+    /// Mac's names for its settings.
+    let noSpeakerNoticeName = "no speaker on"
+    func sourceQuitNoticeName(_ app: String) -> String { "\(app) quit" }
+    func switchFailedNoticeName(_ new: String) -> String { "\(new) didn't start" }
+    let microphoneNoticeName = "microphone access blocked"
+    let waitingForAudioNoticeName = "waiting for audio"
+    func speakerFailedNoticeName(_ speaker: String) -> String { "\(speaker) didn't start, turned off" }
+    func speakerLostNoticeName(_ speaker: String) -> String { "\(speaker) disconnected" }
+    func speakerBusyNoticeName(_ speaker: String) -> String { "\(speaker) in use" }
+    func speakerStrugglingNoticeName(_ speaker: String) -> String { "\(speaker) is struggling" }
+    func pairFirstNoticeName(_ speaker: String) -> String { "\(speaker) stayed off" }
+    /// An AirPlay or Google Cast speaker that is off.
+    func cantPlayNoticeName(_ speaker: String) -> String { "\(speaker) can't play" }
+    let airPlayStoppedNoticeName = "AirPlay stopped"
+    let ptpPortsNoticeName = "PTP ports in use"
+    let pairingsNotSavedNoticeName = "pairings not saved"
+    let pairingsIgnoredNoticeName = "pairings reset"
+    func airPlayAheadNoticeName(_ castSpeaker: String) -> String { "AirPlay ahead of \(castSpeaker)" }
+    let groupsBecameZonesNoticeName = "groups became zones"
+    let presetLeftOffNoticeName = "some speakers stayed off"
+    func launchAtLoginNoticeName(turningOn on: Bool) -> String {
+        on ? "launch at login failed" : "launch at login still on"
+    }
+    let loginItemOffNoticeName = "login item turned off"
+    /// `streamingStartMessage(for:input:)`'s; `input` names the input device.
+    /// Nil where Windows has no such notice.
+    func streamingStartNoticeName(for error: Error, input: String) -> String? {
+        guard let reason = error as? SourceCapture.CaptureError else {
+            return error is StreamEngine.StartError ? nil : captureFailedNoticeName
+        }
+        switch reason {
+        case .appNotRunning(let bundleID): return "\(SourceApps.name(for: bundleID)) \(sourceNotRunningNote)"
+        case .appsNotRunning(let bundleIDs): return "\(listed(bundleIDs.map(SourceApps.name(for:)))) \(sourceNotRunningNote)"
+        case .inputNotFound, .inputDisconnected: return "\(input) not connected"
+        case .inputHandsFree: return nil
+        default: return captureFailedNoticeName
+        }
+    }
+    /// `sourceStopped(_:input:)`'s, the same way.
+    func sourceStoppedNoticeName(_ error: SourceCapture.CaptureError, input: String) -> String? {
+        switch error {
+        case .inputDisconnected, .inputNotFound: return "\(input) was disconnected, streaming stopped"
+        case .inputHandsFree: return nil
+        case .appNotRunning(let bundleID): return sourceQuitNoticeName(SourceApps.name(for: bundleID))
+        default: return "capture stopped"
+        }
+    }
+    private let captureFailedNoticeName = "capture didn't start"
+    let dismissAllNotices = "Dismiss All"
+    let previousTrack = "Previous Track"
+    let nextTrack = "Next Track"
+    let shuffle = "Shuffle"
+    let repeatMode = "Repeat"
+    /// The repeat button's state when it repeats the one song.
+    let repeatOne = "One"
+    let play = "Play"
+    let pause = "Pause"
+    /// What AirPlay speakers with a screen, such as a TV, show while AudioSync
+    /// doesn't know what is playing: AudioSync's name as the title, the source's name as the source
+    /// picker shows it as the artist (`receiverUnnamedSource` when there is no
+    /// name to show) and `receiverAlbum` as the album. None of them may be
+    /// blank: a TV may then show no text at all.
+    var receiverUntitled: String { appName }
+    let receiverUnnamedSource = "Live audio"
+    let receiverAlbum = "From your Mac"
+    /// A delay field's placeholder while it is empty; its VoiceOver label
+    /// (`delayFieldLabel`) says what the number is.
+    let delayFieldPlaceholder = "0"
+    /// `name`: the row's own delay label, such as "Kitchen delay".
+    func delayFieldLabel(_ name: String) -> String { "\(name) in milliseconds" }
+    /// Under a delay field while it holds typing not yet applied; also the
+    /// field's VoiceOver hint then.
+    let delayDraftHint = "Press Return to apply"
+    /// Under a delay field, in place of `delayDraftHint`, while it holds a
+    /// number out of the delay's range; also the field's VoiceOver hint then.
+    func delayOutOfRange(lowest: String, highest: String, applies: String) -> String {
+        "The range is \(lowest) to \(highest) \(millisecondsUnit). Return applies \(applies)."
+    }
+    /// Under a delay field, for a moment, after it blocked a keystroke it
+    /// can't take; VoiceOver announces it.
+    let delayFieldTakes = "Only digits, with + or − in front"
+
+    func statusStreaming(speakers: Int) -> String {
+        switch speakers {
+        case 0: return "Streaming"
+        case 1: return "Streaming to 1 speaker"
+        default: return "Streaming to \(speakers) speakers"
+        }
+    }
+
+    /// The link under the newest notice in the menu bar panel to the window
+    /// that lists the others.
+    func moreNotices(_ count: Int) -> String {
+        count == 1 ? "1 more notice…" : "\(count) more notices…"
+    }
+
+    /// The menu bar icon's accessibility value while notices wait.
+    func noticesWaiting(_ count: Int) -> String {
+        count == 1 ? "1 notice" : "\(count) notices"
+    }
+
+    /// The menu bar icon's accessibility value: streaming on or off, the
+    /// speakers switched on, then the notices waiting.
+    func statusItemValue(running: Bool, speakers: Int, notices: Int) -> String {
+        let streaming = streamingSwitch + " " + (running ? on : off).lowercased() + ", "
+            + (speakers == 0 ? "no speaker on" : speakers == 1 ? "1 speaker on" : "\(speakers) speakers on")
+        return notices > 0 ? streaming + ", " + noticesWaiting(notices) : streaming
+    }
+
+    /// The menu bar icon's tooltip: the app's name, then what VoiceOver reads
+    /// as its value, as the Windows tray tooltip does.
+    func statusItemTooltip(running: Bool, speakers: Int, notices: Int) -> String {
+        appName + ": " + statusItemValue(running: running, speakers: speakers, notices: notices)
+    }
+
+    /// VoiceOver's action on the menu bar icon that opens its right-click menu.
+    let statusItemShowMenu = "Show Menu"
+
+    /// The main window's status line: `status`, then the AirPlay delay in use
+    /// while streaming to an AirPlay speaker, to a tenth of a second.
+    func mainStatus(_ status: String, running: Bool, airPlayOn: Bool, airPlayDelayMs: Double) -> String {
+        guard running, airPlayOn else { return status }
+        let tenths = AirPlayDelayTenths.of(airPlayDelayMs)
+        return status + " · AirPlay delay \(tenths / 10).\(tenths % 10) s"
+    }
+
+    func speakerOptions(name: String) -> String { "Options for \(name)" }
+
+    /// A speaker's (or group's) accessibility value.
+    func value(_ state: SpeakerState) -> String {
+        switch state {
+        case .off: return off
+        case .willPlay: return willPlay
+        case .playing: return on
+        }
+    }
+
+    /// A speaker row's accessibility value: its state, then that it is off
+    /// the network.
+    func rowValue(_ state: SpeakerState, offline: Bool) -> String {
+        offline ? value(state) + ", " + notOnNetwork : value(state)
+    }
+
+    /// What clicking a speaker (or group) does, as its tooltip.
+    func help(_ state: SpeakerState) -> String {
+        switch state {
+        case .off: return turnOn
+        case .willPlay: return willPlayHelp
+        case .playing: return turnOff
+        }
+    }
+
+    /// A speaker's (or group's) VoiceOver hint: its note, if any, then what a
+    /// click does while it waits for streaming to start. Off the network is
+    /// left out, since the row's value (`rowValue`) says it.
+    func rowHint(_ state: SpeakerState, note: String?) -> String {
+        [note == notOnNetwork ? nil : note, state == .willPlay ? willPlayHelp : nil]
+            .compactMap { $0 }
+            .joined(separator: ". ")
+    }
+
+    /// The note next to an AirPlay speaker that can't simply play; nil when it can.
+    func availability(_ a: SpeakerAvailability) -> String? {
+        switch a {
+        case .open: return nil
+        case .needsCode: return "Asks for a code"
+        case .codeEveryTime: return "Asks for a code every time"
+        case .cantPlay(.needsPairing): return "Pairing not supported yet"
+        case .cantPlay(.airPlay2Only): return "AirPlay 2 is off"
+        case .cantPlay: return "Not supported"
+        }
+    }
+
+    /// Tooltip for that note.
+    func availabilityHelp(_ a: SpeakerAvailability) -> String? {
+        switch a {
+        case .open, .cantPlay: return nil
+        case .needsCode:
+            return "This speaker asks for a code or password. AudioSync asks you for it when you turn the speaker on."
+        case .codeEveryTime:
+            return "This speaker asks for a code each time it connects, so auto-connect leaves it off. AudioSync asks you for the code when you turn the speaker on."
+        }
+    }
+    func volume(of name: String) -> String { "\(name) volume" }
+    /// A 0–100 volume as shown next to its slider and read by VoiceOver.
+    func volumeValue(_ volume: Double) -> String { "\(Int(volume.rounded()))" }
+    /// A delay in whole milliseconds, the unit the sync field and steps use.
+    func delayValue(ms: Double) -> String { "\(Int(ms.rounded())) \(millisecondsUnit)" }
+    /// An offset relative to the reference in whole ms, with its sign, as its
+    /// field shows it: "+150", "−250", "0" (S181).
+    func offsetNumber(_ ms: Double) -> String {
+        let n = Int(ms.rounded())
+        return n > 0 ? "+\(n)" : n < 0 ? "−\(-n)" : "0"
+    }
+    /// An offset as its speaker's row shows it and VoiceOver reads it: "+150 ms".
+    func offsetValue(ms: Double) -> String { "\(offsetNumber(ms)) \(millisecondsUnit)" }
+    func delay(of name: String) -> String { "\(name) delay" }
+    /// VoiceOver, as a delay applies while its panel is open: "Desk delay set to +150 ms".
+    func delaySet(_ label: String, to value: String) -> String { "\(label) set to \(value)" }
+    /// The delay value's VoiceOver label, which says whether its controls are open.
+    func showDelayControls(_ label: String) -> String { "Show controls for \(label)" }
+    func hideDelayControls(_ label: String) -> String { "Hide controls for \(label)" }
+    func delayStep(_ delta: Int) -> String { delta < 0 ? "−\(-delta)" : "+\(delta)" }
+    /// Opens with the visible text, so Voice Control's "click −100" finds the button.
+    func delayStepAccessibility(_ delta: Int) -> String {
+        "\(delayStep(delta)) \(millisecondsUnit), \(delta < 0 ? "decrease" : "increase") delay"
+    }
+
+    // MARK: Microphone calibration (S232)
+
+    let calibrateWithMicrophone = "Calibrate with Microphone"
+    func calibrateLabel(of name: String) -> String { "\(calibrateWithMicrophone), \(name)" }
+    let calibrationHint = "Put the microphone where you listen. AudioSync fades the music out, plays a short, "
+        + "quiet sweep on the built-in speakers and then on this speaker, sets this speaker's delay from the "
+        + "difference and fades the music back in."
+    let calibrationCancel = "Cancel"
+    func calibrationCancelLabel(of name: String) -> String { "Cancel calibrating \(name)" }
+    let openMicrophoneSettings = "Open Microphone Settings"
+
+    /// The calibrate button's tooltip and VoiceOver hint while it is off.
+    func calibrationUnavailable(_ reason: CalibrationFailure) -> String {
+        calibrationFailure(reason)
+    }
+
+    /// The calibrate button's tooltip and VoiceOver hint; empty while it reads Cancel.
+    func calibrationButtonHint(running: Bool, unavailable: CalibrationFailure?, held: Bool) -> String {
+        if running { return "" }
+        if let unavailable { return calibrationUnavailable(unavailable) }
+        return held ? calibrateAllUnavailable(.busy) : calibrationHint
+    }
+
+    /// The line under the calibrate button while it is off; nil while it can be pressed.
+    func calibrationButtonReason(running: Bool, unavailable: CalibrationFailure?, held: Bool) -> String? {
+        guard !running, unavailable != nil || held else { return nil }
+        return calibrationButtonHint(running: running, unavailable: unavailable, held: held)
+    }
+
+    /// What a calibration needs that is off, in the order streaming, the
+    /// speaker (`speaker`), the built-in speakers; all three when none is given.
+    func calibrationNeeds(_ missing: CalibrationMissing, speaker: String = "this speaker") -> String {
+        let missing = missing.isEmpty ? CalibrationMissing.all : missing
+        var names: [String] = []
+        if missing.contains(.streaming) { names.append("streaming") }
+        if missing.contains(.speaker) { names.append(speaker) }
+        if missing.contains(.reference) { names.append("the built-in speakers") }
+        guard let last = names.popLast() else { return "" }
+        return names.isEmpty ? last : names.joined(separator: ", ") + " and " + last
+    }
+
+    /// Why a calibration of one speaker, or of all of them, can't start.
+    func calibrationTurnOn(_ missing: CalibrationMissing) -> String {
+        let it = missing.isEmpty || missing.contains(.speaker) ? " it" : ""
+        return "Turn on \(calibrationNeeds(missing)) to calibrate\(it)."
+    }
+
+    /// What a running calibration is doing.
+    func calibrationStep(_ step: CalibrationPhase.Step) -> String {
+        switch step {
+        case .preparing: "Fading the music out…"
+        case .measuring(.reference): "Listening to the built-in speakers…"
+        case .measuring(.chosen): "Listening to this speaker…"
+        case .estimating: "Working out the delay…"
+        }
+    }
+
+    /// The line under the button once a calibration ended; nil while none
+    /// did or one runs, and for a failure while the button's off `reason` shows.
+    func calibrationMessage(_ phase: CalibrationPhase, under reason: String? = nil) -> String? {
+        switch phase {
+        case .idle, .running:
+            return nil
+        case .done(let ms, let clamped):
+            return clamped
+                ? "Delay set to \(offsetValue(ms: ms)), the end of the range. The measured difference is larger, "
+                    + "so this speaker stays a little out of sync."
+                : "Delay set to \(offsetValue(ms: ms))."
+        case .failed(let failure):
+            return reason == nil ? calibrationFailure(failure) + " The delay wasn't changed." : nil
+        case .cancelled:
+            return "Calibration cancelled. The delay wasn't changed."
+        }
+    }
+
+    func calibrationFailure(_ failure: CalibrationFailure) -> String {
+        switch failure {
+        case .noReference:
+            return "Calibration measures against the Mac's built-in speakers, and they aren't listed."
+        case .notPlaying(let missing):
+            return calibrationTurnOn(missing)
+        case .referenceHeadphones:
+            return calibrateAllUnavailable(.referenceHeadphones)
+        case .microphoneDenied:
+            return "AudioSync isn't allowed to use the microphone. Turn it on in System Settings → "
+                + "Privacy & Security → Microphone."
+        case .noMicrophone:
+            return "AudioSync couldn't record from the microphone. Check the input in System Settings → Sound."
+        case .handsFreeMicrophone:
+            return "The default input is a Bluetooth headset's hands-free microphone, and recording from it "
+                + "would switch the headset to call mode. Choose another input in System Settings → Sound, "
+                + "and try again."
+        case .unsupportedRate:
+            return "The audio runs at a sample rate calibration can't use. "
+                + "Set the Mac's output device, or the input you stream from, to 48 kHz in Audio MIDI Setup, "
+                + "and try again."
+        case .unsupportedMicrophoneRate:
+            return "The microphone runs at a sample rate calibration can't use. "
+                + "Set its format to 48 kHz in Audio MIDI Setup, and try again."
+        case .sourceSilent:
+            return "The test sound couldn't start because streaming stalled. "
+                + "Turn streaming off and on, and try again."
+        case .interrupted:
+            return "Streaming, the speakers or their delays changed during the measurement. "
+                + "Leave them as they are while it measures, and try again."
+        case .delayChanged:
+            return "This speaker's delay changed after it was measured. Calibrate All again."
+        case .microphoneChanged:
+            return "The microphone changed during the calibration. Keep one microphone as the default input, "
+                + "and try again."
+        case .microphoneSkipped:
+            return "The microphone dropped audio during the measurement, so its timing can't be trusted. Try again."
+        case .tooShort:
+            return "The recording was too short. Try again."
+        case .tooLong:
+            return "The delays are too long to measure in one recording at the microphone's sample rate. "
+                + "Lower the largest delay, or set the microphone to 48 kHz in Audio MIDI Setup, and try again."
+        case .clipped(let which):
+            return "The microphone was overloaded while \(calibrationSubject(which)) played. "
+                + "Turn the volume down or move the microphone farther away, and try again."
+        case .tooQuiet(let which):
+            return "The microphone barely heard \(calibrationSubject(which)). "
+                + "Turn the volume up or move the microphone closer, and try again."
+        case .ambiguousEcho(let which):
+            return "An echo or another sound was almost as loud as \(calibrationSubject(which)). "
+                + "Give the microphone a clear line to both speakers and try again."
+        case .implausible:
+            return "The two speakers were too far apart to measure. "
+                + "Make sure the microphone can hear both speakers, and try again."
+        case .nothingToMeasure(let zone):
+            return "Nothing to measure in “\(zone)”. Turn on a speaker in this zone first."
+        }
+    }
+
+    private func calibrationSubject(_ which: CalibrationRecording?) -> String {
+        switch which {
+        case .reference: "the built-in speakers"
+        case .chosen: "this speaker"
+        case nil: "a speaker"
+        }
+    }
+
+    // MARK: Calibrate All Speakers (S235 to S240)
+
+    let calibrateAll = "Calibrate All Speakers"
+    let calibrateAllHint = "Put the microphone where you listen. AudioSync fades the music out, plays a short sweep "
+        + "on the built-in speakers and then on each other speaker that is on, one at a time, twice each, "
+        + "and fades the music back in. Headphones and virtual outputs are left out. "
+        + "Nothing changes until you click Apply."
+    let calibrateBeforeStart = "Before you start"
+    let calibrateMicrophoneCheck = "Microphone where you listen"
+    let calibrateMicrophoneCheckDetail = "Keep the room quiet. Nothing changes until you click Apply."
+    let calibrateMusicFadesBack = "The music fades back in when it's done."
+    let calibrateLeftOutTitle = "Left out"
+
+    /// The reference's row under "Before you start".
+    func calibrateVolumeTitle(_ check: CalibrationVolumeCheck) -> String {
+        switch check.warning {
+        case .muted, .mutedAndLow: return "Your Mac is muted"
+        case .low(let n): return "Your Mac's volume is \(percent(n))"
+        case nil: return "Mac volume: \(percent(check.percent ?? 0))"
+        }
+    }
+
+    func calibrateVolumeDetail(_ check: CalibrationVolumeCheck) -> String {
+        switch check.warning {
+        case .muted, .mutedAndLow:
+            return "Calibration plays a sweep on the Mac's built-in speakers, "
+                + "and the microphone can't hear them while they're muted."
+        case .low: return "The microphone may barely hear the sweep on the built-in speakers. Turn it up before you calibrate."
+        case nil: return "Loud enough for the microphone to hear the built-in speakers."
+        }
+    }
+
+    // MARK: Calibrate Zone (S255)
+
+    /// In a zone's ⋯ menu; `calibrateZone` titles its sheet and button.
+    let calibrateZoneItem = "Calibrate Zone…"
+    let calibrateZone = "Calibrate Zone"
+    /// A zone member that was off when the run started (S255).
+    let calibrateAllOff = "Off, so it wasn't measured. Turn it on and choose Measure Again."
+    func calibrateZoneBring(_ name: String) -> String {
+        "Bring the Mac into “\(name)”: the microphone and the built-in speakers stay on it. "
+            + "Speakers outside the zone aren't measured."
+    }
+
+    /// Under a zone sheet's AirPlay line: the other places the shared delay moves.
+    func calibrateZoneAirPlayMoves(_ moves: CalibrateZoneAirPlayMoves) -> String? {
+        let zones = moves.zones.map { "“\($0)”" }
+        let named: String? = zones.count < 2 ? zones.first
+            : zones.dropLast().joined(separator: ", ") + " and " + (zones.last ?? "")
+        let places: String
+        switch (named, moves.noZone) {
+        case (nil, false): return nil
+        case (nil, true): places = "the AirPlay speakers in no zone"
+        case (let named?, false): places = "the AirPlay speakers in \(named)"
+        case (let named?, true): places = "the AirPlay speakers in \(named), and those in no zone"
+        }
+        return "AirPlay speakers share one delay, so a new AirPlay delay applies to \(places) too."
+    }
+
+    /// Why the button is off, under it and as its tooltip.
+    func calibrateAllUnavailable(_ blocker: CalibrateAllBlocker) -> String {
+        switch blocker {
+        case .noReference: "Calibration measures against the Mac's built-in speakers, and they aren't listed."
+        case .notPlaying(let missing): calibrationTurnOn(missing)
+        case .noOtherSpeaker: "Only the built-in speakers are on. Turn on another speaker to calibrate it."
+        case .onlyLeftOut: "The other speakers that are on are headphones or virtual outputs, which the "
+            + "microphone can't hear. Turn on another speaker, or choose Include Anyway for one in \(calibrateAll)."
+        case .referenceHeadphones: "Headphones are plugged into the Mac, so its built-in speakers are silent. "
+            + "Unplug them to calibrate."
+        case .busy: "Another calibration is still running."
+        }
+    }
+
+    /// The blocker as the sheet says it, where Include Anyway is right below.
+    func calibrateAllSheetBlocker(_ blocker: CalibrateAllBlocker) -> String {
+        guard blocker == .onlyLeftOut else { return calibrateAllUnavailable(blocker) }
+        return "The other speakers that are on are headphones or virtual outputs, which the microphone can't "
+            + "hear. Turn on another speaker, or choose Include Anyway below."
+    }
+
+    /// Why an output sits out of microphone calibration, under its row.
+    func calibrationLeftOut(_ reason: CalibrationLeftOut) -> String {
+        switch reason {
+        case .headphones: "Left out of microphone calibration: the microphone can't hear headphones."
+        case .virtual: "Left out of microphone calibration: a virtual output has nothing for the microphone to hear."
+        }
+    }
+
+    let calibrateAllLeftOutIncluded = "Included anyway: measured in this run."
+    let includeAnyway = "Include Anyway"
+    func includeAnywayLabel(of name: String) -> String { "\(includeAnyway), \(name)" }
+    func includeAnywayHelp(_ reason: CalibrationLeftOut) -> String {
+        switch reason {
+        case .headphones: "For a speaker that reports itself as headphones. It counts until you close this window."
+        case .virtual: "For a virtual output that passes the sound on to a speaker. "
+            + "It counts until you close this window."
+        }
+    }
+    let leaveOut = "Leave Out"
+    func leaveOutLabel(of name: String) -> String { "\(leaveOut), \(name)" }
+
+    func calibrateAllProgress(_ progress: CalibrateAllProgress) -> String {
+        switch progress {
+        case .preparing: "Fading the music out…"
+        case .listening(let name, 0): "Listening to \(name)…"
+        case .listening(let name, let sweep): "Listening to \(name), sweep \(sweep) of 2…"
+        case .searching(let name): "Listening to \(name), sweep 1 of 2. AudioSync doesn't know this "
+            + "speaker's delay yet, so this can take up to a minute."
+        }
+    }
+
+    let calibrateAllCurrentColumn = "Current"
+    let calibrateAllNone = "None"
+    let calibrateAllApply = "Apply"
+    let calibrateAllApplyHelp = "Sets the new delays of the speakers that were measured clearly. Undo puts them all back."
+    let calibrateAllUndo = "Undo"
+    let calibrateAllUndoLabel = "Undo the new delays"
+    let calibrateAllUndoHelp = "Puts back every delay that Apply replaced."
+    let calibrateAllClose = "Close"
+    let calibrateAllDone = "Done"
+    let measureAgain = "Measure Again"
+    func measureAgainLabel(of name: String) -> String { "\(measureAgain), \(name)" }
+
+    /// The kind line under a row's name.
+    func calibrateAllKind(_ kind: CalibrateAllKind, reference: Bool) -> String {
+        if reference { return "Reference" }
+        switch kind {
+        case .local: return "Local speaker"
+        case .cast: return "Google Cast"
+        case .airPlay: return "AirPlay"
+        }
+    }
+
+    /// A stored delay in a row: signed for a local offset, plain for a
+    /// Cast offset and the AirPlay delay.
+    func calibrateAllValue(_ ms: Double, kind: CalibrateAllKind) -> String {
+        kind == .local ? offsetValue(ms: ms) : delayValue(ms: ms)
+    }
+
+    /// A measured delay with its uncertainty: "+50 ms ± 3 ms".
+    func calibrateAllMeasured(_ ms: Double, uncertaintyMs: Double, kind: CalibrateAllKind) -> String {
+        "\(calibrateAllValue(ms, kind: kind)) \(calibrateAllUncertainty(uncertaintyMs))"
+    }
+
+    /// "± 3 ms", rounded up to whole milliseconds and at least 1, as on Windows.
+    private func calibrateAllUncertainty(_ ms: Double) -> String {
+        "± \(Int(max(ms.rounded(.up), 1))) \(millisecondsUnit)"
+    }
+
+    /// What the New column says about a row.
+    func calibrateAllResult(_ row: CalibrateAllSheet.Row) -> String {
+        if row.off { return calibrateAllOff }
+        let kind = row.speaker.kind
+        switch row.result {
+        case .reference:
+            return "The other speakers are measured against it."
+        case .notMeasured:
+            return "Not measured."
+        case .certain(let ms, let u, let clamped):
+            let value = calibrateAllMeasured(ms, uncertaintyMs: u, kind: kind)
+            return clamped ? value + ". " + calibrateAllClamped : value
+        case .uncertain(let ms, let u):
+            return calibrateAllMeasured(ms, uncertaintyMs: u, kind: kind) + ". " + calibrateAllUncertain
+        case .refused(let failure):
+            return calibrateAllRefusal(failure) + " The delay stays."
+        }
+    }
+
+    let calibrateAllClamped = "The end of the range, so this speaker stays a little out of sync."
+    let calibrateAllUncertain = "The two sweeps differ too much, so the delay stays. Click Measure Again."
+    let calibrateAllMeasuredClearly = "Measured clearly"
+    let calibrateAllNotClear = "Not clear"
+
+    /// Under a result card's new delay: "± 2 ms · was +12 ms".
+    func calibrateAllWas(uncertaintyMs: Double, was current: String) -> String {
+        "\(calibrateAllUncertainty(uncertaintyMs)) · was \(current)"
+    }
+
+    /// A card's note when nothing new was measured: "Not measured. · was +12 ms".
+    func calibrateAllNote(_ note: String, was current: String) -> String {
+        "\(note) · was \(current)"
+    }
+
+    /// The line under a result card's new delay, nil for a plain clear one.
+    func calibrateAllCardNote(_ row: CalibrateAllSheet.Row) -> String? {
+        if row.off { return calibrateAllOff }
+        switch row.result {
+        case .certain(_, _, let clamped): return clamped ? calibrateAllClamped : nil
+        case .uncertain: return calibrateAllUncertain
+        default: return calibrateAllResult(row)
+        }
+    }
+
+    /// Why a row's sweeps were refused, in a few words for the sheet.
+    func calibrateAllRefusal(_ failure: CalibrationFailure) -> String {
+        switch failure {
+        case .tooQuiet(.reference): "The microphone barely heard the built-in speakers."
+        case .tooQuiet: "The microphone barely heard this speaker. Turn it up or move the microphone closer."
+        case .clipped: "The microphone was overloaded. Turn the volume down or move the microphone away."
+        case .ambiguousEcho: "An echo or another sound was almost as loud as the sweep."
+        case .tooShort: "The recording was too short."
+        case .tooLong: "The recording would be too long at the microphone's sample rate."
+        case .implausible: "Too far apart from the built-in speakers to measure."
+        default: calibrationFailure(failure)
+        }
+    }
+
+    /// The shared AirPlay delay under the rows (S237).
+    func calibrateAllAirPlay(_ airPlay: CalibrateAllSheet.AirPlay) -> String {
+        let current = airPlay.oldMs.map { delayValue(ms: $0) } ?? calibrateAllNone.lowercased()
+        switch airPlay.state {
+        case .noneCertain:
+            return "No AirPlay speaker was measured clearly, so the AirPlay delay stays at \(current)."
+        case .certain, .spread:
+            let source = airPlay.certainRows > 1
+                ? ", the middle value of \(airPlay.certainRows) AirPlay speakers, "
+                    + "which are \(delayValue(ms: airPlay.spreadMs)) apart" : ""
+            let line = "AirPlay delay: was \(current). New: \(delayValue(ms: airPlay.newMs))\(source)."
+            guard airPlay.state == .spread else { return line }
+            return line + " The AirPlay speakers differ by \(delayValue(ms: airPlay.spreadMs)). "
+                + "AudioSync sets one delay for all AirPlay speakers, so they can't all line up exactly."
+        }
+    }
+
+    /// Why a run stopped, as a sentence of its own.
+    func calibrateAllEndReason(_ end: CalibrateAllEnd) -> String {
+        switch end {
+        case .cancelled: "Calibration cancelled."
+        case .speakersChanged: "The speakers changed during the measurement."
+        case .speakerOff: "A speaker was turned off during the measurement."
+        case .sourceChanged: "The source was switched during the measurement."
+        case .rateChanged: "The audio's sample rate changed during the measurement."
+        case .delaysChanged: "A delay changed during the measurement."
+        // A run over all speakers has no one speaker to call "this speaker".
+        case .failed(.notPlaying(let missing)):
+            "Turn on \(calibrationNeeds(missing, speaker: "another speaker")) to calibrate."
+        case .failed(let failure): calibrationFailure(failure)
+        }
+    }
+
+    /// The sheet's status line.
+    func calibrateAllLine(_ line: CalibrateAllLine) -> String {
+        switch line {
+        case .ended(let end):
+            return calibrateAllEndReason(end) + " No delay was changed."
+        case .againEnded(let name, let end):
+            return calibrateAllEndReason(end) + " The row for \(name) wasn't changed."
+        case .changedSinceMeasured:
+            return "A delay changed after the measurement, so nothing was applied. Calibrate again."
+        case .cannotMeasureAgain(let name, let missing):
+            return "Turn on \(calibrationNeeds(missing, speaker: name)) to measure it again."
+        case .applied:
+            return "New delays applied."
+        case .undone:
+            return "The delays are back to what they were."
+        }
+    }
+
+    let calibrateAllNothingCertain = "No speaker was measured clearly, so there is nothing to apply."
+    func calibrateAllFinished(clear: Int, total: Int) -> String {
+        "Calibration finished. \(clear) of \(total) measured clearly."
+    }
+
+    // MARK: Main menu
+
+    let menuAbout = "About AudioSync"
+    let menuCheckForUpdates = "Check for Updates…"
+    let menuCheckUpdatesAutomatically = "Check for Updates Automatically"
+    let aboutCopyright = "Copyright © 2026 Yasser Sutojoyo Kusumo"
+    let aboutLicense = "Licensed under GPL-3.0-or-later. Comes with no warranty."
+    let menuServices = "Services"
+    let menuHide = "Hide AudioSync"
+    let menuHideOthers = "Hide Others"
+    let menuShowAll = "Show All"
+    let menuEdit = "Edit"
+    let menuUndo = "Undo"
+    let menuRedo = "Redo"
+    let menuCut = "Cut"
+    let menuCopy = "Copy"
+    let menuPaste = "Paste"
+    let menuSelectAll = "Select All"
+    let menuSpeakers = "Speakers"
+    let menuTurnStreamingOn = "Turn Streaming On"
+    let menuTurnStreamingOff = "Turn Streaming Off"
+    let menuCloseWindow = "Close Window"
+    /// Command-S: applies the delay typed in an open delay panel.
+    let menuApplyDelay = "Apply Typed Delay"
+    let menuWindow = "Window"
+    let menuMinimize = "Minimize"
+    let menuZoom = "Zoom"
+    let menuBringAllToFront = "Bring All to Front"
+    let menuHelp = "Help"
+    /// The AudioSync menu (Command-comma) and the gear menu: opens the Settings window.
+    let settingsMenu = "Settings…"
+    let settingsTitle = "Settings"
+    /// Settings box titles; the other boxes take menuSpeakers and setupTitle.
+    let settingsGeneral = "General"
+    let settingsUpdates = "Updates"
+    /// Group titles in the Speakers menu and the gear menu, next to streamingSwitch and menuSpeakers.
+    let menuGroupFind = "Find"
+    let menuGroupArrange = "Arrange"
+    let menuGroupDelay = "Delay"
+    let menuGroupWindows = "Windows"
+
+    // MARK: Sources
+
+    let sourceLabel = "Audio Source"
+    let sourceSystem = "All System Audio"
+    let sourceInputsHeader = "Input Devices"
+    let sourceInputDevice = "Input Device"
+    let sourceNotConnectedNote = "not connected"
+    /// The chosen input device while it is unplugged; `name` is the one it
+    /// had when last seen, nil when none was remembered.
+    func sourceNotConnected(_ name: String?) -> String { "\(name ?? sourceInputDevice) (\(sourceNotConnectedNote))" }
+    let sourceNotRunningNote = "not running"
+    /// An app in the several-apps menu; one that isn't running is there only
+    /// because the last mix keeps it.
+    func sourceMixAppName(_ name: String, running: Bool) -> String {
+        running ? name : "\(name) (\(sourceNotRunningNote))"
+    }
+    let inputChannelsLabel = "Input Channels"
+    /// One channel pair of an input device, counted from 1 as the device's
+    /// own settings count them.
+    func inputChannelPair(_ pair: InputChannelPair) -> String {
+        pair.isMono ? "Channel \(pair.left + 1)" : "Channels \(pair.left + 1)-\(pair.right + 1)"
+    }
+    /// The level meter under the source while an input device is captured,
+    /// for VoiceOver: its name, and how full the bar is in steps of 10%.
+    let inputLevel = "Input level"
+    func inputLevelValue(_ spokenPercent: Int) -> String { percent(spokenPercent) }
+    /// The note under the source while an input device plays and an AirPlay
+    /// speaker is on (`LiveInputAirPlayHint`); `tenths` of a second, shown as "1.8".
+    func liveInputAirPlayHint(tenths: Int) -> String {
+        "AirPlay adds a \(tenths / 10).\(tenths % 10) s delay to every speaker. For live sound, use only speakers on this Mac."
+    }
+    let sourceSeveralApps = "Several Apps"
+    let sourceMixOnly = "Only the Checked Apps"
+    let sourceMixAllExcept = "All Apps Except the Checked Ones"
+    let sourceMixEmpty = "No other apps are running."
+    /// The picker's name for a mix source, from its apps' names; the Windows
+    /// app words "all except" the same way.
+    func sourceMixName(_ mode: AppMixMode, _ names: [String]) -> String {
+        let list = names.joined(separator: ", ")
+        return mode == .only ? list : "All Apps Except \(list)"
+    }
+    let microphoneDenied = """
+        AudioSync isn't allowed to use the microphone or other inputs.
+        Open System Settings → Privacy & Security → Microphone and turn on AudioSync.
+        """
+
+    func sourceTerminated(name: String) -> String {
+        "\(name) quit, so streaming has stopped."
+    }
+
+    /// The source app quit and the source became the whole system (S227);
+    /// `started` false when streaming couldn't start with it.
+    func sourceSwitchedToSystem(name: String, started: Bool) -> String {
+        started ? "\(name) quit, so AudioSync switched to \(sourceSystem)."
+            : "\(name) quit, so the source is now \(sourceSystem), but streaming couldn't start with it. "
+                + "Turn streaming on again to retry."
+    }
+    /// A source or channel pair picked while streaming couldn't start, so
+    /// the one before it plays on (S141); names as the source picker shows them.
+    func sourceSwitchFailed(new: String, old: String) -> String {
+        "Couldn't start \(new), still on \(old)."
+    }
+
+    /// An AirPlay speaker was switched off by AudioSync, not by the user.
+    /// `onThisMac`: the phone turned it on, and a PIN or password is entered only at the Mac.
+    func airPlayTurnedOff(name: String, reason: AirPlayPairing.Reason, onThisMac: Bool = false) -> String {
+        let place = onThisMac ? " on this Mac" : ""
+        switch reason {
+        case .unreachable:
+            return "\(name) couldn't be reached, so it's off. "
+                + "Check that the speaker is on and on the same network, then turn it on again."
+        case .needsPin:
+            return "\(name) needs pairing with a code, so it's off. Turn it on again\(place) to pair."
+        case .needsPassword:
+            return "\(name) asks for a password, so it's off. Turn it on again\(place) to enter it. "
+                + "To use it without a password, set Allow Speaker & TV Access on the speaker (or in the Home app) "
+                + "to “Anyone on the Same Network” and turn off Require Password."
+        case .stillNeedsCode:
+            return "\(name) still asks for a code or password after pairing, so it's off. "
+                + "On the speaker (or in the Home app), check that Allow Speaker & TV Access is set to "
+                + "“Anyone on the Same Network”, then turn \(name) on again in AudioSync."
+        }
+    }
+
+    /// A receiver that asked for no PIN or password turned the session down
+    /// before any pairing step, so the cause stays unnamed.
+    func nativeAirPlayNotAccepted(name: String) -> String {
+        "\(name) didn't accept the connection, so it's off. Turn it on again to try once more."
+    }
+
+    /// A native speaker kept answering busy until the sender gave up.
+    func nativeAirPlayBusy(name: String) -> String {
+        "\(name) seems to be busy with another device, so it's off. Turn it on again once it's free."
+    }
+
+    /// A native speaker kept turning the session down until the sender gave up.
+    func nativeAirPlayRefused(name: String) -> String {
+        "\(name) declined the stream, so it's off. Turn it on again to try once more."
+    }
+
+    /// A native speaker turned off because it asks for a PIN or password;
+    /// nil for every other reason. `unasked`: it turned the session down
+    /// before asking for either.
+    func nativeAirPlayAsksForCode(name: String, reason: NativeTurnOff, unasked: Bool, onThisMac: Bool = false) -> String? {
+        switch reason {
+        case .needsCode where unasked: return nativeAirPlayNotAccepted(name: name)
+        case .needsCode: return airPlayTurnedOff(name: name, reason: .needsPin, onThisMac: onThisMac)
+        case .needsPassword: return airPlayTurnedOff(name: name, reason: .needsPassword, onThisMac: onThisMac)
+        case .unreachable, .busy, .refused, .cantPlay, .needsAirPlay2, .timingUnavailable, .playsThroughSpeakers,
+             .receiverUnverified, .memberNeedsPassword, .cancelled, .pairingFailed, .stillNeedsCode:
+            return nil
+        }
+    }
+
+    /// A PIN pairing ended without pairing, for another reason than a wrong
+    /// PIN (which asks again).
+    func nativeAirPlayPairingFailed(name: String) -> String {
+        "Pairing with \(name) didn't finish, so it's off. "
+            + "To try again, turn it on and enter the code it shows."
+    }
+
+    /// AudioSync's own AirPlay sender couldn't start (or browse the network
+    /// for speakers), or stopped after an internal error; the notice has Retry.
+    let nativeAirPlayStopped = "AirPlay stopped or couldn't start. Click Retry to try again. "
+        + "If it couldn't start, AudioSync tries again on its own every 10 seconds. "
+        + "If it keeps happening, restart AudioSync."
+
+    /// AudioSync's own AirPlay sender can't play to this receiver.
+    func nativeAirPlayCantPlay(name: String) -> String {
+        "AudioSync can't play to \(name), so it's off."
+    }
+
+    /// The receiver plays only AirPlay 2, and this launch runs without it.
+    func nativeAirPlayNeedsAirPlay2(name: String) -> String {
+        "\(name) needs AirPlay 2, which this launch of AudioSync runs without, so it's off."
+    }
+
+    /// The receiver turned NTP timing down, and PTP timing isn't available.
+    func nativeAirPlayTimingUnavailable(name: String) -> String {
+        "\(name) needs PTP timing, which isn't available, so it's off. "
+            + "If another app is using port 319 or 320, close it, then turn the speaker on again."
+    }
+
+    /// A paired receiver's pair-verify signature didn't check out (P56).
+    func nativeAirPlayReceiverUnverified(name: String) -> String {
+        "\(name) didn't answer as the speaker you paired, so it's off. "
+            + "If it's yours, use Forget Pairing and turn it on to pair again with its code."
+    }
+
+    /// PTP port 319 or 320 couldn't be bound (P158): the AirPlay 2 speakers
+    /// that need PTP timing can't play until it is free.
+    let nativeAirPlayPtpPortsTaken = "Another app is using port 319 or 320, so AirPlay speakers that need "
+        + "PTP timing can't play. Close that app, then turn the speaker on again."
+
+    /// A newer AudioSync wrote the pairings file, its folder couldn't be found, or a write of it failed.
+    let nativeAirPlayPairingsNotSaved = "AudioSync couldn't save your AirPlay pairings, so pairings you add or "
+        + "forget now won't be kept after AudioSync quits. If the disk is full, free up some space."
+    /// The pairings file was in the wrong format, so the next pairing replaces it.
+    let nativeAirPlayPairingsIgnored = "AudioSync couldn't read your AirPlay pairings when it started, "
+        + "so AirPlay speakers you paired ask for a code again."
+
+    /// Every AirPlay 2 place is taken: this one stays on and starts once
+    /// one of them stops (P169, S285).
+    func nativeAirPlayTooManyAirPlay2(name: String) -> String {
+        "AudioSync plays up to \(ASC_AIRPLAY2_SESSIONS) AirPlay 2 speakers at once, so \(name) waits. It starts once one of them stops."
+    }
+    /// A speaker that takes only PTP while AudioSync runs PTP for speakers
+    /// on another network: it stays on and starts once those stop (S285).
+    func nativeAirPlayPtpOtherNetwork(name: String) -> String {
+        "\(name) waits while AudioSync plays to AirPlay 2 speakers on another network. Turn those speakers off and \(name) starts."
+    }
+    /// That notice's title.
+    func nativeAirPlayWaitingTitle(name: String) -> String { "\(name) waiting" }
+    /// Under the name of a speaker waiting for an AirPlay 2 place.
+    let waitingForAirPlay2 = "Waiting: too many AirPlay 2 speakers"
+    /// Under the name of a speaker waiting for PTP (S285).
+    let waitingForPtp = "Waiting: AirPlay 2 speakers on another network"
+    /// From its second failed retry, an AirPlay speaker the sender keeps
+    /// trying to reach stays on, with this notice (S222).
+    func nativeAirPlayRetrying(_ problem: NativeSpeakerEvent.Problem, name: String) -> String {
+        switch problem {
+        case .connectionLost: return "\(name) lost its connection. AudioSync keeps trying to reconnect."
+        case .busy: return "\(name) seems to be playing from another device. AudioSync keeps trying."
+        case .refused, .incompatible: return "\(name) declined the stream. AudioSync tries again shortly."
+        default: return "\(name) isn't responding. AudioSync keeps trying to reach it."
+        }
+    }
+    /// That notice's title.
+    func nativeAirPlayReconnectingTitle(name: String) -> String { "\(name) reconnecting" }
+    /// Under its name meanwhile.
+    let reconnecting = "Reconnecting…"
+    /// Under the name of a speaker switched on whose password prompt is
+    /// queued or open (S223).
+    let waitingForPassword = "Waiting for the password"
+    /// Under the name of a speaker switched on whose PIN prompt is queued or
+    /// open: the speaker's name, as not every one is a TV (S223).
+    func enterCodeShown(on name: String) -> String { "Enter the code shown on \(name)" }
+    /// Under the name of an AirPlay speaker that is not announced on the
+    /// network right now; it starts by itself once it is again (P215).
+    let notOnNetwork = "Not on the network right now, plays once it's back"
+    /// `notOnNetwork` in a menu bar panel row, where the full text is cut;
+    /// the row's tooltip and VoiceOver keep the full text.
+    let notOnNetworkShort = "Not on the network"
+    /// An Apple TV whose home theater group AudioSync plays to (P177).
+    func nativeAirPlayPlaysThroughSpeakers(name: String) -> String {
+        "\(name) plays through its home theater speakers, and AudioSync already plays to them, so it's off. "
+            + "Turn the group off to play to the Apple TV itself."
+    }
+    /// A home theater group whose Apple TV AudioSync plays to by itself (P177).
+    func nativeAirPlayAppleTVPlays(name: String) -> String {
+        "AudioSync already plays to \(name)'s Apple TV, so the group is off. Turn the Apple TV off to play to the group."
+    }
+    /// A member of a stereo pair or home theater group asks for a password
+    /// AudioSync doesn't have, so the group went off (P176).
+    func nativeAirPlayMemberNeedsPassword(member: String, target: String) -> String {
+        "\(member) in \(target) asks for a password, so \(target) is off. Turn \(target) on again to enter it."
+    }
+    /// A member of a stereo pair or home theater group switched on by
+    /// itself while the group is listed (P176).
+    func nativeAirPlayPlaysInGroup(name: String, group: String) -> String {
+        "\(name) plays as part of \(group), so it stays off by itself."
+    }
+
+    // MARK: AirPlay pairing prompt
+
+    func pairTitle(name: String) -> String { "Pair with \(name)" }
+
+    func pairPasswordMessage(name: String) -> String {
+        "\(name) is protected by a password. Enter the password set for it "
+            + "in the Home app or in the speaker's settings. "
+            + "Cancel turns the speaker off; turn it on again to retry."
+    }
+
+    /// The password prompt again, after the receiver turned the last one down.
+    func pairWrongPasswordMessage(name: String) -> String {
+        "\(name) didn't accept that password. Enter the password set for it "
+            + "in the Home app or in the speaker's settings. "
+            + "Cancel turns the speaker off; turn it on again to retry."
+    }
+
+    /// AudioSync's own AirPlay sender pairs a receiver with the PIN it shows:
+    /// an Apple TV, or a receiver reached over AirPlay 2. A receiver that asks
+    /// for a code every time keeps no pairing, so its prompt doesn't promise one.
+    func nativePairPINMessage(name: String, everyTime: Bool = false) -> String {
+        let pair = everyTime ? "Enter it to pair. " : "Enter it to pair; after that, it connects without a code. "
+        return "\(name) shows a 4-digit code on its screen. " + pair
+            + "Cancel turns the speaker off; turn it on again to retry."
+    }
+
+    /// The native PIN prompt again, after a PIN that didn't work (the
+    /// receiver shows a code again, a new one or the same).
+    func nativePairWrongPINMessage(name: String) -> String {
+        "That code didn't work. Enter the code \(name) shows now. "
+            + "Cancel turns the speaker off; turn it on again to retry."
+    }
+
+    /// In an AirPlay speaker's menu while AudioSync keeps its PIN pairing.
+    let forgetPairing = "Forget Pairing"
+    let forgetPairingHelp = "Removes the pairing AudioSync keeps, so the speaker asks for a code the next time you turn it on"
+    /// In an AirPlay speaker's menu while AudioSync holds the password typed
+    /// for it, until AudioSync quits.
+    let forgetPassword = "Forget Password"
+    let forgetPasswordHelp = "Removes the password AudioSync holds, so the speaker asks for it the next time you turn it on"
+    let pairPINOnlyPlaceholder = "Code"
+    let pairPasswordPlaceholder = "Password"
+    func pairPINFieldLabel(name: String) -> String { "Code for \(name)" }
+    func pairPasswordFieldLabel(name: String) -> String { "Password for \(name)" }
+    let pair = "Pair"
+
+    /// Capture stopped on its own while streaming.
+    func sourceStopped(_ error: SourceCapture.CaptureError, input: String) -> String {
+        switch error {
+        case .inputDisconnected, .inputNotFound:
+            return "\(deviceName(input)) was disconnected, so streaming has stopped. "
+                + "Plug it in again, or pick another source."
+        case .inputHandsFree:
+            return inputHandsFree
+        case .appNotRunning(let bundleID):
+            return sourceTerminated(name: SourceApps.name(for: bundleID))
+        case .appsNotRunning, .ownProcessUnknown, .tapNotCreated, .formatUnusable, .aggregateDeviceFailed,
+             .ioProcNotStarted, .inputBusy:
+            return "AudioSync lost the audio from the selected source, so streaming has stopped. "
+                + "Turn streaming on again, or pick another source."
+        }
+    }
+
+    // MARK: Alerts
+
+    /// A start AudioSync made on its own, with every speaker off.
+    let chooseSpeakerBeforeStart = "Turn on at least one speaker first (under This Mac or Connected Speakers)."
+    /// The speaker list while streaming with every speaker off (`StreamingPolicy.showsNoSpeakerOn`).
+    let noSpeakerOn = "No speaker is on. The first one you turn on starts playing."
+
+    /// Streaming is on but the source hasn't played anything yet.
+    /// `permissionInDoubt`: a tap source, and no tap in this app run has heard sound.
+    func waitingForAudio(_ app: String?, permissionInDoubt: Bool = false) -> String {
+        let permission = permissionInDoubt
+            ? " If it doesn't, turn on AudioSync in System Settings → Privacy & Security → "
+                + "Screen & System Audio Recording, under “System Audio Recording Only”."
+            : ""
+        if let app { return "Waiting for audio from \(app). Start playback there and it streams right away." + permission }
+        return "Waiting for audio. Play something and it streams right away." + permission
+    }
+    /// Streaming runs but no audio arrives; `source` names the app, nil for
+    /// the whole system or an input device.
+    func captureNotWorking(_ source: String?) -> String {
+        "AudioSync isn't getting any audio from \(source ?? "the selected source"). Open System Settings → "
+            + "Privacy & Security → Screen & System Audio Recording and turn on AudioSync under "
+            + "“System Audio Recording Only”, then play something. If you just allowed access, "
+            + "turn streaming off and on again."
+    }
+    /// A session that heard sound gets only silence while its source plays
+    /// (S451); `input` for an input device, whose permission reads as off.
+    func captureSilenced(_ source: String?, input: Bool) -> String {
+        if input {
+            return "AudioSync is no longer allowed to use the microphone, so every speaker is silent. "
+                + "Turn on AudioSync in System Settings → Privacy & Security → Microphone, "
+                + "then turn streaming off and on again."
+        }
+        let from = source.map { "\($0) while \($0) is playing" } ?? "the selected source while it is playing"
+        return "AudioSync gets only silence from \(from), so every speaker is silent. "
+            + "If its own volume is at zero, turn it up. If you turned off AudioSync in System Settings → "
+            + "Privacy & Security → Screen & System Audio Recording, turn it on again under “System Audio Recording Only”, then turn streaming off and on again."
+    }
+
+    let unknownDevice = "Unknown device"
+    /// A device's name, or a placeholder when Core Audio can't read it.
+    func deviceName(_ name: String) -> String { name.isEmpty ? unknownDevice : name }
+
+    /// A local output that stalled again before playing 5 s; it stays on (S334).
+    func outputLost(name: String) -> String { "\(name) was disconnected. It plays again as soon as it's back." }
+
+    /// A local output another process holds in hog mode; it stays on (S331). Windows' words
+    /// without its Sound settings step: hog mode is the holding app's choice, with no Mac setting.
+    func outputBusy(name: String) -> String {
+        "\(name) is in use by another app. Close that app. AudioSync plays to it as soon as it's free."
+    }
+
+    /// A local output that ran away again within 30 s of its reopen; it plays on (S347).
+    func outputLinkStruggling(name: String) -> String {
+        "\(name)'s link is struggling. Turn the speaker off and on again."
+    }
+
+    /// `refusedCaptureRate`: the capture rate (Hz) when that was the reason.
+    func outputCouldNotStart(names: [String], refusedCaptureRate: Double? = nil) -> String {
+        let shown = listed(names)
+        let deviceName = shown.isEmpty ? unknownDevice : shown
+        let one = names.count <= 1
+        let first = "\(deviceName) couldn't start, so " + (one ? "it's off. " : "they're off. ")
+        let again = one ? "turn the speaker on again." : "turn the speakers on again."
+        guard let rate = refusedCaptureRate else {
+            return first + "Another app may be using " + (one ? "it" : "them") + " exclusively. "
+                + "Close that app and " + again
+        }
+        let highest = kiloHertz(Double(EngineParts.highestCaptureRate))
+        return first + "AudioSync captures the audio at \(kiloHertz(rate)), but plays it on local speakers "
+            + "only up to \(highest). In Audio MIDI Setup, set your Mac's output device, or the input device "
+            + "you stream from, to \(highest) or lower, then " + again
+    }
+
+    /// "384 kHz", "352.8 kHz".
+    private func kiloHertz(_ hz: Double) -> String {
+        String(format: "%g kHz", (hz / 100).rounded() / 10)
+    }
+
+    func streamingStartMessage(for error: Error, input: String) -> String {
+        if let reason = error as? SourceCapture.CaptureError {
+            return captureFailureText(reason, input: input)
+        }
+        if let reason = error as? StreamEngine.StartError {
+            switch reason {
+            case .coreUnavailable: return engineSetupFailed
+            }
+        }
+        return captureFailed
+    }
+
+    /// The audio core (linked into the app) couldn't build a session's parts,
+    /// most likely because memory ran out.
+    let engineSetupFailed = "AudioSync couldn't set up its audio engine, so streaming can't start. "
+        + "Quit AudioSync and open it again. If it keeps happening, restart your Mac."
+
+    private let inputHandsFree = "The selected input is a Bluetooth headset's hands-free microphone, "
+        + "which AudioSync doesn't record from. Pick another source."
+
+    private let captureFailed = "AudioSync couldn't capture audio from the selected source. "
+        + "Turn streaming off and on again, or pick another source. If it keeps happening, restart your Mac."
+
+    /// Status codes stay out of these messages; the caller logs them.
+    private func captureFailureText(_ error: SourceCapture.CaptureError, input: String) -> String {
+        switch error {
+        case .appNotRunning(let bundleID):
+            return "\(SourceApps.name(for: bundleID)) is \(sourceNotRunningNote). Open it first, or pick another source."
+        case .appsNotRunning(let bundleIDs):
+            return "\(listed(bundleIDs.map(SourceApps.name(for:)))) are \(sourceNotRunningNote). "
+                + "Open them first, or pick another source."
+        case .ownProcessUnknown:
+            return "AudioSync couldn't capture its own sound to leave it out. Quit AudioSync and open it again."
+        case .tapNotCreated, .formatUnusable, .aggregateDeviceFailed, .ioProcNotStarted, .inputBusy:
+            return captureFailed
+        case .inputNotFound, .inputDisconnected:
+            return "\(deviceName(input)) is not connected. Plug it in, or pick another source."
+        case .inputHandsFree:
+            return inputHandsFree
+        }
+    }
+
+    // MARK: Speakers, groups, menu bar
+
+    let thisMacSection = "This Mac"
+    let connectedSection = "Connected Speakers"
+    /// `hint`: the Local Network hint on screen, which carries the network
+    /// advice in its place. `localNetworkRefused`: Local Network access was
+    /// asked for and refused (`LocalNetworkHint.accessRefused`); until then
+    /// the advice leaves it out.
+    func airPlayNoneFound(hint: LocalNetworkHint = .none, localNetworkRefused: Bool = false) -> String {
+        UIStrings.withNetworkAdvice("No AirPlay speakers found yet.", hint: hint, refused: localNetworkRefused)
+    }
+    private static func withNetworkAdvice(_ text: String, hint: LocalNetworkHint, refused: Bool) -> String {
+        guard hint == .none else { return text }
+        return text + " " + (refused ? networkAdvice : sameNetworkAdvice)
+    }
+    private static let sameNetworkAdvice = "Make sure this Mac is on the same network as your speakers."
+    private static let networkAdvice = "Make sure this Mac is on the same network as your speakers, "
+        + "and that AudioSync is allowed in System Settings → Privacy & Security → Local Network."
+    let thisMacNone = "No built-in output"
+    /// Connected Speakers while AirPlay discovery takes its first look.
+    let lookingForSpeakers = "Looking for speakers…"
+    let lookingForAirPlaySpeakers = "Looking for AirPlay speakers…"
+
+    /// A connected speaker's kind of output: the type icon's tooltip and part
+    /// of the row's VoiceOver label. `airPlay2`: an AirPlay speaker the
+    /// sender reaches over AirPlay 2.
+    func speakerTag(_ tag: SpeakerTag, airPlay2: Bool = false) -> String {
+        switch tag {
+        case .airplay: return airPlay2 ? "AirPlay 2" : "AirPlay"
+        case .systemAirPlay: return "macOS AirPlay"
+        case .cast: return "Google Cast"
+        case .builtIn: return "Built-in"
+        case .bluetooth: return "Bluetooth"
+        case .usb: return "USB"
+        case .hdmi: return "HDMI"
+        case .displayPort: return "DisplayPort"
+        case .thunderbolt: return "Thunderbolt"
+        case .firewire: return "FireWire"
+        case .pci: return "PCI"
+        case .avb: return "AVB"
+        case .virtual: return "Virtual"
+        case .aggregate: return "Aggregate"
+        case .other: return "Other"
+        }
+    }
+
+    /// A speaker row's VoiceOver label: "Kitchen, Bluetooth".
+    func speakerLabel(name: String, tag: String?) -> String {
+        guard let tag else { return name }
+        return "\(name), \(tag)"
+    }
+    /// The same, followed for a renamed speaker by the name it reports.
+    func speakerLabel(name: String, tag: String?, renamedFrom system: String?) -> String {
+        let label = speakerLabel(name: name, tag: tag)
+        guard let system else { return label }
+        return "\(label), \(renamedSpeaker(system: system))"
+    }
+
+    // The output device volume hint (DeviceVolume.swift, S198 to S200),
+    // worded like the Windows app's with macOS in place of Windows.
+
+    /// A whole percent as the user's locale writes it: "13%".
+    func percent(_ value: Int) -> String {
+        (Double(value) / 100).formatted(.percent.precision(.fractionLength(0)).locale(locale))
+    }
+
+    /// The hint under a switched-on local output's volume slider, and the
+    /// tooltip of the compact panel's glyph.
+    func deviceVolumeHint(_ hint: DeviceVolumeHint) -> String {
+        switch hint {
+        case .low(let n): return "macOS volume is \(percent(n))"
+        case .muted: return "Muted in macOS"
+        case .mutedAndLow(let n): return "Muted in macOS, volume \(percent(n))"
+        }
+    }
+
+    /// The one-click fix after the hint.
+    func deviceVolumeFix(_ hint: DeviceVolumeHint) -> String {
+        switch hint {
+        case .low: return "Set to \(percent(DeviceVolumeHint.fixPercent))"
+        case .muted: return "Unmute"
+        case .mutedAndLow: return "Unmute at \(percent(DeviceVolumeHint.fixPercent))"
+        }
+    }
+
+    /// The hint's VoiceOver label, naming the output:
+    /// "MacBook Pro Speakers: macOS volume is 13%".
+    func deviceVolumeHintLabel(_ hint: DeviceVolumeHint, name: String) -> String {
+        switch hint {
+        case .low(let n): return "\(name): macOS volume is \(percent(n))"
+        case .muted: return "\(name): muted in macOS"
+        case .mutedAndLow(let n): return "\(name): muted in macOS, volume \(percent(n))"
+        }
+    }
+
+    /// The fix's VoiceOver label: its visible text first, so Voice Control
+    /// finds it by what is on screen, then the output.
+    func deviceVolumeFixLabel(_ hint: DeviceVolumeHint, name: String) -> String {
+        "\(deviceVolumeFix(hint)), \(name)"
+    }
+
+    /// The tooltip of the hint in the main window.
+    let deviceVolumeHelp = "macOS has its own volume for each output, and it limits AudioSync's slider."
+
+    let noSpeakers = "No speakers found"
+    /// The menu bar panel's list with no speaker and nothing hidden: "No
+    /// speakers found" waits for AirPlay's first look, as on Windows.
+    /// `airPlayStarting`: the sender isn't up yet and nothing stopped it.
+    func panelNoSpeakers(airPlayFoundNone: Bool, airPlayStarting: Bool, networkEmpty: String) -> String {
+        airPlayFoundNone ? noSpeakers : airPlayStarting ? lookingForSpeakers : networkEmpty
+    }
+    let masterVolume = "Master volume"
+    let muteMaster = "Mute Master Volume"
+    let unmuteMaster = "Unmute Master Volume"
+    let openApp = "Open AudioSync"
+    let quitApp = "Quit AudioSync"
+    /// The menu bar panel's short Quit, next to Open AudioSync.
+    let quitShort = "Quit"
+    let equalizer = "Equalizer"
+    let zones = "Zones"
+    /// The gear menu and the Speakers menu (Command-N).
+    let newZone = "New Zone from Active Speakers…"
+    let newZoneTitle = "New Zone"
+    let newZoneMessage = "The speakers that are on right now move into this zone. A speaker in another zone leaves that zone."
+    /// New Zone… in a speaker's Move to Zone menu.
+    func newZoneForSpeaker(_ name: String) -> String { "\(name) moves into this zone." }
+    let newZonePlaceholder = "Living room, Kitchen…"
+    /// VoiceOver label of the name field in the New Zone alert.
+    let newZoneFieldLabel = "Zone name"
+    let newZoneNeedsSpeakers = "Turn on the speakers you want in the zone first, then create it."
+    /// A speaker's ⋯ menu: a submenu of the other zones, then New Zone….
+    let moveToZone = "Move to Zone"
+    let newZoneItem = "New Zone…"
+    let removeFromZone = "Remove from Zone"
+    let renameZone = "Rename…"
+    func renameMessage(_ name: String) -> String { "Enter a new name for “\(name)”." }
+    let deleteZone = "Delete Zone"
+    /// A zone header's count; `zoneWaiting` follows it when a member waits.
+    func zoneCount(on: Int, of total: Int) -> String { "\(on) of \(total) on" }
+    func zoneWaiting(_ n: Int) -> String { ", \(n) waiting" }
+    /// Ends the count of a zone whose members that are on all wait: " · Waiting: …".
+    func zoneWaitNote(_ note: String) -> String { " · \(note)" }
+    /// A zone none of whose members is here.
+    func zoneNoneHere(_ total: Int) -> String { "None of \(total) found" }
+    /// A zone none of whose members is here because they all play as a stereo pair.
+    func zonePlayingInPair(_ total: Int) -> String { "\(total) playing in a pair" }
+    /// A zone with no member, until it is deleted.
+    let zoneEmpty = "No speakers"
+    /// A zone header's VoiceOver label and value.
+    func zoneLabel(_ name: String) -> String { "\(name), zone" }
+    func zoneValue(on: Int, of total: Int, waiting: Int) -> String {
+        "\(on) of \(total) speaker\(total == 1 ? "" : "s") on" + (waiting > 0 ? zoneWaiting(waiting) : "")
+    }
+    func showZoneSpeakers(_ name: String) -> String { "Show speakers in \(name)" }
+    func hideZoneSpeakers(_ name: String) -> String { "Hide speakers in \(name)" }
+    /// A new zone's name when none was typed.
+    func numberedZone(_ n: Int) -> String { "Zone \(n)" }
+    /// A zone member's compact row under its own section, after the full
+    /// rows: the label above them (shown in capitals), what VoiceOver reads
+    /// for its switch and for the chip that goes to its zone, and its menu.
+    let inZones = "In zones"
+    func inZoneLabel(_ speaker: String, zone: String) -> String { "\(speaker), in \(zone)" }
+    func goToZoneLabel(_ zone: String) -> String { "Go to \(zone)" }
+    let goToZone = "Go to Zone"
+    /// In a zone member's ⋯ menu under its zone: the other members go off.
+    let onlyThisSpeaker = "Only This Speaker"
+    /// A zone member that plays as part of a stereo pair or home theater (S247).
+    func zoneMemberInTarget(_ target: String) -> String { "Plays as part of \(target)" }
+    /// The zone menu's way to put that target in the member's place.
+    func useTargetInstead(_ target: String) -> String { "Use \(target) Instead" }
+    /// A stereo pair or home theater in a zone while this launch runs without AirPlay 2.
+    let needsAirPlay2 = "Needs AirPlay 2"
+    /// A zone member that isn't listed right now.
+    let zoneMemberNotFound = "Not found"
+    /// A Cast member a zone click left off (S246).
+    let castStayedOff = "Stayed off, since one Cast speaker plays at a time"
+    /// What VoiceOver says after Move to Zone and Delete Zone.
+    func speakerMovedToZone(_ speaker: String, zone: String) -> String { "\(speaker) moved to \(zone)" }
+    func zoneDeleted(_ name: String) -> String { "\(name) deleted" }
+    /// The notice at the first launch after the groups became zones (S248).
+    let groupsBecameZones = "Your groups are zones now. Each zone has its own volume, and its speakers show under it."
+
+    // MARK: Speaker presets (S259 to S269)
+
+    let presets = "Presets"
+    let savePreset = "Save as Preset…"
+    let savePresetTitle = "Save Preset"
+    let savePresetMessage = "The speakers that are on, their volumes, the zone volumes, the master volume and the curve are saved. Delays and the preamp are not."
+    let savePresetNeedsSpeakers = "Turn on the speakers you want in the preset first, then save it."
+    /// VoiceOver label of the name field in the Save Preset and Rename Preset alerts.
+    let presetFieldLabel = "Preset name"
+    let presetPlaceholder = "Evening, Party…"
+    /// A new preset's name when none was typed.
+    func numberedPreset(_ n: Int) -> String { "Preset \(n)" }
+    let renamePreset = "Rename…"
+    let renamePresetTitle = "Rename Preset"
+    let updatePreset = "Update to Current Settings"
+    let deletePreset = "Delete"
+    /// The Presets submenu while there is none.
+    let noPresets = "No Presets"
+    let presetsEmpty = "No presets yet. Turn on the speakers you want, set the volumes and the curve, then save them as a preset."
+    /// The panel's preset row while no preset is current.
+    let choosePreset = "Choose a Preset"
+    /// What VoiceOver says after Save, Update and Delete.
+    func presetSaved(_ name: String) -> String { "\(name) saved" }
+    func presetUpdated(_ name: String) -> String { "\(name) updated" }
+    func presetDeleted(_ name: String) -> String { "\(name) deleted" }
+    /// The notice after a recall that left stored speakers off (S265).
+    let presetLeftOffTitle = "Some speakers stayed off"
+    func presetLeftOff(_ preset: String, _ list: String) -> String { "“\(preset)” is on. Stayed off: \(list)." }
+    func presetNothingChanged(_ preset: String, _ list: String) -> String {
+        "Nothing changed: no speaker in “\(preset)” can play now. \(list)."
+    }
+    func presetMemberLeftOff(_ name: String, _ reason: String) -> String { "\(name) (\(reason))" }
+    func presetMemberList(_ items: [String]) -> String { items.joined(separator: ", ") }
+    let presetHidden = "Hidden"
+    let presetBusy = "In use by another app"
+    let rename = "Rename"
+    /// In a speaker's ⋯ menu and right-click menu: edits its name in the row.
+    let renameSpeaker = "Rename…"
+    /// The name field's VoiceOver label; the field's placeholder is the
+    /// system name, which an empty field brings back.
+    func nameField(for name: String) -> String { "Name for \(name)" }
+    /// What VoiceOver adds on a speaker's or a zone's rename field, as on Windows.
+    let speakerNameFieldHint = "Press Return to apply or Escape to cancel. Leave it empty for the device's own name."
+    let zoneNameFieldHint = "Press Return to apply or Escape to cancel."
+    /// The tooltip on a speaker's name: the full name, which the row may
+    /// truncate, then how to rename it.
+    func speakerNameHelp(name: String, system: String, renamed: Bool) -> String {
+        renamed ? "\(name)\nDevice name: \(system). Double-click to rename." : "\(name)\nDouble-click to rename."
+    }
+    /// The same in the menu bar panel, where a click switches the speaker
+    /// and nothing renames it.
+    func panelNameHelp(name: String, renamedFrom: String?) -> String {
+        renamedFrom.map { "\(name)\nDevice name: \($0)" } ?? name
+    }
+    /// What VoiceOver adds after a renamed speaker's label.
+    func renamedSpeaker(system: String) -> String { "device name \(system)" }
+    /// Last in a speaker's ⋯ menu and right-click menu; never on the reference.
+    let hideSpeaker = "Hide Speaker"
+    let hideSpeakerHelp = "Turns the speaker off and takes it out of the speaker lists. Hidden Speakers brings it back."
+    /// The menu bar panel's list when every speaker in it is hidden: the panel has no gear menu.
+    let panelAllHidden = "Every speaker is hidden. Open AudioSync and choose Hidden Speakers to show one again."
+    let panelConnectedHidden = "Every connected speaker is hidden. Open AudioSync and choose Hidden Speakers to show one again."
+    /// What VoiceOver says after Hide Speaker and after choosing a hidden speaker.
+    func speakerHidden(_ name: String) -> String { "\(name) hidden" }
+    func speakerShown(_ name: String) -> String { "\(name) shown" }
+    /// The submenu in the Speakers menu and the list in Settings.
+    let hiddenSpeakers = "Hidden Speakers"
+    let noHiddenSpeakers = "No hidden speakers"
+    /// The button beside a hidden speaker in Settings; VoiceOver hears which one.
+    let unhide = "Unhide"
+    func unhideLabel(_ entry: String) -> String { "Unhide \(entry)" }
+    func hiddenSpeakerEntry(name: String, kind: String) -> String {
+        kind.isEmpty ? name : "\(name) (\(kind))"
+    }
+    func hiddenSpeakerEntryAbsent(name: String, kind: String) -> String {
+        kind.isEmpty ? "\(name) (not found)" : "\(name) (\(kind), not found)"
+    }
+    /// A section whose every speaker is hidden.
+    let allSpeakersHidden = "Every speaker here is hidden. To show one again, choose Settings… in the gear menu and click Unhide."
+    /// Connected Speakers with no row: every speaker hidden, else
+    /// `networkEmpty`, under a line saying virtual devices are hidden when
+    /// they were its only outputs (S434).
+    func connectedEmpty(allHidden: Bool, virtualHidden: Bool, networkEmpty: String) -> String {
+        allHidden ? allSpeakersHidden : virtualHidden ? virtualDevicesHidden + "\n" + networkEmpty : networkEmpty
+    }
+    let virtualDevicesHidden = "Virtual devices are hidden. To list them, choose Settings… in the gear menu and turn on Show Virtual Devices."
+    /// The menu bar panel's Connected Speakers with no row and nothing hidden (S434).
+    func panelConnectedEmpty(virtualHidden: Bool, networkEmpty: String) -> String {
+        virtualHidden ? panelVirtualDevicesHidden + "\n" + networkEmpty : networkEmpty
+    }
+    let panelVirtualDevicesHidden = "Virtual devices are hidden. Open AudioSync and turn on Show Virtual Devices in Settings."
+    let create = "Create"
+    let cancel = "Cancel"
+    let autoConnect = "Auto-Connect When Available"
+    let launchAtLogin = "Launch at Login"
+    let launchAtLoginFailed = "macOS did not allow AudioSync to launch at login. You can add it in System Settings → General → Login Items & Extensions."
+    let launchAtLoginMoveToApplications = "Move AudioSync to the Applications folder and open it from there to turn on Launch at Login."
+    let launchAtLoginOffFailed = "macOS did not allow AudioSync to stop launching at login. You can remove it in System Settings → General → Login Items & Extensions."
+    func automationDenied(_ app: String) -> String {
+        "AudioSync isn't allowed to control \(app), so Now Playing can't show its track or controls, and AirPlay speakers with a screen can't show it either. Turn on \(app) under AudioSync in System Settings → Privacy & Security → Automation."
+    }
+    let openSettings = "Open Settings"
+    let openSettingsHint = "Opens System Settings at the right privacy setting"
+    /// The explanation shown before a feature makes macOS ask for `permission`.
+    func permissionTitle(_ permission: Permission) -> String {
+        switch permission {
+        case .localNetwork: return "Find speakers on your network"
+        case .audioCapture: return "Capture your Mac's audio"
+        case .microphone: return "Use the microphone or an input"
+        case .automation: return "Show Now Playing for Spotify and Music"
+        case .accessibility: return "Let the volume keys change AudioSync's volume"
+        }
+    }
+    func permissionReason(_ permission: Permission) -> String {
+        switch permission {
+        case .localNetwork:
+            return "AudioSync looks for AirPlay and Google Cast speakers on your network. macOS asks you to allow this next."
+        case .audioCapture:
+            return "AudioSync captures the audio you pick so it can play it on your speakers. macOS asks you to allow this next."
+        case .microphone:
+            return "AudioSync listens to the input you pick to play it on your speakers, or to the microphone when you calibrate a speaker. macOS asks you to allow this next."
+        case .automation:
+            return "Now Playing reads the track from Spotify and Music and gives you their play controls. macOS asks once for each app."
+        case .accessibility:
+            return "While streaming is on, the volume keys change AudioSync's master volume. macOS asks you to allow AudioSync under Accessibility next."
+        }
+    }
+    let permissionContinue = "Continue"
+    let permissionNotNow = "Not Now"
+
+    // MARK: Permission setup window
+
+    let setupTitle = "Permissions"
+    let setupHeading = "Before you start"
+    let setupIntro = "macOS asks before AudioSync can find speakers or capture sound. Allow both now, and streaming won't stop later to ask."
+    /// Over the microphone and Automation rows.
+    let setupLater = "Only when you use them"
+    func setupDetail(_ permission: Permission) -> String {
+        switch permission {
+        case .localNetwork:
+            return "Finds AirPlay and Google Cast speakers. In System Settings → Privacy & Security → Local Network."
+        case .audioCapture:
+            return "Plays what your Mac plays on your speakers. In System Settings → Privacy & Security → Screen & System Audio Recording."
+        case .microphone:
+            return "For an input device as the source, or to calibrate a speaker with the microphone."
+        case .automation:
+            return "Shows the track playing in Spotify or Music. macOS asks once for each app."
+        case .accessibility:
+            return "Only while Volume Keys Control AudioSync is on in Settings. In System Settings → Privacy & Security → Accessibility."
+        }
+    }
+    func setupState(_ state: SetupRowState) -> String {
+        switch state {
+        case .notAsked: return "Not asked yet"
+        case .waiting: return "Waiting for your answer"
+        case .allowed: return "Allowed"
+        case .denied: return "Not allowed"
+        case .askedUnknown: return "Asked. If you didn't allow it, turn it on in System Settings."
+        }
+    }
+    let setupAllow = "Allow Access"
+    let setupAsking = "Asking…"
+    let setupDone = "Done"
+    let setupSkip = "Skip for Now"
+    /// The microphone row's own button.
+    let setupAllowOne = "Allow"
+    /// VoiceOver's name for `setupAllowOne`.
+    let setupAllowMicrophone = "Allow Microphone"
+    /// VoiceOver's name for a row's Open Settings button.
+    func setupOpenSettings(_ permission: Permission) -> String {
+        switch permission {
+        case .localNetwork: return "\(openSettings), Local Network"
+        case .audioCapture: return "\(openSettings), Screen & System Audio Recording"
+        case .microphone: return "\(openSettings), Microphone"
+        case .automation: return "\(openSettings), Automation"
+        case .accessibility: return "\(openSettings), Accessibility"
+        }
+    }
+    /// The app menu item that opens the window again.
+    let setupMenu = "Check Setup…"
+    let setupWindowTitle = "Setup"
+    /// Over the Local Network and audio capture rows.
+    let setupNeeded = "Needed to stream"
+    /// A row's state line, worded for what macOS can report about it.
+    func setupState(_ permission: Permission, _ state: SetupRowState) -> String {
+        switch (permission, state) {
+        case (.audioCapture, .allowed):
+            return "Allowed. AudioSync heard your Mac's audio."
+        case (.audioCapture, .askedUnknown):
+            return "Asked. macOS doesn't report the answer, so this turns to Allowed the first time AudioSync hears your Mac's audio."
+        case (.accessibility, .notAsked):
+            return "Not asked yet. macOS asks the first time you start streaming with this switch on."
+        case (.accessibility, .denied):
+            return "Not allowed. The volume keys keep changing the Mac's volume."
+        case (_, .denied):
+            return "Not allowed. Turn it on in System Settings."
+        default:
+            return setupState(state)
+        }
+    }
+    /// The Automation row's players, named as in its title.
+    func setupPlayer(_ bundleID: String) -> String {
+        bundleID == NowPlayingMonitor.spotify ? "Spotify" : "Music"
+    }
+    /// The Automation row's state line, one sentence per player.
+    func setupAutomation(_ names: [String], _ verdicts: [AutomationConsent.Verdict]) -> String {
+        zip(names, verdicts).map { player -> String in
+            switch player.1 {
+            case .allowed: return "\(player.0) allowed."
+            case .denied: return "\(player.0) not allowed."
+            case .undecided: return "\(player.0) not asked yet."
+            }
+        }.joined(separator: " ")
+    }
+    func setupName(_ permission: Permission) -> String {
+        switch permission {
+        case .localNetwork: return "Local Network"
+        case .audioCapture: return "Audio capture"
+        case .microphone: return "Microphone"
+        case .automation: return "Now Playing"
+        case .accessibility: return "Volume keys"
+        }
+    }
+    func setupSummaryHeading(_ summary: SetupSummary) -> String {
+        summary.ready ? "Ready to stream" : "Not ready to stream"
+    }
+    func setupSummaryLine(_ summary: SetupSummary) -> String {
+        var parts: [String] = []
+        if !summary.missing.isEmpty {
+            let names = summary.missing.map(setupName).joined(separator: " and ")
+            parts.append(names + (summary.missing.count > 1 ? " are" : " is") + " not allowed yet.")
+        }
+        if summary.captureUnconfirmed {
+            parts.append("Audio capture is confirmed the first time AudioSync hears sound.")
+        }
+        if !summary.refused.isEmpty {
+            parts.append("Not allowed, used only when you need them: \(summary.refused.map(setupName).joined(separator: ", ")).")
+        }
+        return parts.isEmpty ? "Everything AudioSync asked for is allowed." : parts.joined(separator: " ")
+    }
+    /// VoiceOver's line when a row turns allowed or refused.
+    func setupAnnouncement(_ permission: Permission, _ state: SetupRowState) -> String {
+        "\(setupName(permission)), \(setupState(state))"
+    }
+    /// AirPlay has found nothing for a while and AudioSync can't tell whether
+    /// Local Network access is the reason.
+    let localNetworkHint = "If you expect AirPlay speakers, make sure this Mac is on the same network as them, and that AudioSync is allowed in System Settings → Privacy & Security → Local Network."
+    /// The menu bar panel's one-line version of `localNetworkHint`.
+    let localNetworkHintShort = "Speakers missing? Check Local Network access."
+    /// macOS denies AudioSync Local Network access.
+    let localNetworkDenied = "AudioSync isn't allowed on the local network, so it can't find AirPlay speakers. Turn on AudioSync in System Settings → Privacy & Security → Local Network."
+    /// The menu bar panel's one-line version of `localNetworkDenied`.
+    let localNetworkDeniedShort = "Local Network access is off for AudioSync."
+    /// The hint's text in the window (`short`: in the menu bar panel); nil: none.
+    func localNetworkHint(_ hint: LocalNetworkHint, short: Bool) -> String? {
+        switch hint {
+        case .none: return nil
+        case .denied: return short ? localNetworkDeniedShort : localNetworkDenied
+        case .possible: return short ? localNetworkHintShort : localNetworkHint
+        }
+    }
+    let openLocalNetworkSettings = "Open Local Network Settings"
+    let launchAtLoginNeedsApproval = "Allow AudioSync in System Settings → General → Login Items & Extensions to finish turning on Launch at Login."
+
+    let syncAdjust = "Adjust sync"
+    /// The hint under a local speaker's delay field: what the value is
+    /// relative to (S181). Without the Mac's built-in speakers listed, the
+    /// values only count against each other.
+    func offsetHint(hasReference: Bool) -> String {
+        (hasReference
+            ? "Relative to the built-in speakers. Use a negative value for a speaker that sounds late, such as Bluetooth."
+            : "The speaker with the lowest value plays first; the others wait by the difference.")
+            + " Heard this speaker first? Raise the value. Heard it late? Lower it."
+    }
+    /// The AirPlay delay (S178, S181): one field for every local speaker.
+    let airPlayDelay = "AirPlay Delay"
+    let airPlayDelayHint = "While an AirPlay speaker is on, local speakers wait this long for it. "
+        + "Heard the AirPlay speakers late? Raise it."
+    let millisecondsUnit = "ms"
+
+    // MARK: Google Cast speakers
+
+    /// The note under a speaker's name, also read in its VoiceOver hint:
+    /// what a Cast speaker does, what an AirPlay speaker's PIN or password
+    /// prompt waits for, that an AirPlay 2 speaker waits, that an
+    /// AirPlay speaker is off the network, or what a stereo pair or home
+    /// theater group is made of.
+    func rowNote(cast: CastRow?, waitingForAirPlay2: Bool, waitingForPtp: Bool = false, reconnecting: Bool = false,
+                 codeWait: NativeCodeWait? = nil, name: String = "",
+                 unannounced: Bool, target: AirPlayTargetRow?) -> String? {
+        if let cast { return castNote(cast) }
+        switch codeWait {
+        case .password?: return waitingForPassword
+        case .pin?: return enterCodeShown(on: name)
+        case nil: break
+        }
+        if waitingForPtp { return self.waitingForPtp }
+        if waitingForAirPlay2 { return self.waitingForAirPlay2 }
+        if reconnecting { return self.reconnecting }
+        if unannounced { return notOnNetwork }
+        return target.map(airPlayTargetNote)
+    }
+    /// The `rowNote` a menu bar panel row shows next to the name.
+    func panelRowNote(_ note: String?) -> String? {
+        note == notOnNetwork ? notOnNetworkShort : note
+    }
+    /// A stereo pair or home theater group: its kind and members, or the
+    /// members that are missing (P176, P181).
+    func airPlayTargetNote(_ target: AirPlayTargetRow) -> String {
+        let kind = target.kind == .stereoPair ? "Stereo pair" : "Home theater group"
+        if target.incomplete {
+            return target.missing.isEmpty ? kind + ", a speaker is missing" : kind + ", missing " + listed(target.missing)
+        }
+        return target.members.isEmpty ? kind : kind + ": " + listed(target.members)
+    }
+    /// Under a Cast speaker's name: where one that is on stands, and that a
+    /// group is one, with its members once it reports them; nil otherwise.
+    func castNote(_ row: CastRow) -> String? {
+        switch row.status {
+        case .connecting: return "Connecting…"
+        case .reconnecting: return "Reconnecting…"
+        case .paused: return castPaused
+        case .playing where row.muted: return row.group == nil ? "Muted on the speaker" : "Muted on the group"
+        case .playing, .idle: return row.group.map(castGroupNote) ?? (row.manual ? castAddedByAddress : nil)
+        }
+    }
+    let castPaused = "Paused on the speaker"
+    func castGroupNote(_ members: CastGroupMembers) -> String {
+        switch members {
+        case .notReported: return "Google Cast group"
+        case .unknown: return "Google Cast group, members unknown"
+        case .known(let names): return "Google Cast group: " + listed(names)
+        }
+    }
+    /// "A", "A and B", "A, B and C".
+    func listed(_ names: [String]) -> String {
+        guard let last = names.last, names.count > 1 else { return names.first ?? "" }
+        return names.dropLast().joined(separator: ", ") + " and " + last
+    }
+    /// Under a Cast speaker's volume while it connects or plays.
+    let castMute = "Mute"
+    let castUnmute = "Unmute"
+    let castMuteHelp = "Mutes the speaker itself"
+    let castUnmuteHelp = "Unmutes the speaker itself"
+    let castResync = "Resync"
+    let castResyncHelp = "Restarts the stream, with a short gap, so this speaker plays at its offset again"
+    /// What VoiceOver reads for those buttons: the button's text, so Voice
+    /// Control finds it by what it shows, then the speaker ("Mute, Kitchen").
+    func castButtonLabel(_ text: String, name: String) -> String { "\(text), \(name)" }
+
+    // A Google Cast speaker added by address when discovery can't find it (C18).
+    let castAddByAddress = "Add by Address…"
+    let castAddTitle = "Add a Cast Speaker by Address"
+    let castAddBody = "Use this when a Google Cast speaker doesn't show up. Enter its IP address or host name, and add :port only if it doesn't use 8009."
+    let castAddField = "Address"
+    let castAddInvalid = "That isn't an IP address or host name. Check it and try again."
+    let castAddNotFound = "AudioSync couldn't find a speaker at that address. Check that it's on and try again."
+    /// The Add button and its spinner while the address is tried.
+    let castAddChecking = "Checking…"
+    func castAddProblem(_ problem: CastAddProblem) -> String {
+        switch problem {
+        case .unreadable: return castAddInvalid
+        case .notFound: return castAddNotFound
+        }
+    }
+    let castAdd = "Add"
+    let castRemove = "Remove"
+    /// Under the name of a speaker added by address until a search finds it.
+    let castAddedByAddress = "Added by address"
+    /// The volume slider's hint when the device's volume can't be changed.
+    let castVolumeFixed = "This speaker's volume can't be changed from AudioSync."
+    /// Why a speaker's volume slider is dimmed, as its hint and tooltip; nil while it moves.
+    func volumeLocked(enabled: Bool, cast: CastRow?) -> String? {
+        if cast?.volumeFixed == true { return castVolumeFixed }
+        if !enabled { return volumeSpeakerOff }
+        return cast?.live == false ? castVolumeNotLive : nil
+    }
+    let volumeSpeakerOff = "Turn this speaker on to change its volume."
+    let castVolumeNotLive = "This speaker's volume can be changed while AudioSync plays to it."
+    /// Under a Cast speaker's delay field, in place of the sync hint (CAST_SPEC C74-C77).
+    let castSyncHint = "AudioSync can't sync Google Cast speakers automatically, so it keeps the others only "
+        + "roughly in step with this one. Set this by ear: heard this speaker late? Raise the value, and the "
+        + "other speakers wait longer. Heard it early? Lower it. AudioSync keeps it for this speaker; check it "
+        + "again when you start it."
+
+    /// What Connected Speakers says about the network speakers it doesn't
+    /// list: no AirPlay speaker (`airPlayNone`), then how the Google Cast
+    /// search goes; nil when there is nothing to say. `hint`: the Local
+    /// Network hint on screen next to it.
+    /// `airPlaySearching`: AirPlay discovery has listed nothing yet but is
+    /// still within its first look (`AirPlaySearch`), so the note says it is
+    /// looking instead of giving network advice.
+    func networkSpeakersNote(airPlayNone: Bool, cast: CastListState, hint: LocalNetworkHint = .none,
+                             localNetworkRefused: Bool = false, airPlaySearching: Bool = false) -> String? {
+        let refused = localNetworkRefused
+        if airPlayNone && airPlaySearching {
+            if case .searching = cast { return lookingForSpeakers }
+            guard let castNote = castList(cast, hint: hint, localNetworkRefused: refused) else { return lookingForSpeakers }
+            return lookingForAirPlaySpeakers + " " + castNote
+        }
+        switch (airPlayNone, cast) {
+        case (true, .noneFound):
+            return UIStrings.withNetworkAdvice("No AirPlay or Google Cast speakers found yet.", hint: hint, refused: refused)
+        case (true, .quiet): return airPlayNoneFound(hint: hint, localNetworkRefused: refused)
+        case (true, _):
+            return airPlayNoneFound(hint: hint, localNetworkRefused: refused) + " "
+                + (castList(cast, hint: hint, localNetworkRefused: refused) ?? "")
+        case (false, _): return castList(cast, hint: hint, localNetworkRefused: refused)
+        }
+    }
+    /// The Google Cast search while it lists no speaker; nil when quiet.
+    func castList(_ state: CastListState, hint: LocalNetworkHint = .none, localNetworkRefused: Bool = false) -> String? {
+        switch state {
+        case .quiet: return nil
+        case .searching: return "Looking for Google Cast speakers…"
+        case .noneFound:
+            return UIStrings.withNetworkAdvice("No Google Cast speakers found yet.", hint: hint,
+                                               refused: localNetworkRefused)
+        case .failed: return "AudioSync can't look for Google Cast speakers right now. Restart AudioSync to try again."
+        }
+    }
+
+    /// The notice when the Cast sender stopped working with `speaker` on.
+    func castSenderStopped(speaker: String) -> String {
+        "Google Cast stopped working in AudioSync, so \(speaker) is off. Restart AudioSync to use Google Cast speakers again."
+    }
+
+    /// The notice when the AirPlay speakers can't wait as long as the Cast
+    /// speaker's offset asks; `tenths` of a second, shown as "1.5".
+    func airPlayAheadOfCast(tenths: Int, speaker: String) -> String {
+        "AirPlay speakers can wait at most 20 s for a Google Cast speaker, so they play about \(tenths / 10).\(tenths % 10) s ahead of \(speaker). Lower its offset to keep them together."
+    }
+
+    /// The notice when a Cast speaker can't play, or stopped, and is off.
+    func castProblem(_ problem: CastProblem, name: String) -> String {
+        switch problem {
+        case .busy:
+            return "Only one Google Cast speaker can play at a time, so \(name) stays off. Turn the other one off first."
+        case .notResponding:
+            return "\(name) isn't responding, so it's off. Check that it's on and on this Mac's network, then turn it on again."
+        case .refused:
+            return "\(name) declined the stream, so it's off. Turn it on again to try once more."
+        case .blocked:
+            return "\(name) couldn't reach the stream on this Mac, so it's off. If the macOS firewall is on, "
+                + "allow incoming connections for AudioSync in System Settings → Network → Firewall, then turn it on again."
+        case .takenOver:
+            return "\(name) stopped AudioSync's stream, so it's off. Turn it on again to stream to it."
+        case .connectionLost:
+            return "\(name) lost its connection, so it's off. Turn it on again to reconnect."
+        case .searchStopped:
+            return "AudioSync stopped looking for Google Cast speakers, so \(name) is off. Restart AudioSync to try again."
+        case .notGenuine:
+            return "\(name) couldn't prove it's a genuine Google Cast speaker, so it's off. "
+                + "If you trust it, remove it from AudioSync and add it again."
+        case .unauthenticated:
+            return "\(name) didn't prove it's a genuine Google Cast speaker. AudioSync plays to it anyway. "
+                + "If you don't recognize it, turn it off."
+        }
+    }
+
+    // MARK: Equalizer
+
+    let equalizerTitle = "Equalizer"
+    let equalizerCustom = "Custom"
+    let equalizerReset = "Reset"
+    let equalizerPreamp = "Pre"
+    func equalizerCaption(maxGain: Int) -> String { "±\(maxGain) dB · applied to every speaker" }
+    let equalizerPreampAccessibility = "Preamp"
+    /// The label in front of the equalizer's picker of presets and saved curves.
+    let equalizerCurve = "Curve"
+    let equalizerSaveCurve = "Save Curve…"
+    func equalizerRenameCurve(_ name: String) -> String { "Rename “\(name)”…" }
+    func equalizerDeleteCurve(_ name: String) -> String { "Delete “\(name)”" }
+    let saveCurveTitle = "Save Curve"
+    let saveCurveMessage = "The ten band gains are saved under this name; the preamp stays as you set it. A curve saved under the same name is replaced."
+    let curveNameField = "Curve name"
+    let save = "Save"
+    let renameCurveTitle = "Rename Curve"
+    func numberedCurve(_ n: Int) -> String { "Curve \(n)" }
+    func curvesFull(_ n: Int) -> String { "You can keep up to \(n) saved curves. Delete one, then save again." }
+    func curveNameTaken(_ name: String) -> String { "Another saved curve is already called “\(name)”." }
+    /// The Equalizer card's VoiceOver value while the equalizer is on.
+    func equalizerCardOn(_ curve: String) -> String { "On, \(curve)" }
+
+    /// The curve the picker shows: a preset's name, a saved curve's, or Custom.
+    func equalizerCurveName(_ match: Equalizer.CurveMatch?, saved: [Equalizer.Curve]) -> String {
+        switch match {
+        case .preset(let id): return equalizerPreset(id)
+        case .saved(let index) where saved.indices.contains(index): return saved[index].name
+        default: return equalizerCustom
+        }
+    }
+
+    func equalizerPreset(_ id: Equalizer.PresetID) -> String {
+        switch id {
+        case .flat: return "Flat"
+        case .bassBoost: return "Bass Boost"
+        case .bassCut: return "Bass Cut"
+        case .trebleBoost: return "Treble Boost"
+        case .vocal: return "Vocal"
+        case .rock: return "Rock"
+        case .pop: return "Pop"
+        case .jazz: return "Jazz"
+        case .classical: return "Classical"
+        case .electronic: return "Electronic"
+        case .loudness: return "Loudness"
+        case .smallSpeakers: return "Small Speakers"
+        }
+    }
+
+    /// A band's short label under its slider: "32", "125", "1k", "16k".
+    func equalizerBandShort(hz: Double) -> String {
+        hz >= 1000 ? "\(Int(hz / 1000))k" : "\(Int(hz))"
+    }
+
+    /// A band's spoken name: "125 Hz", "1 kHz".
+    func equalizerBandName(hz: Double) -> String {
+        hz >= 1000 ? "\(Int(hz / 1000)) kHz" : "\(Int(hz)) Hz"
+    }
+
+    /// A gain shown above its slider: "+2.5", "+3", "0", "−1.5". One decimal
+    /// only when the value isn't whole (the sliders move in 0.5 dB steps).
+    func equalizerGain(_ db: Double) -> String {
+        let tenths = (db * 10).rounded()
+        if tenths == 0 { return "0" }
+        let magnitude = abs(tenths) / 10
+        let digits = magnitude == magnitude.rounded()
+            ? String(Int(magnitude))
+            : String(format: "%.1f", magnitude)
+        return (tenths > 0 ? "+" : "−") + digits
+    }
+
+    /// A gain as VoiceOver reads it: "+2.5 dB".
+    func equalizerGainValue(_ db: Double) -> String { "\(equalizerGain(db)) dB" }
+
+    // MARK: Web remote
+
+    let webRemoteMenu = "Web Remote…"
+    let webRemoteTitle = "Web Remote"
+    let webRemoteSummary = "Control your speakers from a phone on the same network as this Mac."
+    let webRemoteAddressTitle = "Address"
+    /// Above the first address, then above the IP address after the Bonjour one.
+    let webRemoteAddressLabel = "On the phone, open"
+    let webRemoteIPLabel = "If that doesn't open, use"
+    let webRemoteFirewall = "Phone can't open it? Allow AudioSync in System Settings → Network → Firewall."
+    let webRemoteSetupTitle = "Set Up the Phone"
+    /// The accessibility name of the iPhone and Android choice above the steps.
+    let webRemotePhonePicker = "Phone"
+    let webRemoteIPhone = "iPhone"
+    let webRemoteAndroid = "Android"
+    func webRemoteStepNumber(_ number: Int) -> String { "\(number)." }
+    let webRemoteStepScan = "Scan the QR code with your phone's camera."
+    let webRemoteStepHomeIPhone = "Add the page to your Home Screen: tap the options button left of Safari's address bar, "
+        + "then Share, View More and Add to Home Screen."
+    let webRemoteStepHomeAndroid = "Add the page to your Home screen: in Chrome's menu, tap Add to Home screen or Install app."
+    let webRemoteStepOpen = "Open AudioSync from the new icon and enter the pairing code."
+    let webRemoteOrderIPhone = "Do step 2 before you enter the code: a pairing made in Safari doesn't carry over "
+        + "to the Home Screen app, so you would pair again there."
+    let webRemoteOrderAndroid = "Do step 2 before you enter the code, so you pair in the app you'll use."
+    func webRemoteQRLabel(_ address: String) -> String { "QR code for \(address)" }
+    let webRemoteNoAddress = "This Mac has no address on a home network right now. Connect it to your Wi-Fi or Ethernet network."
+    let webRemoteCodeTitle = "Pairing Code"
+    /// Spaced out so VoiceOver reads the digits one by one.
+    func webRemoteCodeLabel(_ code: String) -> String {
+        "Pairing code " + code.map(String.init).joined(separator: " ")
+    }
+    let webRemoteCodeNote = "Each code works once and for 10 minutes; the window shows the next one, and New Code makes a fresh one."
+    let webRemoteCodeExpired = "This code has expired. Click New Code to pair another phone."
+    let webRemoteLocked = "Pairing is locked after too many wrong codes. Click New Code to unlock it."
+    let webRemoteNewCode = "New Code"
+    let webRemoteDevicesTitle = "Paired Devices"
+    func webRemoteDevices(_ count: Int) -> String {
+        switch count {
+        case 0: return "No paired devices"
+        case 1: return "1 paired device"
+        default: return "\(count) paired devices"
+        }
+    }
+    let webRemoteForgetAll = "Forget All Remote Devices"
+    let webRemoteForgetFailed = "AudioSync couldn't save the list of paired devices, so they are paired again "
+        + "after AudioSync restarts. Click Forget All Remote Devices again."
+    let webRemotePort = "Port"
+    let webRemoteUsePort = "Use Port"
+    let webRemotePortRange = "Enter a port from 1024 to 65535."
+    func webRemotePortInUse(_ port: Int) -> String {
+        "Another app uses port \(port), so the web remote can't start. Enter another port and click Use Port."
+    }
+    func webRemoteListenFailed(_ port: Int) -> String {
+        "AudioSync couldn't open port \(port) on this Mac, so the web remote can't start. "
+            + "Enter another port and click Use Port."
+    }
+    let webRemoteStartFailed = "The web remote couldn't start. Turn it off and on again."
+    let webRemotePlainHTTP = "The page uses plain HTTP, so use the web remote only on your home network."
+    /// On the phone, under a speaker that asks for a code AudioSync doesn't keep.
+    let remoteTurnOnInApp = "Asks for a code: turn it on in AudioSync on the Mac"
+    /// A zone or preset turned on from the phone left out a speaker that asks
+    /// for a code: its prompt would wait on the Mac with nobody there.
+    func remotePairFirst(_ speaker: String) -> String { "\(speaker) stayed off. Pair it on this Mac first." }
+
+    // MARK: Guide
+
+    var helpText: String { """
+        AudioSync Guide
+        By Yasser Sutojoyo Kusumo
+
+        AudioSync plays your Mac's sound (the whole system, one app, or an input device)
+        through HomePod/AirPlay and Google Cast speakers and local speakers connected to this Mac
+        (jack, HDMI, USB-C, Bluetooth), then aligns them with a per-speaker delay
+        relative to the Mac's built-in speakers.
+
+        First Steps
+        1. Open AudioSync. Its window holds every control. The AudioSync icon in
+           the menu bar gives quick access to the Streaming switch, the source, the
+           volume and the speakers. Closing the window keeps AudioSync running in
+           the menu bar, and streaming continues.
+        2. Pick a source under Audio Source: All System Audio, a specific app,
+           Several Apps, or an input device. Several Apps opens a submenu where
+           you check apps and choose \(sourceMixOnly) or
+           \(sourceMixAllExcept). AudioSync keeps your last mix of
+           apps, so you can switch back to it later.
+           Keep the macOS sound output on a local device. Don't pick a HomePod in
+           Control Center or in the player app: AudioSync streams to AirPlay itself.
+        3. For AirPlay, check HomePod access in the Home app:
+           Home Settings → Speakers & TV → Allow Speaker & TV Access →
+           “Anyone on the Same Network”.
+        4. Speakers are listed under This Mac (the Mac's own speakers and
+           headphone jack), then your zones, then Connected Speakers: every
+           AirPlay, Google Cast, Bluetooth, USB, HDMI or other output, by name, each with a
+           small icon for its kind (in color while it plays).
+        5. Click a speaker's round icon to start streaming to it. Click it again to turn
+           it off. Turning streaming off keeps your speakers chosen: their icons
+           turn outlined, and they play again when you turn streaming on or click
+           any speaker.
+
+        More Controls
+        - Sync: the Mac's built-in speakers are the reference and have no delay.
+          Every other local speaker has a delay relative to them, which always
+          applies: click the time next to it to adjust it, or let a microphone
+          measure it (see Calibration below). A positive value holds the
+          speaker back; a negative one is for a speaker that sounds late, such
+          as Bluetooth. While an AirPlay
+          speaker is on, every local speaker also waits the AirPlay Delay
+          under Connected Speakers for it.
+        - Zones: turn on the speakers you want, then choose “New Zone from Active
+          Speakers” in the gear menu, or press Command-N. A speaker is in one
+          zone at a time. It shows under its zone and keeps a short row under
+          This Mac or Connected Speakers: its round button there turns only that
+          speaker on or off, and the button with its zone's name goes to the
+          zone. Click the zone's round icon to switch its speakers at once; a
+          click elsewhere on its header shows or hides them. Each zone has its
+          own volume. To play one speaker of a zone alone, choose Only This
+          Speaker from its ⋯ button under the zone; the others turn off and
+          stay in the zone. For a mix of speakers you turn on again and again,
+          save a preset instead. To move a speaker, right-click it or use its ⋯
+          button and choose Move to Zone, or Remove from Zone to take it out. To
+          rename a zone, double-click its name; to rename or delete it,
+          right-click it or use its ⋯ button. Deleting a zone gives its speakers
+          their full rows back.
+        - Presets: turn on the speakers you want and set their volumes, the
+          zone volumes, Master Volume and the equalizer curve, then choose
+          Save as Preset… in the Presets menu in the window. Delays and the
+          preamp aren't saved. To recall a preset, pick it in that menu or in
+          the menu bar panel, or press Control-Command-1 to 9 for the first
+          nine (they're also in Window > Presets). Speakers you hid are never
+          saved in a preset, and recalling one leaves them hidden. To rename,
+          update or delete a preset, point to its name in the Presets menu in
+          the window and choose Rename…, Update to Current Settings or Delete.
+        - Auto-connect: right-click a speaker, or use its ⋯ button, and turn on
+          Auto-Connect When Available. AudioSync then turns it on whenever it
+          appears. At launch, AudioSync starts streaming only when such a speaker
+          is there.
+        - Rename: double-click a speaker's name, or right-click it or use its ⋯
+          button and choose Rename…; type a name and press Return. Leave it empty
+          to go back to the device's own name; while a speaker is renamed, its
+          tooltip also shows the device's own name.
+        - Hide: to keep a speaker you never use out of the lists, right-click it
+          or use its ⋯ button and choose “Hide Speaker”. A speaker that is on
+          turns off first.
+          Settings lists what you hid under Hidden Speakers; click Unhide to
+          show one again, off, with its volume and delay as you left them.
+        - Equalizer: click Equalizer in the window for 10 bands, a preamp,
+          preset curves and curves you save yourself. It shapes the sound on
+          every speaker at once. Option-Command-E opens it too.
+        - Now Playing: while Spotify or Music is open with a track, the window
+          shows it with Previous Track, Play or Pause and Next Track, plus
+          Shuffle and Repeat when the app offers them, and AirPlay speakers
+          with a screen, such as a TV, show its title and artwork.
+          Other apps aren't shown: macOS doesn't let apps read the
+          system-wide Now Playing info.
+          macOS asks once for Automation access to Spotify or Music. With an
+          input device as the source, the window shows no track.
+        - Virtual devices (loopback drivers, meeting apps, aggregate devices) are
+          hidden unless you use them; turn on Show Virtual Devices in Settings
+          to list them all. To read the sources and outputs again, choose
+          Refresh Devices in the gear menu or press Command-R.
+        - Launch at Login: in Settings (AudioSync > Settings…, or Settings… in
+          the gear menu). The window doesn't open at login; click the Dock icon
+          to bring it back.
+        - Appearance: in Settings. Match System follows macOS; Light or Dark
+          keeps AudioSync's windows that way.\(guideUpdatesLine)
+        - When the source app quits, AudioSync switches to All System Audio and
+          keeps playing.
+
+        Calibration
+        A microphone can measure the delays for you. Put it where you listen
+        and keep the room quiet. Each measurement compares a speaker with the
+        Mac's built-in speakers, so streaming, the built-in speakers and the
+        speaker you measure have to be on. macOS asks once whether AudioSync
+        may use the microphone; if it may not, AudioSync says so, with a
+        button that opens the Microphone settings.
+
+        To measure one local speaker, click the time next to it, then
+        '\(calibrateWithMicrophone)'. AudioSync fades the music out, plays a
+        short, quiet sweep on the built-in speakers and then on this speaker,
+        sets its delay from the difference and fades the music back in.
+        Cancel stops it and leaves the delay as it was. Headphones and virtual
+        outputs don't have that button; a line there says why.
+
+        '\(calibrateAll)' in the left column measures every speaker that
+        is on, AirPlay and Google Cast too. AudioSync fades the music out,
+        plays a sweep on the built-in speakers and then on each other speaker,
+        one at a time, twice each, and fades the music back in. A Google Cast
+        speaker with no offset yet can take up to a minute. The results show
+        each speaker's current delay and the new one with its margin, such as
+        +50 ms ± 3 ms. The AirPlay speakers share one AirPlay delay, the middle
+        of their values. Nothing changes until you click '\(calibrateAllApply)',
+        which sets the delays of the speakers that were measured clearly.
+        '\(calibrateAllUndo)' then puts the old delays back. Before you apply,
+        '\(measureAgain)' repeats one speaker. If the speakers, the source or
+        a delay change during a run, it stops and no delay changes.
+
+        To calibrate one zone, right-click it or use its ⋯ button and choose
+        '\(calibrateZoneItem)'. It measures the zone's speakers that are on,
+        as '\(calibrateAll)' does; speakers outside the zone stay quiet during
+        the run and keep their delays.
+
+        Headphones, headsets, earbuds and virtual outputs are left out, since
+        the microphone can't hear them: their rows say so, and their delay
+        stays yours to set. If one of them does play through a speaker in
+        the room, such as a speaker that reports itself as headphones or a
+        virtual output that passes the sound on, click '\(includeAnyway)'
+        next to it in the \(calibrateAll) window. That holds until you close
+        the window. Bluetooth speakers take part; a Bluetooth device counts
+        as headphones only when its name says headphones, earbuds or
+        AirPods.
+        While headphones are plugged into the Mac, its built-in speakers are
+        silent, so calibration can't start until you unplug them.
+
+        A row that wasn't measured clearly says why, and its delay stays. The
+        microphone may have barely heard the speaker, been overloaded, or
+        heard an echo almost as loud as the sweep, or the two sweeps differed
+        too much. Turn the speaker up or down, move the microphone or quiet
+        the room, then click '\(measureAgain)' on that row. One speaker's
+        calibration says the same under its button and leaves the delay as it
+        was; click '\(calibrateWithMicrophone)' again to retry.
+
+        Speaker Notes
+        \(guideCodeNote)
+
+        AirPlay
+        AudioSync sends to AirPlay speakers itself. If its AirPlay sender stops
+        after an internal error, Connected Speakers says so, with a Retry button.
+        \(guideAirPlay2Note)
+
+        Google Cast
+        Local and AirPlay speakers play in step: once their delays are set,
+        AudioSync keeps them together. It can't sync Google Cast speakers
+        automatically, so each one has an offset you set by ear: click the time
+        next to it. If the Cast speaker sounds late, raise it, and the other
+        speakers wait longer; if it sounds early, lower it. AudioSync keeps the
+        offset for that speaker. One Google Cast speaker plays at a time. A
+        speaker group made in the Google Home app plays as one speaker, with
+        one volume and one offset, and its note names the speakers in it once
+        the group reports them. Those speakers keep their own rows. While a
+        Cast speaker or group plays,
+        Resync under its volume restarts the stream, with a short gap, so it
+        lines up at its offset again. If a Cast speaker doesn't show up, click
+        \(castAddByAddress) under the speaker list and enter its IP address or
+        host name.
+
+        Notices
+        When something needs your attention, such as a speaker that was switched
+        off or a source that quit, a notice appears at the top of the window and
+        of the menu bar panel, and a dot appears next to the menu bar icon.
+        Several can wait at once. Click × to dismiss one, or Dismiss All
+        when there is more than one. Many notices also clear themselves once the
+        cause is gone.
+
+        Web Remote
+        Choose Web Remote… in the gear menu or the Window menu and turn it
+        on to control AudioSync from a phone on the same network: each
+        speaker's switch, volume and delay, Master Volume, the source or a mix
+        of several apps, each zone's switch and volume, and the presets. The
+        page also shows what's playing.
+        On the phone, open the address it shows or scan its QR code, add the
+        page to the Home Screen before you enter the code, then open
+        AudioSync from the new icon and pair there: on iPhone, a pairing made
+        in Safari doesn't carry over to the Home Screen app. The window shows
+        these steps for iPhone and Android. Each code works once and for
+        10 minutes; the window shows the next one, and New Code makes a
+        fresh one. The page uses plain HTTP, so use the web remote only on
+        your home network. Forget All Remote Devices unpairs every phone,
+        also while the remote is off. If another app already uses the port,
+        the window says so and lets you pick another one.
+
+        Tips
+        - Tune with just two speakers at first: one AirPlay and one local.
+        - Pick a track with sharp sounds, like drums, claps or speech, so any
+          offset is easy to hear.
+        - Line the built-in speakers up with the HomePod first: if the Mac plays
+          first and the HomePod echoes behind it, raise the AirPlay delay; if the
+          HomePod plays first, lower it.
+        - Then add the other local speakers one by one and tune each against
+          the built-in speakers.
+        - Bluetooth speakers and headphones add a lag of their own, so they
+          often need a delay below 0.
+        - A Bluetooth headset's hands-free microphone carries call audio, so it
+          isn't offered as a source.
+
+        Volume
+        Local speakers' sliders follow how loudness is heard: halfway is about −18 dB.
+        AirPlay speakers use the AirPlay volume scale.
+        A Google Cast speaker's slider sets the speaker's own volume, and Master
+        Volume scales it like every other speaker. Mute under it mutes the
+        speaker itself.
+        When a local speaker that is on is turned down low or muted in macOS,
+        a line under its slider says so, with a button that fixes it. AudioSync
+        changes the macOS volume only when you click that button, or the same
+        one in the \(calibrateAll) window.
+
+        Notes
+        - AirPlay speakers are kept in step with each other by AudioSync's AirPlay
+          sender, so they need no delay.
+        - AirPlay adds at most 0.2 s on top of what the speaker needs. The first
+          0.1 s is there from the start, and the rest comes and goes only when
+          packets are lost.
+        - AudioSync saves the source, each speaker's switch, delay, volume and
+          name, the speakers you hid, your zones and the equalizer, and restores
+          them the next time it starts.
+        """
+    }
+
+    /// Each Guide illustration goes just before the line that starts with this text.
+    func guideArtAnchor(_ art: GuideArt) -> String {
+        switch art {
+        case .source: return "First Steps"
+        case .delay: return "- Zones:"
+        case .classes: return "Notices"
+        }
+    }
+
+    /// What each Guide illustration shows, read by VoiceOver.
+    func guideArtDescription(_ art: GuideArt) -> String {
+        switch art {
+        case .source:
+            return "The sound of the whole system or one app going into AudioSync, which plays it on several speakers and headphones at once."
+        case .delay:
+            return "Two speakers playing the same sound toward a listener. The second starts later, held back by its delay, so their waves line up."
+        case .classes:
+            return "Left: local and AirPlay speakers playing in step. Right: a Google Cast speaker starting after an offset you set by ear."
+        }
+    }
+
+    private var guideUpdatesLine: String {
+        guard updatesOn else { return "" }
+        return "\n- Updates: choose \(menuCheckForUpdates) in the AudioSync menu to\n  look for a newer version."
+            + " AudioSync asks once whether it may also look\n  by itself, about once a day;"
+            + " \(menuCheckUpdatesAutomatically) in\n  Settings turns that on or off."
+            + " A newer version opens a window with\n  Install Update, Remind Me Later and Skip This Version,"
+            + " and nothing\n  downloads until you click Install Update."
+    }
+
+    /// The Guide's lines on which AirPlay a speaker plays over (S312).
+    private var guideAirPlay2Note: String {
+        """
+            AudioSync plays to AirPlay 2 speakers, stereo pairs and home theater
+            groups. A speaker that plays both AirPlay 1 and AirPlay 2 uses AirPlay 2,
+            or AirPlay 1 when it was paired over AirPlay 1 or AirPlay 2 can't take
+            it; then its row says AirPlay. A stereo pair or home theater group shows
+            as one row, and its note names the speakers in it.
+            """
+    }
+
+    /// The Guide's note on “Asks for a code”.
+    private var guideCodeNote: String {
+        let asks = """
+            - “Asks for a code”: the speaker wants a code or password. AudioSync asks
+              for it only when you turn the speaker on yourself. If it was turned on
+              automatically (auto-connect, or at launch), it is switched off with a
+              notice instead.
+            """
+        return asks + """
+             An Apple TV, or a speaker reached over AirPlay 2,
+              pairs once, with the code it shows; Forget Pairing in the speaker's
+              menu removes that pairing. A password is asked for once each time
+              AudioSync starts. If a
+              code doesn't work, AudioSync asks again; if you cancel, the speaker
+              turns off. Turn it on again to retry. If a speaker turns the password
+              down after it has started playing, it is switched off with a notice.
+            - “Asks for a code every time”: the speaker is set to ask for a code
+              every time. Auto-connect leaves it off, also at launch; AudioSync
+              asks for the code each time you turn it on.
+            """
+    }
+}

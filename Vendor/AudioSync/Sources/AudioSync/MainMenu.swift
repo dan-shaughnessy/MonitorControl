@@ -1,0 +1,135 @@
+import AppKit
+
+/// The app's menu bar menus. Items without a target go up the responder chain,
+/// which ends at the app delegate, so AppDelegate's actions and its
+/// `validateMenuItem` handle the AudioSync-specific ones.
+@MainActor
+enum MainMenu {
+
+    static func make(text t: UIStrings) -> NSMenu {
+        let main = NSMenu()
+
+        let app = submenu(of: main, title: t.appName)
+        app.addItem(AboutPanel.menuItem(text: t))
+        if let update = AppUpdater.menuItem(text: t) {
+            app.addItem(update)
+        }
+        app.addItem(.separator())
+        app.addItem(item(t.settingsMenu, #selector(AppDelegate.showSettings(_:)), ","))
+        app.addItem(.separator())
+        let services = NSMenu(title: t.menuServices)
+        app.addItem(withTitle: t.menuServices, action: nil, keyEquivalent: "").submenu = services
+        NSApp.servicesMenu = services
+        app.addItem(.separator())
+        app.addItem(item(t.menuHide, #selector(NSApplication.hide(_:)), "h"))
+        app.addItem(item(t.menuHideOthers, #selector(NSApplication.hideOtherApplications(_:)), "h",
+                         [.command, .option]))
+        app.addItem(item(t.menuShowAll, #selector(NSApplication.unhideAllApplications(_:))))
+        app.addItem(.separator())
+        app.addItem(item(t.quitApp, #selector(NSApplication.terminate(_:)), "q"))
+
+        // Text fields (the sync delay) need the standard editing commands.
+        let edit = submenu(of: main, title: t.menuEdit)
+        edit.addItem(item(t.menuUndo, Selector(("undo:")), "z"))
+        edit.addItem(item(t.menuRedo, Selector(("redo:")), "z", [.command, .shift]))
+        edit.addItem(.separator())
+        edit.addItem(item(t.menuCut, #selector(NSText.cut(_:)), "x"))
+        edit.addItem(item(t.menuCopy, #selector(NSText.copy(_:)), "c"))
+        edit.addItem(item(t.menuPaste, #selector(NSText.paste(_:)), "v"))
+        edit.addItem(item(t.menuSelectAll, #selector(NSText.selectAll(_:)), "a"))
+
+        let speakers = submenu(of: main, title: t.menuSpeakers)
+        speakers.addItem(.sectionHeader(title: t.streamingSwitch))
+        speakers.addItem(item(t.menuTurnStreamingOn, #selector(AppDelegate.toggleStreaming(_:))))
+        speakers.addItem(.sectionHeader(title: t.menuGroupFind))
+        speakers.addItem(item(t.refreshDevices, #selector(AppDelegate.refreshDevices(_:)), "r"))
+        speakers.addItem(item(t.castAddByAddress, #selector(AppDelegate.addCastByAddress(_:))))
+        speakers.addItem(.sectionHeader(title: t.menuGroupArrange))
+        speakers.addItem(item(t.newZone, #selector(AppDelegate.newZone(_:)), "n"))
+        let hidden = NSMenu(title: t.hiddenSpeakers)
+        hidden.delegate = HiddenSpeakersMenu.shared   // filled each time it opens
+        speakers.addItem(withTitle: t.hiddenSpeakers, action: nil, keyEquivalent: "").submenu = hidden
+        speakers.addItem(.sectionHeader(title: t.menuGroupDelay))
+        speakers.addItem(item(t.menuApplyDelay, #selector(AppDelegate.applyTypedDelay(_:)), "s"))
+
+        let window = submenu(of: main, title: t.menuWindow)
+        window.addItem(item(t.menuCloseWindow, #selector(NSWindow.performClose(_:)), "w"))
+        window.addItem(item(t.menuMinimize, #selector(NSWindow.performMiniaturize(_:)), "m"))
+        window.addItem(item(t.menuZoom, #selector(NSWindow.performZoom(_:))))
+        window.addItem(.separator())
+        window.addItem(item(t.mainWindowTitle, #selector(AppDelegate.showMainWindow(_:)), "0"))
+        window.addItem(item(t.equalizer, #selector(AppDelegate.showEqualizer(_:)), "e", [.command, .option]))
+        window.addItem(withTitle: t.presets, action: nil, keyEquivalent: "").submenu = PresetsMenu.make(text: t)
+        window.addItem(item(t.webRemoteMenu, #selector(AppDelegate.showWebRemote(_:))))
+        window.addItem(.separator())
+        window.addItem(item(t.menuBringAllToFront, #selector(NSApplication.arrangeInFront(_:))))
+        NSApp.windowsMenu = window
+
+        let help = submenu(of: main, title: t.menuHelp)
+        help.addItem(item(t.guideTitle, #selector(AppDelegate.showGuide(_:)), "?"))
+        NSApp.helpMenu = help
+
+        return main
+    }
+
+    private static func submenu(of main: NSMenu, title: String) -> NSMenu {
+        let menu = NSMenu(title: title)
+        main.addItem(withTitle: title, action: nil, keyEquivalent: "").submenu = menu
+        return menu
+    }
+
+    private static func item(_ title: String, _ action: Selector, _ key: String = "",
+                             _ modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = modifiers
+        return item
+    }
+}
+
+/// Window > Presets (S261). Rebuilt when the names or the order change, not
+/// when it opens, so Control-Command-1 to 9 work while it is closed;
+/// `validateMenuItem` keeps the check on the current one.
+@MainActor
+enum PresetsMenu {
+    private static weak var menu: NSMenu?
+    private static var text = UIStrings()
+    private static var shown: [PresetRow]?
+    /// The rows of the last push, which may come before the menu is made.
+    private static var latest: [PresetRow] = []
+
+    static func make(text t: UIStrings) -> NSMenu {
+        let menu = NSMenu(title: t.presets)
+        self.menu = menu
+        text = t
+        shown = nil
+        update(latest)
+        return menu
+    }
+
+    static func update(_ rows: [PresetRow]) {
+        latest = rows
+        guard let menu else { return }
+        let names = rows.map { PresetRow(id: $0.id, name: $0.name) }
+        guard names != shown else { return }
+        shown = names
+        menu.removeAllItems()
+        for entry in PresetMenu.entries(rows, text: text) {
+            switch entry {
+            case .preset(let id, let title, let key, let checked):
+                let item = NSMenuItem(title: title, action: #selector(AppDelegate.recallPresetFromMenu(_:)),
+                                      keyEquivalent: key)
+                item.keyEquivalentModifierMask = [.control, .command]
+                item.representedObject = id
+                item.state = checked ? .on : .off
+                menu.addItem(item)
+            case .empty(let title):
+                menu.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: ""))   // no action: disabled
+            case .separator:
+                menu.addItem(.separator())
+            case .save(let title):
+                menu.addItem(NSMenuItem(title: title, action: #selector(AppDelegate.savePreset(_:)),
+                                        keyEquivalent: ""))
+            }
+        }
+    }
+}

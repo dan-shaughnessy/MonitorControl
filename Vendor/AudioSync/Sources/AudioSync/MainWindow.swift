@@ -1,0 +1,2259 @@
+import AppKit
+import SwiftUI
+
+/// The main AudioSync window: every control, in two columns. Closing it leaves
+/// AudioSync running in the menu bar.
+final class MainWindowController: NSObject, NSWindowDelegate {
+    // Renamed with the slim layout so a frame saved at the old 860 pt default opens slim once.
+    private static let frameName = "AudioSyncMainWindowSlim"
+    private let window: NSWindow
+    private let model: AppModel
+    /// Whether the window was on screen at the last check, so the callback
+    /// only fires on a change.
+    private var onScreen = false
+    private var clickMonitor: Any?
+    private var appearanceWatch: NSKeyValueObservation?
+
+    init(model: AppModel) {
+        self.model = model
+        let host = NSHostingController(rootView: MainView(model: model))
+        host.sizingOptions = [.minSize]   // SwiftUI sets the minimum; the user picks the size
+        let chrome: NSWindow.StyleMask = [.titled, .resizable, .closable, .miniaturizable]
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 696, height: 600),
+                          styleMask: chrome, backing: .buffered, defer: false)
+        super.init()
+        window.contentViewController = host
+        window.title = model.text.mainWindowTitle
+        window.titleVisibility = .hidden   // the header shows the wordmark
+        window.titlebarAppearsTransparent = true
+        window.isReleasedWhenClosed = false
+        window.isExcludedFromWindowsMenu = true   // the Window menu has its own AudioSync item
+        window.delegate = self
+        // A white page in light appearance, so the hero's 5% ink reads #F4F4F4
+        // over it; dark keeps the system window color exactly.
+        appearanceWatch = window.observe(\.effectiveAppearance, options: [.initial]) { window, _ in
+            let dark = window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            window.backgroundColor = dark ? .windowBackgroundColor : .white
+        }
+        window.setContentSize(NSSize(width: 696, height: 600))
+        // Past this the speaker column stops widening and the header would stretch alone.
+        window.contentMaxSize = NSSize(width: 860, height: CGFloat.greatestFiniteMagnitude)
+        // A saved frame on a display that is no longer attached would leave
+        // the window out of reach.
+        if !window.setFrameUsingName(Self.frameName)
+            || !WindowPlacement.isReachable(window.frame, screens: NSScreen.screens.map(\.visibleFrame)) {
+            window.center()
+        }
+        window.setFrameAutosaveName(Self.frameName)
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            self?.endTyping(before: event)
+            return event
+        }
+    }
+
+    deinit {
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
+    }
+
+    /// A slider or a plain button doesn't take the keyboard focus, so a click
+    /// on one would leave a delay field or a speaker's name field holding its
+    /// typing. The field gives the focus up first, which applies the typing
+    /// (`SyncControls`, `SpeakerRow`), before the control acts on the click
+    /// (`DelayPanels.clickEndsTyping`).
+    private func endTyping(before event: NSEvent) {
+        guard event.window === window else { return }
+        model.delayFocusLeftByClick = nil
+        guard let editor = window.firstResponder as? NSTextView, editor.isFieldEditor else { return }
+        let field = FieldEditor.field(DelayTextField.Field.self, editedBy: editor)
+        let point = event.locationInWindow
+        var onField = false
+        var hit = window.contentView?.superview?.hitTest(point)
+        while let view = hit, !onField {
+            onField = view is NSTextField || view === editor
+            hit = view.superview
+        }
+        let step = DelayStepArea.Marker.all.allObjects.first {
+            $0.window === window && $0.convert($0.bounds, to: nil).contains(point)
+        }
+        guard DelayPanels.clickEndsTyping(typingIn: field?.rowID ?? "", onField: onField, onStepOf: step?.rowID) else {
+            return
+        }
+        // The row's delay value takes the focus back if this click closes the panel.
+        model.delayFocusLeftByClick = field?.rowID
+        window.makeFirstResponder(nil)
+    }
+
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    private func updateOnScreen() {
+        let now = window.isVisible && window.occlusionState.contains(.visible)
+        guard now != onScreen else { return }
+        onScreen = now
+        model.actions.mainWindowVisible(now)
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) { updateOnScreen() }
+    func windowDidMiniaturize(_ notification: Notification) { updateOnScreen() }
+    func windowDidDeminiaturize(_ notification: Notification) { updateOnScreen() }
+    func windowDidBecomeKey(_ notification: Notification) {
+        updateOnScreen()
+        // The window turns key again as the menu bar panel closes; the refresh waits until it is gone.
+        model.whenPanelQuiet("window refresh") { [weak self] in self?.model.actions.refreshExternalState {} }
+    }
+
+    /// The zoom button springs between the slim and the widest width
+    /// (`MainZoom`) instead of filling the screen; with Reduce Motion it jumps.
+    func windowShouldZoom(_ window: NSWindow, toFrame newFrame: NSRect) -> Bool {
+        let target = MainZoom.target(window.frame, visible: window.screen?.visibleFrame ?? newFrame)
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            window.setFrame(target, display: true)
+        } else {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = MainMotion.zoom
+                // Fully damped: it settles without overshooting the new width.
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1)
+                window.animator().setFrame(target, display: true)
+            }
+        }
+        return false
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        // As a click outside the controls: a typed delay applies.
+        model.closeDelayPanels()
+        onScreen = false
+        model.actions.mainWindowVisible(false)
+    }
+}
+
+// MARK: - Views
+
+private let accent = Brand.teal
+
+private extension MainMotion {
+    static func rows(reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : .easeOut(duration: rowMove)
+    }
+
+    static func reveal(reduceMotion: Bool) -> Animation {
+        reduceMotion ? .linear(duration: reducedFade) : .spring(duration: control, bounce: 0)
+    }
+}
+
+struct MainView: View {
+    @ObservedObject var model: AppModel
+    @StateObject private var gearAnchor = MenuAnchor.Box()
+    @StateObject private var sheetRoom = SheetRoom()
+    @StateObject private var zoneDisclosure = ZoneDisclosure()
+    @StateObject private var windowWidth = WindowWidth()
+    @StateObject private var noticeCount = NoticeCount()
+    @StateObject private var heroHover = HoverState()
+    @StateObject private var masterDrag = VolumeDrag()
+    @FocusState private var modeFocus: TransportMode?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+
+    var body: some View {
+        let t = model.text
+        // The notices carry the gap above them, so it opens and closes with them.
+        VStack(alignment: .leading, spacing: 0) {
+            header(t)
+            NoticeStack(model: model)
+            HStack(alignment: .top, spacing: BrandTokens.Spacing.columnGap) {
+                FadingScroll(onBlankTap: { model.closeDelayPanels() }) {
+                    // One hero, then plain rows split by a hairline instead of a card each.
+                    VStack(alignment: .leading, spacing: 0) {
+                        hero(t)
+                        masterVolume(t).padding(.top, 16)
+                        Divider().padding(.vertical, 10)
+                        PresetsRow(model: model)
+                        equalizerRow(t)
+                        CalibrateAllButton(model: model).modifier(QuickRow())
+                    }
+                }
+                .frame(width: MainColumns.left(window: windowWidth.points))
+                FadingScroll(onBlankTap: { model.closeDelayPanels() }) {
+                    let all = model.layout
+                    let layout = model.zonelessLayout
+                    let zoned = model.zonedLayout
+                    ScrollViewReader { proxy in
+                        VStack(alignment: .leading, spacing: BrandTokens.Spacing.sectionGap) {
+                            if StreamingPolicy.showsNoSpeakerOnLine(
+                                noSpeakerOn: model.noSpeakerOn, rows: all.thisMac.count + all.connected.count) {
+                                Text(t.noSpeakerOn)
+                                    .font(.callout)
+                                    .foregroundStyle(Brand.secondaryText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .padding(.leading, 4)
+                            }
+                            // This Mac first: few, stable rows that don't shift as
+                            // other speakers come and go. Then the zones, then every
+                            // connected speaker (AirPlay and local) by name; a
+                            // speaker in a zone has its full row under its zone and
+                            // a compact one in its section.
+                            speakerSection(t.thisMacSection, speakers: layout.thisMac, zoned: zoned.thisMac,
+                                           empty: model.hidden.inThisMac ? t.allSpeakersHidden : t.thisMacNone,
+                                           scroll: proxy)
+                            if !model.zones.isEmpty { zonesSection(t) }
+                            speakerSection(t.connectedSection, speakers: layout.connected, zoned: zoned.connected,
+                                           empty: t.connectedEmpty(allHidden: model.hidden.inConnected,
+                                                                   virtualHidden: model.virtualOutputsHidden,
+                                                                   networkEmpty: model.networkEmptyText),
+                                           scroll: proxy,
+                                           connected: true, airPlayListed: all.connected.contains { $0.isAirPlay },
+                                           problem: model.airPlayProblem,
+                                           localNetworkHint: model.localNetworkHint)
+                        }
+                    }
+                    // A row that comes, goes or opens its delay moves its neighbours on one
+                    // ease-out; with Reduce Motion they move at once.
+                    .animation(MainMotion.rows(reduceMotion: reduceMotion),
+                               value: all.thisMac.map(\.id) + all.connected.map(\.id) + model.zones.map(\.id))
+                    .animation(MainMotion.rows(reduceMotion: reduceMotion), value: model.delayPanels)
+                    .padding(.bottom, 4)
+                }
+                // Slim by default; a wider window widens it up to 524 pt, its
+                // width in the old 860 pt window. 360 still fits a zone header.
+                .frame(minWidth: 360, maxWidth: MainColumns.speakerListFull, maxHeight: .infinity)
+            }
+            .padding(.top, NoticeStack.windowGap)
+        }
+        .animation(NoticeMotion.of(reduceMotion: reduceMotion)
+                    .columns(closing: model.notices.items.count < noticeCount.shown),
+                   value: model.notices)
+        .onChange(of: model.notices.items.count, initial: true) { noticeCount.shown = model.notices.items.count }
+        .padding(.horizontal, BrandTokens.Spacing.windowMargin)
+        .padding(.top, 4)
+        .padding(.bottom, 20)
+        .frame(minWidth: 696, maxWidth: .infinity, minHeight: 460, maxHeight: .infinity, alignment: .topLeading)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { sheetRoom.height = $0 }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { windowWidth.points = $0 }
+        // A click no row or control takes closes the delay panels, applying
+        // what was typed. Behind everything, so the header can still drag
+        // the window.
+        .background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { model.closeDelayPanels() }
+        }
+        // Near monochrome: sliders and controls in ink, teal only where a state shows.
+        .tint(.primary)
+        .sheet(isPresented: Binding(get: { model.calibrateAll.shown },
+                                    set: { if !$0 { model.actions.closeCalibrateAll() } })) {
+            CalibrateAllSheetView(model: model, room: sheetRoom.height).tint(accent)
+        }
+        // On the content, not the window's root: one view holds one sheet.
+        .background {
+            Color.clear.sheet(isPresented: $model.castAddShown) { CastAddressSheet(model: model).tint(accent) }
+        }
+    }
+
+    // MARK: Header
+
+    private func header(_ t: UIStrings) -> some View {
+        HStack(spacing: 12) {
+            BreathingMark(model: model, onScreen: \.mainOnScreen)
+                .frame(width: 32, height: 32)
+                .accessibilityHidden(true)
+                .allowsHitTesting(false)
+            VStack(alignment: .leading, spacing: 2) {
+                Wordmark(size: BrandTokens.Typography.wordmarkSize)
+                Text(model.mainStatusText)
+                    .font(.callout)
+                    .foregroundStyle(Brand.secondaryText)
+                    // A new status replaces the old in the same frame.
+                    .transaction { $0.animation = nil }
+            }
+            .allowsHitTesting(false)
+            Spacer()
+            gearMenu(t)
+            PowerSwitch(isOn: model.running, text: t) { model.actions.setPower(!model.running) }
+                .help(model.running ? t.turnOff : t.turnOn)
+        }
+        // The band drags the window like a title bar, and as a click outside
+        // every speaker row it closes the delay panels; the gear and the
+        // switch sit above it and take their own clicks.
+        .background(WindowDragArea { model.closeDelayPanels() }.accessibilityHidden(true))
+    }
+
+    /// The gear's menu is AppKit's; it opens under the gear.
+    private func gearMenu(_ t: UIStrings) -> some View {
+        Button {
+            if let anchor = gearAnchor.view { GearMenu.make(model: model, text: t).popUp(under: anchor) }
+        } label: {
+            Image(systemName: "gearshape")
+                .font(.system(size: 15))
+        }
+        .buttonStyle(.borderless)
+        .background(MenuAnchor(box: gearAnchor).accessibilityHidden(true))
+        .fixedSize()
+        .accessibilityLabel(t.moreOptions)
+        .accessibilityHint(t.moreOptionsHint)
+        .help(t.moreOptions)
+    }
+
+    // MARK: Left column
+
+    /// The hero: the source, then what plays, on a faint fill of its own.
+    private func hero(_ t: UIStrings) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SourcePicker(model: model, large: true)
+            InputLevelMeter(level: model.inputLevel, text: t)
+            if let hint = model.liveInputAirPlayHint { LiveInputAirPlayNote(message: hint) }
+            if let track = model.nowPlaying { nowPlaying(track, t) }
+        }
+        .padding(MainColumns.heroPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: BrandTokens.Radius.card).fill(Color.primary.opacity(0.05))
+            if let track = model.nowPlaying {
+                AmbientTint(tide: SoundTide.shared, color: CoverColors.of(track.artwork)[0],
+                            cornerRadius: BrandTokens.Radius.card)
+            }
+        }
+        .onHover { heroHover.isHovered = $0 }
+    }
+
+    private func nowPlaying(_ track: NowPlayingMonitor.Track, _ t: UIStrings) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    if let art = track.artwork {
+                        Image(nsImage: art).resizable().aspectRatio(contentMode: .fill)
+                    } else {
+                        ZStack {
+                            Color.secondary.opacity(0.15)
+                            Image(systemName: "music.note").font(.system(size: 28)).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .padding(.top, 2)
+                .accessibilityHidden(true)
+            AmbientArt(tide: SoundTide.shared, colors: CoverColors.of(track.artwork))
+                .padding(.vertical, 3)
+            ScrollingTitle(text: track.title).font(.title3.weight(.semibold))
+            ScrollingTitle(text: track.artist.isEmpty ? track.appName : track.artist)
+                .font(.callout).foregroundStyle(Brand.secondaryText)
+            HStack(spacing: MainColumns.transportSpacing(
+                modes: track.shuffle != nil || track.repeatMode != nil)) {
+                if let shuffle = track.shuffle {
+                    modeButton("shuffle", .shuffle(!shuffle), on: shuffle, label: t.shuffle,
+                               value: shuffle ? t.on : t.off)
+                        .focused($modeFocus, equals: .shuffle)
+                        .modifier(Reveal(shown: modesShown))
+                }
+                transportButton("backward.fill", .previous, label: t.previousTrack)
+                transportButton(track.isPlaying ? "pause.fill" : "play.fill", .playPause,
+                                label: track.isPlaying ? t.pause : t.play)
+                    .font(.system(size: 22))
+                transportButton("forward.fill", .next, label: t.nextTrack)
+                if let mode = track.repeatMode {
+                    modeButton("arrow.2.squarepath",
+                               .repeatMode(mode.next(withOne: track.bundleID == NowPlayingMonitor.music)),
+                               on: mode != .off, one: mode == .one, label: t.repeatMode,
+                               value: mode == .one ? t.repeatOne : mode == .all ? t.on : t.off)
+                        .focused($modeFocus, equals: .repeatMode)
+                        .modifier(Reveal(shown: modesShown))
+                }
+            }
+            .font(.system(size: 16))
+            .frame(maxWidth: .infinity)
+            .padding(.top, 6)
+        }
+    }
+
+    /// Shuffle and Repeat wait one step away: hover or keyboard focus on the
+    /// hero shows them, and VoiceOver always finds them.
+    private var modesShown: Bool { heroHover.isHovered || modeFocus != nil || voiceOver }
+
+    private func transportButton(_ symbol: String, _ command: NowPlayingMonitor.Command,
+                                 label: String) -> some View {
+        Button { model.actions.transport(command) } label: {
+            Image(systemName: symbol)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel(label)
+        .help(label)
+    }
+
+    /// `one`: repeat-one, a "1" inside the loop. On shows as the accent with a dot under it.
+    private func modeButton(_ symbol: String, _ command: NowPlayingMonitor.Command, on: Bool, one: Bool = false,
+                            label: String, value: String) -> some View {
+        Button { model.actions.transport(command) } label: {
+            Image(systemName: symbol)
+                .overlay {
+                    if one { Text(verbatim: "1").font(.system(size: 7, weight: .bold)) }
+                }
+                // An overlay, so the dot leaves the row's height and centering as they are.
+                .overlay(alignment: .bottom) {
+                    Circle().frame(width: 4, height: 4).offset(y: 7).opacity(on ? 1 : 0)
+                }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(on ? Brand.tealText : Color.secondary)
+        .accessibilityLabel(label)
+        .accessibilityValue(value)
+        .help(label)
+    }
+
+    private func masterVolume(_ t: UIStrings) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(t.masterVolumeTitle)
+                .font(.subheadline)
+                .foregroundStyle(Brand.secondaryText)
+                .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 8) {
+                MasterMuteButton(model: model, text: t)
+                Slider(value: Binding(get: { model.master }, set: { model.actions.setMaster($0) }),
+                       in: 0...100, onEditingChanged: { masterDrag.held = $0 })
+                    .controlSize(.small)
+                    .accessibilityLabel(t.masterVolume)
+                    .accessibilityValue(t.volumeValue(model.master))
+                Text(t.volumeValue(model.master))
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(masterDrag.held ? Color.primary : Brand.secondaryText)
+                    .frame(width: 26, alignment: .trailing)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private func equalizerRow(_ t: UIStrings) -> some View {
+        Button { model.actions.openEqualizer() } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "slider.vertical.3")
+                    .font(.system(size: 15))
+                    .frame(width: 20)
+                Text(t.equalizer).lineLimit(1).layoutPriority(1)
+                // The teal dot is the row's one state mark: the curve is on.
+                if model.equalizerOn {
+                    Circle().fill(accent).frame(width: 6, height: 6)
+                }
+                ScrollingTitle(text: model.equalizerOn ? model.equalizerCurve : t.off)
+                    .foregroundStyle(Brand.secondaryText)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.secondaryText)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .modifier(QuickRow())
+        .accessibilityLabel(t.equalizer)
+        .accessibilityValue(model.equalizerOn ? t.equalizerCardOn(model.equalizerCurve) : t.off)
+    }
+
+    // MARK: Right column
+
+    private func zonesSection(_ t: UIStrings) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionTitle(t.zones).padding(.leading, 4)
+            VStack(spacing: 0) {
+                ForEach(Array(model.zones.enumerated()), id: \.element.id) { index, zone in
+                    if index > 0 { Divider() }
+                    ZoneCard(model: model, disclosure: zoneDisclosure, zone: zone)
+                        .id(ZoneAnchor(id: zone.id))
+                }
+            }
+        }
+    }
+
+    /// `connected`: the Connected Speakers list, whose rows name their kind of
+    /// output ("Bluetooth") and which carries AirPlay's status: `problem`
+    /// (why AirPlay can't work right now) above the list, and while no AirPlay
+    /// speaker is listed, `empty` (starting, none found) with the Local
+    /// Network hint. Denied Local Network access shows even over a stale list.
+    /// `airPlayListed`: an AirPlay speaker is listed, in a zone or not, so
+    /// the AirPlay delay stays here.
+    /// `zoned`: its speakers that are in a zone, as compact rows after the
+    /// others; `scroll` brings a zone into view for their zone chips.
+    private func speakerSection(_ title: String, speakers: [AppModel.Speaker], zoned: [AppModel.Speaker],
+                                empty: String, scroll: ScrollViewProxy,
+                                connected: Bool = false, airPlayListed: Bool = false, problem: String? = nil,
+                                localNetworkHint: LocalNetworkHint = .none) -> some View {
+        let hint = model.text.localNetworkHint(localNetworkHint, short: false)
+        let hasAirPlay = airPlayListed || speakers.contains { $0.isAirPlay }
+        let listsNone = speakers.isEmpty && zoned.isEmpty
+        return VStack(alignment: .leading, spacing: 6) {
+            SectionTitle(title).padding(.leading, 4)
+            // Rows on the window itself, split by hairlines: no card around the section.
+            VStack(spacing: 0) {
+                if let problem {
+                    AirPlayProblemView(message: problem, canRetry: true,
+                                       text: model.text) { model.actions.retryAirPlay() }
+                        .padding(10)
+                    if !listsNone { Divider() }
+                } else if listsNone {
+                    emptyNote(empty, hint: hint, under: [])
+                } else if hasAirPlay && localNetworkHint == .denied, let hint {
+                    LocalNetworkHintView(message: hint, text: model.text).padding(10)
+                    Divider()
+                }
+                ForEach(Array(speakers.enumerated()), id: \.element.id) { index, speaker in
+                    if index > 0 { Divider().padding(.leading, ZoneLook.nameColumn) }
+                    SpeakerRow(model: model, speaker: speaker, showTag: connected)
+                }
+                if connected && problem == nil && hasAirPlay {
+                    // One AirPlay delay for every local speaker, not on any row (S181).
+                    if !speakers.isEmpty { Divider().padding(.leading, ZoneLook.nameColumn) }
+                    AirPlayDelayRow(model: model)
+                }
+                if !zoned.isEmpty { zonedRows(zoned, scroll: scroll) }
+                let note = connected && problem == nil && !listsNone ? model.networkNote : nil
+                let lines = ZoneLayout.linesBelowRows(zoneBox: !zoned.isEmpty, note: note != nil,
+                                                      castAdd: connected && model.castCanAdd)
+                if let note {
+                    // Say where AirPlay or the Google Cast search stands, under the rows.
+                    if lines.note { Divider() }
+                    // The note leaves the network advice to the hint, so show it unless it is above.
+                    emptyNote(note, hint: hasAirPlay && localNetworkHint == .denied ? nil : hint,
+                              under: zoned.isEmpty ? speakers : [])
+                }
+                if connected && model.castCanAdd {
+                    if lines.castAdd { Divider() }
+                    Button(model.text.castAddByAddress) { model.castAddShown = true }
+                        .controlSize(.small)
+                        .help(model.text.castAddBody)
+                        .accessibilityHint(model.text.castAddBody)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                }
+            }
+        }
+    }
+
+    /// The compact rows of a section's speakers that are in a zone, under a
+    /// label whose line is the separator above them, one box per zone. Their
+    /// chip scrolls to the zone and focuses its switch.
+    private func zonedRows(_ speakers: [AppModel.Speaker], scroll: ScrollViewProxy) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: ZoneLook.labelLineGap) {
+                Text(model.text.inZones.uppercased())
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Brand.secondaryText)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .accessibilityLabel(model.text.inZones)
+                    .accessibilityAddTraits(.isHeader)
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor))
+                    .frame(height: 1)
+                    .accessibilityHidden(true)
+            }
+            .padding(.leading, ZoneLook.nameColumn)
+            .padding(.trailing, BrandTokens.Spacing.rowPaddingX)
+            .padding(.top, ZoneLook.labelTop)
+            .padding(.bottom, ZoneLook.labelBottom)
+            VStack(spacing: ZoneLook.groupGap) {
+                ForEach(ZoneLayout.byZone(speakers) { model.zone(holding: $0.key)?.id }) { group in
+                    if let zone = model.zones.first(where: { $0.id == group.zone }) {
+                        ZoneMemberGroup {
+                            ForEach(Array(group.rows.enumerated()), id: \.element.id) { index, speaker in
+                                if index > 0 { Divider().padding(.leading, ZoneLook.nameColumn) }
+                                ZoneMemberCompactRow(model: model, speaker: speaker, zone: zone) {
+                                    withAnimation(AppModel.delayPanelAnimation) {
+                                        scroll.scrollTo(ZoneAnchor(id: zone.id), anchor: .top)
+                                    }
+                                    model.focusZone = zone.id
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `under`: the rows above the note, whose last row's box it belongs to.
+    private func emptyNote(_ message: String, hint: String?, under rows: [AppModel.Speaker]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(Brand.secondaryText)
+            if let hint { LocalNetworkHintView(message: hint, text: model.text) }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        // Under a list, a click works like one on the last row; alone, it
+        // is outside every row.
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if let id = DelayPanels.noteTarget(under: rows.map { (id: $0.id, hasDelay: $0.offsetMs != nil) }) {
+                model.toggleDelayPanel(id)
+            } else {
+                model.closeDelayPanels()
+            }
+        }
+    }
+}
+
+/// Shown when Local Network access is denied, or may be because AirPlay
+/// finds nothing for a while: without it the sender can't see any speaker,
+/// and macOS doesn't say so.
+private struct LocalNetworkHintView: View {
+    let message: String
+    let text: UIStrings
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(Brand.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(text.openLocalNetworkSettings) { NSWorkspace.shared.open(PrivacyPane.localNetwork.url) }
+                .controlSize(.small)
+                .accessibilityHint(text.openSettingsHint)
+                .help(text.openSettingsHint)
+        }
+    }
+}
+
+/// The main window's width, which sets its left column's (`MainColumns`).
+/// How many notices the main window last showed: read while the next list
+/// renders, it tells a closing notice from an opening one. Not published, as
+/// updating it needs no new render.
+private final class NoticeCount: ObservableObject {
+    var shown = 0
+}
+
+private final class WindowWidth: ObservableObject {
+    @Published var points: CGFloat = 0
+}
+
+/// A title or name on one line. One too long for it scrolls to its end and
+/// back (`Marquee`); with Reduce Motion it is cut with an ellipsis.
+struct ScrollingTitle: View {
+    let text: String
+    /// Whether a name cut at its line shows in full in its tooltip.
+    let tip: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var line = MarqueeLine()
+
+    init(text: String, tip: Bool = false) {
+        self.text = text
+        self.tip = tip
+    }
+
+    var body: some View {
+        if tip {
+            // Applied only here, so a caller's own tooltip on the name stays.
+            title.help(Marquee.overflow(text: line.textWidth, line: line.width, reduceMotion: false) > 0 ? text : "")
+        } else {
+            title
+        }
+    }
+
+    @ViewBuilder private var title: some View {
+        let overflow = Marquee.overflow(text: line.textWidth, line: line.width, reduceMotion: reduceMotion)
+        Text(text)
+            .lineLimit(1)
+            .opacity(overflow > 0 ? 0 : 1)
+            // Only a name that runs over takes the whole line, so one that
+            // fits keeps what follows it (an icon, a note) beside it.
+            .frame(maxWidth: overflow > 0 ? .infinity : nil, alignment: .leading)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { line.width = $0 }
+            .overlay(alignment: .leading) {
+                TimelineView(.animation(paused: overflow == 0)) { context in
+                    Text(text)
+                        .fixedSize()
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { line.textWidth = $0 }
+                        .offset(x: -Marquee.offset(elapsed: context.date.timeIntervalSince(line.start),
+                                                   overflow: overflow))
+                        .opacity(overflow > 0 ? 1 : 0)
+                }
+            }
+            .clipped()
+            // Clipping hides the scrolled text but leaves it hit-testable over the controls beside it.
+            .contentShape(Rectangle())
+            .onChange(of: text) { line.start = .now }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(text)
+    }
+}
+
+private final class MarqueeLine: ObservableObject {
+    @Published var width: CGFloat = 0
+    @Published var textWidth: CGFloat = 0
+    var start = Date()
+}
+
+/// A zone's member rows, set apart by a hairline on their leading edge
+/// instead of a tinted box; whether a member plays shows in its badge.
+private struct ZoneMemberGroup<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(spacing: 0) { content }
+            .overlay(alignment: .leading) {
+                Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1).accessibilityHidden(true)
+            }
+    }
+}
+
+private struct SectionTitle: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+
+    var body: some View {
+        Text(title.uppercased())
+            .font(.subheadline)
+            .tracking(0.4)
+            .foregroundStyle(Brand.secondaryText)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// The Presets row (S259): the current preset's name, and a menu that
+/// recalls a preset, saves one, and renames, updates or deletes each one.
+private struct PresetsRow: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let t = model.text
+        let current = PresetPanel.label(model.presets)
+        Menu {
+            if model.presets.isEmpty {
+                Text(t.presetsEmpty)
+            }
+            ForEach(model.presets) { row in
+                Toggle(row.name, isOn: Binding(get: { row.current },
+                                               set: { _ in model.actions.recallPreset(row.id) }))
+            }
+            Divider()
+            Button(t.savePreset) { model.actions.savePreset() }
+            Divider()
+            ForEach(model.presets) { row in
+                Menu(row.name) {
+                    Button(t.renamePreset) { model.actions.renamePreset(row.id) }
+                    Button(t.updatePreset) { model.actions.updatePreset(row.id) }
+                        .disabled(!PresetEdit.canUpdate(row))
+                    Button(t.deletePreset, role: .destructive) { model.actions.deletePreset(row.id) }
+                }
+            }
+        } label: {
+            // AppKit draws the label; unnamed symbols keep VoiceOver on the text (SourcePicker.unnamedSymbol).
+            HStack(spacing: 8) {
+                SourcePicker.unnamedSymbol("square.stack.3d.up")
+                    .frame(width: 18, height: 16)
+                Text(t.presets).lineLimit(1)
+                Text(current ?? "").foregroundStyle(Brand.secondaryText).lineLimit(1)
+                Spacer(minLength: 0)
+                SourcePicker.unnamedSymbol("chevron.down")
+                    .foregroundStyle(.tertiary)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(t.presets)
+            .accessibilityValue(current ?? t.choosePreset)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .tint(.primary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(QuickRow())
+        .help(current ?? t.choosePreset)
+        .accessibilityLabel(t.presets)
+        .accessibilityValue(current ?? t.choosePreset)
+    }
+}
+
+/// A left-column row below the hero: 34 pt high, with a faint fill under the pointer.
+private struct QuickRow: ViewModifier {
+    @StateObject private var hover = HoverState()
+
+    func body(content: Content) -> some View {
+        content
+            .frame(minHeight: 34)
+            .padding(.horizontal, MainColumns.rowInset)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(hover.isHovered ? 0.05 : 0)))
+            // The fill comes in over 80 ms and leaves at once.
+            .animation(hover.isHovered ? .linear(duration: 0.08) : nil, value: hover.isHovered)
+            .onHover { hover.isHovered = $0 }
+    }
+}
+
+/// A control that waits one step away: it slides 4 pt in and shows on hover
+/// or focus, and only fades with Reduce Motion.
+private struct Reveal: ViewModifier {
+    let shown: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(shown ? 1 : 0)
+            .offset(x: shown || reduceMotion ? 0 : 4)
+            .animation(MainMotion.reveal(reduceMotion: reduceMotion), value: shown)
+    }
+}
+
+private enum TransportMode: Hashable {
+    case shuffle, repeatMode
+}
+
+/// The zones collapsed in one view: the main window and the menu bar panel
+/// each keep their own. Every zone opens expanded, and nothing is saved. An
+/// object rather than @State: the Command Line Tools toolchain ships without
+/// SwiftUI's macro plugins.
+final class ZoneDisclosure: ObservableObject {
+    @Published private(set) var collapsed: Set<String> = []
+    /// True from a fold until its motion is over (`PanelFold`).
+    @Published private(set) var moving = false
+    private var folds = 0
+
+    func isExpanded(_ id: String) -> Bool { !collapsed.contains(id) }
+
+    func toggle(_ id: String) {
+        if collapsed.remove(id) == nil { collapsed.insert(id) }
+        folds += 1
+        let fold = folds
+        let motion = PanelFold(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        guard motion.moves else {
+            moving = false
+            return
+        }
+        moving = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + motion.duration + 0.05) { [weak self] in
+            guard let self, self.folds == fold else { return }
+            self.moving = false
+        }
+    }
+}
+
+/// Whether a volume slider is held. An object rather than @State, for the
+/// same reason as ZoneDisclosure; the number beside the slider brightens
+/// while it is.
+final class VolumeDrag: ObservableObject {
+    @Published var held = false
+}
+
+/// The brand mark in a header, breathing (`MarkBreath`) while no network
+/// speaker has been found.
+struct BreathingMark: View {
+    @ObservedObject var model: AppModel
+    let onScreen: KeyPath<MarkBreath, Bool>
+    @ObservedObject private var breath = MarkBreath.shared
+    @StateObject private var start = BreathStart()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let breathes = MarkBreath.breathes(networkSpeakers: model.airplay.count + model.cast.count,
+                                           localNetworkRefused: model.localNetworkHint.accessRefused,
+                                           reduceMotion: reduceMotion, onScreen: breath[keyPath: onScreen])
+        // 30 frames a second is plenty for a 4.5 s breath; paused, it asks for no frames.
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !breathes)) { context in
+            let depth = breathes
+                ? MarkBreath.depth(sinceStart: context.date.timeIntervalSince(start.since(context.date))) : 0
+            BrandMark()
+                .fill(model.running ? Brand.logo : Color.secondary)
+                .scaleEffect(MarkBreath.scale(depth: depth))
+                .opacity(MarkBreath.opacity(depth: depth))
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: MarkBreath.settle), value: breathes)
+        .onChange(of: breathes) { _, now in
+            if !now { start.date = nil }
+        }
+    }
+}
+
+/// One zone: its header (disclosure, switch, volume, options), then its
+/// members as speaker rows, dimmed while they can't play with it.
+private struct ZoneCard: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var disclosure: ZoneDisclosure
+    let zone: AppModel.Zone
+
+    private var state: SpeakerState { model.state(of: zone) }
+    private var waitNote: String? { model.waitNote(of: zone) }
+    // A waiting zone's icon is outlined, as while streaming is off; a click still switches it off.
+    private var shownState: SpeakerState { waitNote == nil ? state : .willPlay }
+    private var expanded: Bool { disclosure.isExpanded(zone.id) }
+    // The icon greys out and folds then: unfolding still lists the missing speakers.
+    private var nonePresent: Bool { zone.present == 0 }
+    /// The header part that takes the focus from a member's Go to Zone.
+    @FocusState private var focused: ZoneHeaderHit.Area?
+    @FocusState private var optionsFocused: Bool
+    @StateObject private var hover = HoverState()
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+
+    var body: some View {
+        let t = model.text
+        // Shaped like a speaker row: no card, the options one step away.
+        VStack(spacing: 0) {
+            header(t)
+                .onChange(of: model.focusZone, initial: true) { _, id in
+                    if id == zone.id {
+                        focused = ZoneHeaderHit.goToZoneFocus(nonePresent: nonePresent)
+                        model.focusZone = nil
+                    }
+                }
+            if expanded && !zone.members.isEmpty {
+                ZoneMemberGroup {
+                    ForEach(Array(zone.members.enumerated()), id: \.element.id) { index, member in
+                        if index > 0 { Divider().padding(.leading, ZoneLook.nameColumn) }
+                        if let speaker = model.speaker(of: member) {
+                            SpeakerRow(model: model, speaker: speaker, showTag: true, zoneNote: member.note,
+                                       grouped: true)
+                        } else {
+                            ZoneMemberPlaceholder(model: model, member: member, zone: zone, text: t)
+                        }
+                    }
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(zone.name)
+    }
+
+    private func hit(_ area: ZoneHeaderHit.Area) {
+        switch ZoneHeaderHit.action(for: area, nonePresent: nonePresent) {
+        case .fold: fold()
+        case .toggleZone: model.actions.toggleZone(zone.id)
+        case .none: break
+        }
+    }
+
+    private func fold() { withAnimation(AppModel.delayPanelAnimation) { disclosure.toggle(zone.id) } }
+
+    private func arrowKey(_ press: KeyPress) -> KeyPress.Result {
+        guard ZoneHeaderHit.arrowFolds(right: press.key == .rightArrow, expanded: expanded) else { return .ignored }
+        fold()
+        return .handled
+    }
+
+    private func header(_ t: UIStrings) -> some View {
+        HStack(spacing: 8) {
+            Button { hit(.chevron) } label: {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                    .frame(width: 16, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Brand.secondaryText)
+            .accessibilityLabel(expanded ? t.hideZoneSpeakers(zone.name) : t.showZoneSpeakers(zone.name))
+            .accessibilityValue(nonePresent ? model.countText(of: zone) : "")
+            .help(expanded ? t.hideZoneSpeakers(zone.name) : t.showZoneSpeakers(zone.name))
+            // With nothing to switch the chevron speaks for the header, so it has the action too.
+            .accessibilityAction(named: t.renameZone) { model.startRename(zone) }
+            .focused($focused, equals: .chevron)
+            .onKeyPress(keys: [.leftArrow, .rightArrow]) { arrowKey($0) }
+
+            Button { hit(.zoneIcon) } label: {
+                SpeakerBadge(symbol: MenuBarView.zoneSymbol, state: shownState, size: 32)
+            }
+            .buttonStyle(.plain)
+            .opacity(nonePresent ? 0.45 : 1)
+            // With nothing to switch, the chevron speaks for the header.
+            .accessibilityHidden(nonePresent)
+            .focusable(!nonePresent)
+            .accessibilityLabel(t.zoneLabel(zone.name))
+            .accessibilityValue(nonePresent ? model.countText(of: zone)
+                                : t.zoneValue(on: zone.on, of: zone.total, waiting: zone.waiting))
+            .accessibilityHint(t.rowHint(state, note: waitNote))
+            .accessibilityAction(named: t.renameZone) { model.startRename(zone) }
+            .help(t.help(state))
+            .focused($focused, equals: .zoneIcon)
+            .onKeyPress(keys: [.leftArrow, .rightArrow]) { arrowKey($0) }
+            // The badge's gap to the name, as in a speaker row.
+            .padding(.trailing, 4)
+
+            VStack(alignment: .leading, spacing: 2) {
+                if model.isRenaming(zone) {
+                    InlineNameField(model: model, id: zone.id, placeholder: zone.name,
+                                    label: model.text.nameField(for: zone.name),
+                                    hint: model.text.zoneNameFieldHint)
+                } else {
+                    ScrollingTitle(text: zone.name, tip: true)
+                        // Read through the switch's label, whose Rename action replaces the double-click.
+                        .accessibilityHidden(true)
+                        // As on a speaker's name: a double-click renames, a single
+                        // click folds once it can't be a double-click.
+                        .gesture(TapGesture(count: 2).onEnded { model.startRename(zone) }
+                            .exclusively(before: TapGesture().onEnded { hit(.name) }))
+                }
+                countLine(t)
+                    .onTapGesture { hit(.count) }
+            }
+            // In a slim column the name and count take room from the slider first.
+            .layoutPriority(1)
+
+            Spacer(minLength: 8)
+
+            // The zone's volume shows only while the zone plays.
+            if zone.on > 0 {
+                Slider(value: Binding(get: { zone.volume }, set: { model.actions.setZoneVolume(zone.id, $0) }),
+                       in: 0...100)
+                    .controlSize(.small)
+                    .frame(minWidth: 100, maxWidth: 140)
+                    .disabled(zone.total == 0)
+                    .accessibilityLabel(t.volume(of: zone.name))
+                    .accessibilityValue(t.volumeValue(zone.volume))
+                    .help(t.volume(of: zone.name))
+            }
+
+            Menu { menuItems(t) } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .tint(Brand.secondaryText)   // grey: teal is kept for state
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel(t.speakerOptions(name: zone.name))
+            .help(t.speakerOptions(name: zone.name))
+            .focused($optionsFocused)
+            .modifier(Reveal(shown: hover.isHovered || optionsFocused || voiceOver))
+        }
+        .padding(.vertical, BrandTokens.Spacing.rowPaddingY)
+        .padding(.leading, 2)
+        .padding(.trailing, BrandTokens.Spacing.rowPaddingX)
+        .background(RoundedRectangle(cornerRadius: BrandTokens.Radius.row)
+            .fill(Color.primary.opacity(hover.isHovered ? 0.05 : 0)))
+        .animation(hover.isHovered ? .linear(duration: 0.08) : nil, value: hover.isHovered)
+        .onHover { hover.isHovered = $0 }
+        // Like a speaker row's box opening its delay panel: everything but
+        // the badge, the slider and the menu shows or hides the speakers.
+        // The chevron stays the keyboard's way in.
+        .contentShape(Rectangle())
+        .onTapGesture { hit(.blank) }
+        .contextMenu { menuItems(t) }
+    }
+
+    /// "2 of 3 on" in the readable teal while one plays, ", 1 waiting" in
+    /// secondary text; read through the switch's value instead.
+    private func countLine(_ t: UIStrings) -> some View {
+        HStack(spacing: 0) {
+            if nonePresent {
+                Text(model.countText(of: zone)).foregroundStyle(Brand.secondaryText)
+            } else {
+                Text(t.zoneCount(on: zone.on, of: zone.total))
+                    .foregroundStyle(zone.on > 0 ? Brand.tealText : Brand.secondaryText)
+                if zone.waiting > 0 {
+                    Text(t.zoneWaiting(zone.waiting)).foregroundStyle(Brand.secondaryText)
+                }
+                if let waitNote {
+                    Text(t.zoneWaitNote(waitNote)).foregroundStyle(Brand.secondaryText)
+                }
+            }
+        }
+        .font(.caption)
+        .lineLimit(1)
+        .accessibilityHidden(true)
+    }
+
+    /// One Use <target> Instead per target its members play as part of.
+    private var targetChoices: [AppModel.ZoneMember] {
+        var seen = Set<String>()
+        return zone.members.filter { member in member.target.map { seen.insert($0.key).inserted } ?? false }
+    }
+
+    @ViewBuilder
+    private func menuItems(_ t: UIStrings) -> some View {
+        Button(t.renameZone) { model.startRename(zone) }
+        ForEach(targetChoices) { member in
+            if let target = member.target {
+                Button(t.useTargetInstead(target.name)) { model.actions.useTargetInstead(zone.id, member.key) }
+            }
+        }
+        Button(t.calibrateZoneItem) { model.actions.calibrateZone(zone.id) }
+            .disabled(!CalibrateAllFlow.offersZoneRun(model.calibrateAll,
+                                                      singleHoldsOutputs: model.calibration.holdsOutputs,
+                                                      present: zone.present))
+        Divider()
+        Button(t.deleteZone, role: .destructive) { model.delete(zone) }
+    }
+}
+
+/// Where Go to Zone scrolls: a zone's card, apart from every row's ID.
+private struct ZoneAnchor: Hashable {
+    let id: String
+}
+
+/// A zone member's compact row in its own section: the switch, which works
+/// as the one on its row under the zone, its name and a chip to the zone.
+/// No volume, delay or equalizer; its menu holds Go to Zone and Remove from
+/// Zone.
+private struct ZoneMemberCompactRow: View {
+    @ObservedObject var model: AppModel
+    let speaker: AppModel.Speaker
+    let zone: AppModel.Zone
+    let goToZone: () -> Void
+
+    private var state: SpeakerState { model.state(of: speaker) }
+
+    /// What its row under the zone says: a Cast speaker's state, the wait
+    /// for AirPlay 2, or the zone's note on it.
+    private var note: String? {
+        model.text.rowNote(cast: speaker.cast, waitingForAirPlay2: speaker.waitingForAirPlay2,
+                           waitingForPtp: speaker.waitingForPtp, reconnecting: speaker.reconnecting,
+                           codeWait: speaker.codeWait, name: speaker.name,
+                           unannounced: speaker.unannounced, target: speaker.airPlayTarget)
+            ?? zone.members.first { $0.key == speaker.key }?.note
+    }
+
+    var body: some View {
+        let t = model.text
+        HStack(spacing: 12) {
+            Button { model.setEnabled(speaker, state.clickTurnsOn) } label: {
+                // As wide as a full row's switch, so the names line up.
+                SpeakerBadge(symbol: speaker.symbol, state: state, size: ZoneLook.compactBadge)
+                    .frame(width: ZoneLook.badgeColumn)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(t.inZoneLabel(speaker.name, zone: zone.name))
+            .accessibilityValue(t.rowValue(state, offline: speaker.unannounced))
+            .accessibilityHint(t.rowHint(state, note: note))
+            .accessibilityAction(named: t.renameSpeaker) { model.startRename(speaker, in: .inZones) }
+            .help(t.help(state))
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    if model.isRenaming(speaker, in: .inZones) {
+                        InlineNameField(model: model, id: speaker.id, placeholder: speaker.systemName,
+                                        label: model.text.nameField(for: speaker.systemName),
+                                        hint: model.text.speakerNameFieldHint)
+                    } else {
+                        ScrollingTitle(text: speaker.name)
+                            .font(.body)
+                            .help(t.speakerNameHelp(name: speaker.name, system: speaker.systemName, renamed: speaker.isRenamed))
+                            // The name stays whole; the chip's zone name ends in "…" first.
+                            .layoutPriority(1)
+                            // The switch's Rename action replaces the double-click.
+                            .accessibilityHidden(true)
+                            // As on its row under the zone; a single click does nothing here.
+                            .gesture(TapGesture(count: 2).onEnded { model.startRename(speaker, in: .inZones) })
+                    }
+                    Button(action: goToZone) {
+                        HStack(spacing: 4) {
+                            Image(systemName: MenuBarView.zoneSymbol)
+                                .font(.system(size: 9))
+                            Text(zone.name)
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
+                        }
+                        // The readable teal: the brand teal falls under 4.5:1 for small text.
+                        .foregroundStyle(Brand.tealText)
+                        .padding(.horizontal, ZoneLook.chipPaddingX)
+                        .frame(height: ZoneLook.chipHeight)
+                        .background(Capsule().fill(accent.opacity(ZoneLook.chipFill)))
+                        .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(t.goToZoneLabel(zone.name))
+                    .help(t.goToZoneLabel(zone.name))
+                }
+                if let note {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(Brand.secondaryText)
+                        .lineLimit(2)
+                        .accessibilityHidden(true)
+                }
+            }
+            Spacer(minLength: 0)
+            Menu { menuItems(t) } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .tint(Brand.tealText)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel(t.speakerOptions(name: speaker.name))
+            .help(t.speakerOptions(name: speaker.name))
+        }
+        .padding(.vertical, ZoneLook.compactPaddingY)
+        .padding(.horizontal, BrandTokens.Spacing.rowPaddingX)
+        .contentShape(Rectangle())
+        .contextMenu { menuItems(t) }
+    }
+
+    @ViewBuilder
+    private func menuItems(_ t: UIStrings) -> some View {
+        Button(t.goToZone, action: goToZone)
+        Button(t.removeFromZone) { model.actions.removeFromZone(speaker.key) }
+    }
+}
+
+/// A speaker's or zone's name, editable in place in its row. Like a delay
+/// field, Return or the focus leaving applies it and Escape drops it; an empty
+/// name brings back `placeholder`: a speaker's system name, a zone's name.
+private struct InlineNameField: View {
+    @ObservedObject var model: AppModel
+    let id: String
+    let placeholder: String
+    let label: String
+    let hint: String
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextField(placeholder, text: $model.renameText)
+            .textFieldStyle(.roundedBorder)
+            .frame(maxWidth: 220)
+            .accessibilityLabel(label)
+            .accessibilityHint(hint)
+            .focused($focused)
+            .onSubmit { model.commitRename(id: id) }
+            .onExitCommand { model.dropRename() }
+            // A menu item starts the rename: the field takes the focus once
+            // the menu has closed.
+            .onAppear { DispatchQueue.main.async { focused = true } }
+            .onChange(of: focused) { _, now in
+                if !now { model.commitRename(id: id) }
+            }
+    }
+}
+
+/// A zone member that can't play with its zone now: not found yet, part of a
+/// stereo pair or home theater, or a target that needs AirPlay 2.
+private struct ZoneMemberPlaceholder: View {
+    @ObservedObject var model: AppModel
+    let member: AppModel.ZoneMember
+    let zone: AppModel.Zone
+    let text: UIStrings
+    @StateObject private var hover = HoverState()
+    @FocusState private var optionsFocused: Bool
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Dimmed by the badge and secondary text, which keeps 4.5:1.
+            SpeakerBadge(symbol: member.symbol, state: .off, size: 32).opacity(0.45)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                ScrollingTitle(text: member.name).font(.body).foregroundStyle(Brand.secondaryText)
+                if let note = member.note {
+                    Text(note).font(.caption).foregroundStyle(Brand.secondaryText).lineLimit(2)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(member.name)
+            .accessibilityValue(member.note ?? "")
+            Spacer(minLength: 0)
+            // One that plays as part of a target changes through Use <target> Instead (S247).
+            if member.target == nil {
+                Menu { menuItems(text) } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .tint(Brand.secondaryText)   // grey: teal is kept for state
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel(text.speakerOptions(name: member.name))
+                .help(text.speakerOptions(name: member.name))
+                .focused($optionsFocused)
+                .modifier(Reveal(shown: hover.isHovered || optionsFocused || voiceOver))
+            }
+        }
+        .padding(.vertical, BrandTokens.Spacing.rowPaddingY)
+        .padding(.horizontal, BrandTokens.Spacing.rowPaddingX)
+        .contentShape(Rectangle())
+        .onHover { hover.isHovered = $0 }
+        .contextMenu { if member.target == nil { menuItems(text) } }
+    }
+
+    /// As a speaker row's: Move to Zone (the other zones, then New Zone…)
+    /// and Remove from Zone, as on Windows.
+    @ViewBuilder
+    private func menuItems(_ t: UIStrings) -> some View {
+        Menu(t.moveToZone) {
+            let others = model.zones.filter { $0.id != zone.id }
+            ForEach(others) { other in
+                Button(other.name) { model.move(member, to: other) }
+            }
+            if !others.isEmpty { Divider() }
+            Button(t.newZoneItem) { model.actions.newZoneWithSpeaker(member.key, member.name) }
+        }
+        Button(t.removeFromZone) { model.actions.removeFromZone(member.key) }
+    }
+}
+
+struct SpeakerRow: View {
+    @ObservedObject var model: AppModel
+    let speaker: AppModel.Speaker
+    /// Show the kind of output (an AirPlay, Bluetooth, USB… icon) after the
+    /// speaker's name; VoiceOver reads it in the row's label.
+    var showTag = false
+    /// What the speaker's zone says about it, shown when its own note is empty.
+    var zoneNote: String? = nil
+    /// In its zone's box, which takes the place of the row's own hover fill.
+    var grouped = false
+
+    private var tag: String? { showTag ? model.text.speakerTag(speaker.tag, airPlay2: speaker.airPlay2) : nil }
+
+    private var showSync: Bool { model.delayPanels.isOpen(speaker.id) }
+
+    private var state: SpeakerState { model.state(of: speaker) }
+
+    /// Keyboard focus on the volume slider and on the device volume fix: the
+    /// fix goes away once it works, so focus moves to the slider first.
+    @FocusState private var volumeFocused: Bool
+    @FocusState private var deviceVolumeFixFocused: Bool
+    /// The delay value, which takes the focus back when its panel closes.
+    @FocusState private var delayFocused: Bool
+    /// The switch, which takes the focus when a neighbouring row is hidden.
+    @FocusState private var switchFocused: Bool
+    /// The volume slider is held; a row closed mid-drag never sees the release.
+    @StateObject private var volumeDrag = VolumeDrag()
+    @StateObject private var hover = HoverState()
+    @FocusState private var optionsFocused: Bool
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+
+    var body: some View {
+        let t = model.text
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Button { toggle(state.clickTurnsOn) } label: {
+                    SpeakerBadge(symbol: speaker.symbol, state: state, size: 32)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(t.speakerLabel(name: speaker.name, tag: tag,
+                                                   renamedFrom: speaker.renamedFrom))
+                .accessibilityValue(t.rowValue(state, offline: speaker.unannounced))
+                .accessibilityHint(t.rowHint(state, note: note ?? t.availability(speaker.availability)))
+                .accessibilityAction(named: t.renameSpeaker) { model.startRename(speaker) }
+                .help(t.help(state))
+                .focused($switchFocused)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        if model.isRenaming(speaker, in: .row) {
+                            InlineNameField(model: model, id: speaker.id, placeholder: speaker.systemName,
+                                        label: model.text.nameField(for: speaker.systemName),
+                                        hint: model.text.speakerNameFieldHint)
+                        } else {
+                            ScrollingTitle(text: speaker.name)
+                                // The note beside it wraps or truncates first.
+                                .layoutPriority(1)
+                                .help(t.speakerNameHelp(name: speaker.name, system: speaker.systemName, renamed: speaker.isRenamed))
+                                // The toggle's label already reads the name and device name,
+                                // and its Rename action replaces the double-click.
+                                .accessibilityHidden(true)
+                                // A double-click renames; a single click works like the
+                                // rest of the row, once it can't be a double-click.
+                                .gesture(TapGesture(count: 2).onEnded { model.startRename(speaker) }
+                                    .exclusively(before: TapGesture().onEnded { rowTapped() }))
+                        }
+                        if showTag {
+                            SpeakerTypeIcon(kind: speaker.tag, state: state, text: t, airPlay2: speaker.airPlay2)
+                        }
+                        if speaker.codeWait == nil {
+                            AvailabilityNote(availability: speaker.availability, text: t)
+                        }
+                        if let note {
+                            // Read in the speaker's hint.
+                            Text(note)
+                                .font(.caption)
+                                .foregroundStyle(Brand.secondaryText)
+                                // A group's member list can outrun the row.
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .help(note)
+                                .accessibilityHidden(true)
+                        }
+                        if speaker.autoConnect {
+                            Image(systemName: "bolt.fill")
+                                .font(.caption2)
+                                // Text-sized glyph: the readable teal, not the brand teal.
+                                .foregroundStyle(Brand.tealText)
+                                .help(t.autoConnect)
+                                .accessibilityLabel(t.autoConnect)
+                        }
+                        Spacer()
+                        // No delay field on AirPlay rows, nor on the reference's (S181).
+                        if speaker.offsetMs != nil {
+                            DelayValueButton(model: model, id: speaker.id, draft: model.draft(for: speaker.id),
+                                             label: t.delay(of: speaker.name),
+                                             showsTimer: true, focus: $delayFocused)
+                                // A delay of 0 waits one step away, like the options.
+                                .modifier(Reveal(shown: oneStepShown || delayFocused || showSync
+                                                     || (model.savedDelay(of: speaker.id) ?? 0) != 0))
+                        }
+                        optionsMenu(t)
+                            .focused($optionsFocused)
+                            .modifier(Reveal(shown: oneStepShown || optionsFocused))
+                    }
+                    HStack(spacing: 8) {
+                        Slider(value: Binding(get: { speaker.volume }, set: { model.setVolume(speaker, $0) }),
+                               in: 0...100, onEditingChanged: { editing in
+                                   volumeDrag.held = editing
+                                   model.setVolumeDragging(speaker, editing)
+                               })
+                            .onDisappear {
+                                if volumeDrag.held {
+                                    volumeDrag.held = false
+                                    model.setVolumeDragging(speaker, false)
+                                }
+                            }
+                            .controlSize(.small)
+                            .disabled(volumeLocked != nil)
+                            .accessibilityLabel(t.volume(of: speaker.name))
+                            .accessibilityValue(t.volumeValue(speaker.volume))
+                            .hintAndHelp(volumeLocked)
+                            .modifier(CastVolumeKeys(step: speaker.isCast
+                                ? { up in model.actions.stepCastVolume(speaker.id, up) } : nil))
+                            .focused($volumeFocused)
+                        Text(t.volumeValue(speaker.volume))
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundStyle(volumeDrag.held ? Color.primary : Brand.secondaryText)
+                            .frame(width: 26, alignment: .trailing)
+                            .accessibilityHidden(true)
+                    }
+                    // macOS's own volume of this output, when it is low or muted (S198).
+                    if let hint = model.deviceVolume(of: speaker) {
+                        DeviceVolumeLine(shown: DeviceVolumePresentation(hint, name: speaker.name, text: t),
+                                         fixFocused: $deviceVolumeFixFocused) {
+                            // The button goes with the hint once the fix works; keyboard
+                            // focus on it moves to this row's slider first, not to nowhere.
+                            if deviceVolumeFixFocused { volumeFocused = true }
+                            model.actions.fixDeviceVolume(speaker.id)
+                        }
+                    }
+                    if let cast = speaker.cast, cast.live { castButtons(cast, t) }
+                }
+            }
+            if showSync, let ms = model.savedDelay(of: speaker.id) {
+                SyncControls(model: model, id: speaker.id,
+                             kind: speaker.isCast ? .cast : .offset(hasReference: model.hasLocalReference), ms: ms,
+                             label: t.delay(of: speaker.name), text: t, draft: model.draft(for: speaker.id),
+                             escape: {
+                    // Dropped first: the field losing the focus would apply it.
+                    model.dropDelayTyping()
+                    delayFocused = true
+                }) { ms in
+                    if speaker.isCast { model.actions.setCastOffset(speaker.id, ms) }
+                    else { model.actions.setLocalOffset(speaker.id, ms) }
+                }
+                .padding(.leading, 44)
+                .transition(.opacity)
+                // A Cast speaker's timing isn't known to the microphone sweep's model.
+                if !speaker.isCast {
+                    CalibrationControl(model: model, id: speaker.id, name: speaker.name, speakerOn: speaker.enabled,
+                                       leftOut: speaker.calibrationLeftOut)
+                        .padding(.leading, 44)
+                        .transition(.opacity)
+                }
+            }
+        }
+        .onChange(of: showSync) { _, open in
+            if !open, model.draft(for: speaker.id).fieldFocused || model.delayFocusLeftByClick == speaker.id {
+                delayFocused = true
+            }
+        }
+        .onChange(of: model.focusSwitch, initial: true) { _, id in
+            if id == speaker.id {
+                switchFocused = true
+                model.focusSwitch = nil
+            }
+        }
+        .padding(.vertical, BrandTokens.Spacing.rowPaddingY)
+        .padding(.horizontal, BrandTokens.Spacing.rowPaddingX)
+        // Teal marks state on the badge alone; the row's fill only follows the pointer,
+        // in over 80 ms and out at once.
+        .background(RoundedRectangle(cornerRadius: BrandTokens.Radius.row)
+            .fill(Color.primary.opacity(hover.isHovered && !grouped ? 0.05 : 0)))
+        .animation(hover.isHovered ? .linear(duration: 0.08) : nil, value: hover.isHovered)
+        .onHover { hover.isHovered = $0 }
+        // A click on the row's box, between its dividers and its open
+        // panel's blank space included, works like its delay value; a row
+        // without one (AirPlay, the reference) is outside every panel. The
+        // delay value stays the keyboard's way in.
+        .contentShape(Rectangle())
+        .onTapGesture { rowTapped() }
+        .contextMenu { menuItems(t) }
+    }
+
+    /// The pointer on the row, or VoiceOver, shows its options and a delay of 0.
+    private var oneStepShown: Bool { hover.isHovered || voiceOver }
+
+    private func rowTapped() {
+        if speaker.offsetMs != nil { model.toggleDelayPanel(speaker.id) } else { model.closeDelayPanels() }
+    }
+
+    @ViewBuilder
+    private func menuItems(_ t: UIStrings) -> some View {
+        Button(t.renameSpeaker) { model.startRename(speaker) }
+        if let cast = speaker.cast {
+            // A Cast speaker never turns itself on: the menu has its session's actions.
+            if cast.offersMute {
+                Button(cast.muted ? t.castUnmute : t.castMute) { model.actions.setCastMuted(speaker.id, !cast.muted) }
+            }
+            if cast.live {
+                Button(t.castResync) { model.actions.resyncCast(speaker.id) }
+            }
+            if cast.removable { Button(t.castRemove) { model.actions.removeCastAddress(speaker.id) } }
+        } else {
+            autoConnectToggle(t)
+            if speaker.paired || speaker.holdsCredentials {
+                Button(t.forgetPairing) { model.actions.forgetAirPlayPairing(speaker.id) }
+                    .help(t.forgetPairingHelp)
+            } else if speaker.holdsPassword {
+                Button(t.forgetPassword) { model.actions.forgetAirPlayPairing(speaker.id) }
+                    .help(t.forgetPasswordHelp)
+            }
+        }
+        Divider()
+        zoneItems(t)
+        if !speaker.isReference {
+            Divider()
+            Button(t.hideSpeaker) { model.hide(speaker) }
+                .help(t.hideSpeakerHelp)
+        }
+    }
+
+    /// Move to Zone (the other zones, then New Zone…), and Only This Speaker
+    /// and Remove from Zone while the speaker is in one.
+    @ViewBuilder
+    private func zoneItems(_ t: UIStrings) -> some View {
+        let current = model.zone(holding: speaker.key)
+        if current?.members.contains(where: { $0.key == speaker.key && $0.speakerID != nil }) == true {
+            Button(t.onlyThisSpeaker) { model.actions.onlyThisSpeaker(speaker.key) }
+        }
+        Menu(t.moveToZone) {
+            let others = model.zones.filter { $0.id != current?.id }
+            ForEach(others) { zone in
+                Button(zone.name) { model.move(speaker, to: zone) }
+            }
+            if !others.isEmpty { Divider() }
+            Button(t.newZoneItem) { model.actions.newZoneWithSpeaker(speaker.key, speaker.name) }
+        }
+        if current != nil {
+            Button(t.removeFromZone) { model.actions.removeFromZone(speaker.key) }
+        }
+    }
+
+    /// What a Cast speaker does, that an AirPlay 2 speaker waits for the
+    /// slot or is off the network, or what a stereo pair or home theater
+    /// group is made of.
+    private var note: String? {
+        model.text.rowNote(cast: speaker.cast, waitingForAirPlay2: speaker.waitingForAirPlay2,
+                           waitingForPtp: speaker.waitingForPtp, reconnecting: speaker.reconnecting,
+                           codeWait: speaker.codeWait, name: speaker.name,
+                           unannounced: speaker.unannounced, target: speaker.airPlayTarget) ?? zoneNote
+    }
+
+    /// The device's own volume moves only while a session reaches it.
+    private var volumeLocked: String? {
+        model.text.volumeLocked(enabled: speaker.enabled, cast: speaker.cast)
+    }
+
+    /// Resync, and Mute unless the volume is fixed, under a Cast speaker's volume while it connects or plays.
+    private func castButtons(_ cast: CastRow, _ t: UIStrings) -> some View {
+        HStack(spacing: 14) {
+            if cast.offersMute {
+                castButton(cast.muted ? t.castUnmute : t.castMute, help: cast.muted ? t.castUnmuteHelp : t.castMuteHelp, t) {
+                    model.actions.setCastMuted(speaker.id, !cast.muted)
+                }
+            }
+            castButton(t.castResync, help: t.castResyncHelp, t) { model.actions.resyncCast(speaker.id) }
+        }
+    }
+
+    private func castButton(_ title: String, help: String, _ t: UIStrings,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                // Primary text, like the device volume fix: the brand teal can
+                // fall below 4.5:1 on a playing row.
+                .foregroundStyle(.primary)
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .accessibilityLabel(t.castButtonLabel(title, name: speaker.name))
+        .accessibilityHint(help)
+        .help(help)
+    }
+
+    private func optionsMenu(_ t: UIStrings) -> some View {
+        Menu { menuItems(t) } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .tint(Brand.secondaryText)   // grey: teal is kept for state
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel(t.speakerOptions(name: speaker.name))
+        .help(t.speakerOptions(name: speaker.name))
+    }
+
+    private func autoConnectToggle(_ t: UIStrings) -> some View {
+        Toggle(t.autoConnect, isOn: Binding(get: { speaker.autoConnect },
+                                            set: { model.actions.setAutoConnect(speaker.key, $0) }))
+    }
+
+    private func toggle(_ on: Bool) { model.setEnabled(speaker, on) }
+}
+
+private extension View {
+    /// `text` as the VoiceOver hint and the tooltip; neither when nil.
+    @ViewBuilder
+    func hintAndHelp(_ text: String?) -> some View {
+        if let text { accessibilityHint(text).help(text) } else { self }
+    }
+}
+
+/// The AirPlay delay (S178, S181): one row under the AirPlay speakers, with
+/// the controls of a local speaker's delay, since every local speaker waits
+/// that long for them while one is on.
+struct AirPlayDelayRow: View {
+    @ObservedObject var model: AppModel
+    /// Its key in `delayPanels` and the drafts, apart from every speaker's ID.
+    static let id = "airplay-delay"
+
+    private var expanded: Bool { model.delayPanels.isOpen(Self.id) }
+    @FocusState private var delayFocused: Bool
+
+    var body: some View {
+        let t = model.text
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Image(systemName: "timer")
+                    .font(.system(size: 15))
+                    .foregroundStyle(Brand.secondaryText)
+                    .frame(width: 32)
+                    .accessibilityHidden(true)
+                Text(t.airPlayDelay)
+                Spacer()
+                DelayValueButton(model: model, id: Self.id, draft: model.draft(for: Self.id),
+                                 label: t.airPlayDelay, focus: $delayFocused)
+            }
+            if expanded {
+                SyncControls(model: model, id: Self.id, kind: .airPlay, ms: model.airPlayDelayMs,
+                             label: t.airPlayDelay, text: t,
+                             draft: model.draft(for: Self.id), escape: {
+                    // Dropped first: the field losing the focus would apply it.
+                    model.dropDelayTyping()
+                    delayFocused = true
+                }) { model.actions.setAirPlayDelay($0) }
+                    .padding(.leading, 44)
+                    .transition(.opacity)
+            }
+        }
+        .onChange(of: expanded) { _, open in
+            if !open, model.draft(for: Self.id).fieldFocused || model.delayFocusLeftByClick == Self.id {
+                delayFocused = true
+            }
+        }
+        .padding(.vertical, BrandTokens.Spacing.rowPaddingY)
+        .padding(.horizontal, BrandTokens.Spacing.rowPaddingX)
+        // A click on the row's box works like its delay value.
+        .contentShape(Rectangle())
+        .onTapGesture { model.toggleDelayPanel(Self.id) }
+    }
+}
+
+/// A row's delay value, which opens and closes its panel. It reads the saved
+/// delay from the model by ID (`DelayBadge`), so a delay applied with the
+/// panel open shows at once; the new number rolls in (a crossfade under
+/// Reduce Motion), and a brief teal highlight marks each apply from the
+/// row's own panel.
+private struct DelayValueButton: View {
+    @ObservedObject var model: AppModel
+    let id: String
+    @ObservedObject var draft: SyncDraft
+    /// VoiceOver's label, also used to announce a new value.
+    let label: String
+    var showsTimer = false
+    var focus: FocusState<Bool>.Binding
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var expanded: Bool { model.delayPanels.isOpen(id) }
+
+    var body: some View {
+        let t = model.text
+        let ms = model.savedDelay(of: id)
+        let value = model.savedDelayText(of: id) ?? ""
+        Button {
+            model.toggleDelayPanel(id)
+        } label: {
+            HStack(spacing: 3) {
+                if showsTimer { Image(systemName: "timer") }
+                Text(value)
+                    .monospacedDigit()
+                    .contentTransition(reduceMotion ? .opacity : .numericText(value: ms ?? 0))
+                    .animation(.snappy(duration: 0.3), value: ms)
+            }
+            .font(.subheadline)
+            // Small text: the readable teal (≥ 4.5:1), not the brand teal.
+            .foregroundStyle(expanded ? Brand.tealText : Brand.secondaryText)
+            // At its 12% peak the highlight keeps the readable teal at 4.7:1 on
+            // a playing row in light mode, 5.1:1 in dark.
+            .keyframeAnimator(initialValue: 0.0, trigger: draft.applied) { content, tint in
+                content.background {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Brand.teal.opacity(0.12 * tint))
+                        .padding(-3)
+                }
+            } keyframes: { _ in
+                KeyframeTrack {
+                    LinearKeyframe(1.0, duration: 0.12)
+                    CubicKeyframe(0.0, duration: 0.9)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .focused(focus)
+        .help(t.syncAdjust)
+        .accessibilityLabel(expanded ? t.hideDelayControls(label) : t.showDelayControls(label))
+        .accessibilityValue(value)
+        .onChange(of: value) { _, now in DebugTrace.log(DelayBadge.traceLine(id: id, shows: now)) }
+        // Only for the field being typed in, which keeps VoiceOver's focus;
+        // Command-S applying other open panels stays quiet.
+        .onChange(of: draft.applied) { _, _ in
+            guard draft.fieldFocused, let shown = model.savedDelayText(of: id) else { return }
+            AccessibilityNotification.Announcement(t.delaySet(label, to: shown)).post()
+        }
+    }
+}
+
+/// The one ring `DelayFieldRings` asks for, as a single shape: a change of
+/// state moves and recolors it, and never fades a second ring in beside it.
+/// The focus ring sits 3 pt outside the bezel like AppKit's; the red outline
+/// sits on the bezel, or where the focus ring goes while the field has the focus.
+private struct DelayFieldRing: View {
+    let rings: DelayFieldRings
+
+    var body: some View {
+        let outset: CGFloat = rings.focusRing || rings.redOutsideBezel ? 3 : 0
+        let width: CGFloat = rings.focusRing || rings.redOutsideBezel ? 3 : 1.5
+        RoundedRectangle(cornerRadius: 6 + outset)
+            .strokeBorder(rings.focusRing ? Color(nsColor: .keyboardFocusIndicatorColor) : Brand.errorText,
+                          lineWidth: width)
+            .padding(-outset)
+            .opacity(rings.focusRing || rings.redOutlines > 0 ? 1 : 0)
+    }
+}
+
+/// The dashed line under a delay field that holds typing not yet applied.
+private struct DraftUnderline: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+        return path
+    }
+}
+
+/// A Cast row's slider: the arrow keys and VoiceOver's adjust move the
+/// device's volume by its own step (C69); other sliders keep their own.
+private struct CastVolumeKeys: ViewModifier {
+    let step: ((_ up: Bool) -> Void)?
+
+    func body(content: Content) -> some View {
+        if let step {
+            content
+                .onKeyPress(keys: [.upArrow, .rightArrow, .downArrow, .leftArrow]) { press in
+                    step(press.key == .upArrow || press.key == .rightArrow)
+                    return .handled
+                }
+                .accessibilityAdjustableAction { direction in
+                    switch direction {
+                    case .increment: step(true)
+                    case .decrement: step(false)
+                    @unknown default: break
+                    }
+                }
+        } else {
+            content
+        }
+    }
+}
+
+/// A delay field as an AppKit text field. SwiftUI's own field shows a
+/// keystroke before its binding can turn it down, so a blocked character
+/// flashed in and out; a formatter here blocks it before it shows. AppKit's
+/// focus ring is off: `DelayFieldRing` draws the one ring the field shows.
+private struct DelayTextField: NSViewRepresentable {
+    /// The row's key in `delayPanels`, for the main window's click monitor.
+    let rowID: String
+    let text: String
+    let placeholder: String
+    let label: String
+    let hint: String
+    let typed: (String) -> Void
+    /// A keystroke, or part of a paste, the field turned down.
+    let blocked: () -> Void
+    let submit: () -> Void
+    let escape: () -> Void
+    let focusChanged: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> Field {
+        let field = Field()
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
+        // Set at creation only: turned off mid-edit, AppKit's ring stayed drawn.
+        field.focusRingType = DelayFieldRings.appKitRing ? .default : .none
+        field.alignment = .center
+        field.font = .monospacedDigitSystemFont(ofSize: NSFont.preferredFont(forTextStyle: .callout).pointSize,
+                                                weight: .regular)
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.cell?.usesSingleLineMode = true
+        field.formatter = InputFilter(owner: context.coordinator)
+        field.delegate = context.coordinator
+        field.owner = context.coordinator
+        return field
+    }
+
+    func updateNSView(_ field: Field, context: Context) {
+        context.coordinator.parent = self
+        field.rowID = rowID
+        // Setting the field's own value while it is being edited would end the editing.
+        if let editor = field.currentEditor() {
+            if editor.string != text { editor.string = text }
+        } else if field.stringValue != text {
+            field.stringValue = text
+        }
+        field.placeholderString = placeholder
+        field.setAccessibilityLabel(label)
+        field.setAccessibilityHelp(hint)
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: DelayTextField?
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent?.typed(field.stringValue)
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            switch selector {
+            case #selector(NSResponder.insertNewline(_:)):
+                parent?.submit()   // applies and keeps the panel open, to try the next value
+                return true
+            case #selector(NSResponder.cancelOperation(_:)):
+                parent?.escape()
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    final class Field: NSTextField {
+        weak var owner: Coordinator?
+        var rowID = ""
+
+        override func becomeFirstResponder() -> Bool {
+            let became = super.becomeFirstResponder()
+            if became { owner?.parent?.focusChanged(true) }
+            return became
+        }
+
+        override func textDidEndEditing(_ notification: Notification) {
+            super.textDidEndEditing(notification)
+            owner?.parent?.focusChanged(false)
+        }
+    }
+
+    /// Passes only edits that leave text a delay field can hold
+    /// (`LocalDelay.fieldAccepts`); a paste with anything else goes whole.
+    final class InputFilter: Formatter {
+        private weak var owner: Coordinator?
+
+        init(owner: Coordinator) {
+            self.owner = owner
+            super.init()
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func string(for obj: Any?) -> String? { obj as? String }
+
+        override func getObjectValue(_ obj: AutoreleasingUnsafeMutablePointer<AnyObject?>?, for string: String,
+                                     errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?) -> Bool {
+            obj?.pointee = string as NSString
+            return true
+        }
+
+        override func isPartialStringValid(_ partialString: String,
+                                           newEditingString newString: AutoreleasingUnsafeMutablePointer<NSString?>?,
+                                           errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?) -> Bool {
+            guard !LocalDelay.fieldAccepts(partialString) else { return true }
+            owner?.parent?.blocked()
+            return false
+        }
+    }
+}
+
+/// Drags the window from the header band. SwiftUI's background tap that
+/// closes the delay panels would otherwise take the header's clicks, so the
+/// band moves the window itself; `pressed` runs first, as for any click
+/// outside the speaker rows.
+private struct WindowDragArea: NSViewRepresentable {
+    let pressed: () -> Void
+
+    func makeNSView(context: Context) -> DragView { DragView() }
+    func updateNSView(_ view: DragView, context: Context) { view.pressed = pressed }
+
+    final class DragView: NSView {
+        var pressed: () -> Void = {}
+        override func mouseDown(with event: NSEvent) {
+            pressed()
+            window?.performDrag(with: event)
+        }
+    }
+}
+
+/// The gear button's menu, built at each click from the model.
+@MainActor
+private enum GearMenu {
+    static func make(model: AppModel, text t: UIStrings) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.addItem(.sectionHeader(title: t.menuSpeakers))
+        menu.addItem(MenuAction.item(t.newZone) { model.actions.newZone() })
+        menu.addItem(MenuAction.item(t.refreshDevices) { model.actions.refreshDevices() })
+        menu.addItem(.sectionHeader(title: t.menuGroupWindows))
+        menu.addItem(MenuAction.item(t.webRemoteMenu) { model.actions.openWebRemote() })
+        menu.addItem(MenuAction.item(t.settingsMenu) { model.actions.openSettings() })
+        menu.addItem(MenuAction.item(t.guideTitle) { model.actions.openGuide() })
+        return menu
+    }
+}
+
+/// An empty view behind a button that a menu opens under.
+private struct MenuAnchor: NSViewRepresentable {
+    @MainActor final class Box: ObservableObject {
+        weak var view: NSView?
+    }
+
+    let box: Box
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        box.view = view
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) { box.view = view }
+}
+
+/// A main-window column that scrolls when the window is too short for it.
+/// Cards scrolling under the header fade out instead of meeting a hard edge;
+/// the top fade lies inside the column, so nothing scrolls into the gap under
+/// the header, and the bottom one in the window's bottom margin.
+/// An edge fades only while content lies past it.
+private struct FadingScroll<Content: View>: View {
+    let onBlankTap: () -> Void
+    let content: Content
+    @StateObject private var edges = ScrollEdgeState()
+
+    init(onBlankTap: @escaping () -> Void, @ViewBuilder content: () -> Content) {
+        self.onBlankTap = onBlankTap
+        self.content = content()
+    }
+
+    /// Shorter than the window's bottom margin.
+    private static var fade: CGFloat { 12 }
+
+    var body: some View {
+        GeometryReader { viewport in
+            ScrollView {
+                content
+                    // At rest the cards sit clear of the faded bottom edge.
+                    .padding(.bottom, Self.fade)
+                    // Blank space under a short column is outside every control too.
+                    // Whole points: the scroll view's frame is snapped to pixels, and a
+                    // fraction more here let a column that fits scroll by it once.
+                    .frame(maxWidth: .infinity, minHeight: viewport.size.height.rounded(.down),
+                           alignment: .topLeading)
+                    // The scroll geometry callback may not run before the first
+                    // scroll, so a column already too long at open is seeded here.
+                    .background(GeometryReader { column in
+                        Color.clear.onAppear {
+                            edges.fades = ScrollEdgeFades.of(contentHeight: column.size.height, visibleTop: 0,
+                                                             visibleHeight: viewport.size.height, fade: Self.fade)
+                        }
+                    })
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onBlankTap)
+            }
+            // The faded edges show there is more; a scroller would cover the
+            // cards' right edge and appear on one column only.
+            .scrollIndicators(.never)
+            .scrollBounceBehavior(.basedOnSize)
+            .onScrollGeometryChange(for: ScrollEdgeFades.self) { geometry in
+                ScrollEdgeFades.of(contentHeight: geometry.contentSize.height,
+                                   visibleTop: geometry.visibleRect.minY,
+                                   visibleHeight: geometry.visibleRect.height, fade: Self.fade)
+            } action: { _, fades in
+                edges.fades = fades
+            }
+        }
+        .mask(ScrollEdgeFade(height: Self.fade, fades: edges.fades))
+        .padding(.bottom, -Self.fade)
+    }
+}
+
+private final class ScrollEdgeState: ObservableObject {
+    @Published var fades = ScrollEdgeFades.none
+}
+
+/// The scroll list's mask: opaque, fading out over `height` at the top and
+/// the bottom as strongly as `fades` says.
+private struct ScrollEdgeFade: View {
+    let height: CGFloat
+    let fades: ScrollEdgeFades
+
+    var body: some View {
+        VStack(spacing: 0) {
+            LinearGradient(colors: [.black.opacity(1 - fades.top), .black], startPoint: .top, endPoint: .bottom)
+                .frame(height: height)
+            Color.black
+            LinearGradient(colors: [.black, .black.opacity(1 - fades.bottom)], startPoint: .top, endPoint: .bottom)
+                .frame(height: height)
+        }
+    }
+}
+
+/// A step button's area, which the main window's click monitor finds by
+/// position: a click there leaves the focus with the same panel's field, so
+/// the step builds on its typing and applies once.
+private struct DelayStepArea: NSViewRepresentable {
+    let rowID: String
+
+    func makeNSView(context: Context) -> Marker { Marker() }
+    func updateNSView(_ marker: Marker, context: Context) { marker.rowID = rowID }
+
+    final class Marker: NSView {
+        static let all = NSHashTable<Marker>.weakObjects()
+        var rowID = ""
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil { Self.all.add(self) } else { Self.all.remove(self) }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
+/// A delay's controls: coarse/fine steppers that apply at once, plus a typed
+/// value in whole ms that applies on Return or Command-S, as the focus leaves
+/// the field, or as the panel closes (`DelayPanels`), so the outputs re-time
+/// once rather than at every keystroke. The field blocks any keystroke but
+/// digits after one leading sign; a blocked keystroke or a number out of
+/// range gets a red outline, and the number applies clamped (S181,
+/// `DelayFieldDraft`).
+struct SyncControls: View {
+    /// Which delay the controls edit.
+    enum Kind: Equatable {
+        /// A local speaker's offset relative to the reference, signed (S175).
+        /// `hasReference`: the Mac's built-in speakers are listed.
+        case offset(hasReference: Bool)
+        /// The AirPlay delay, 0 to 20 000 ms (S178).
+        case airPlay
+        /// A Google Cast speaker's offset, set by ear, 0 to 20 000 ms (CAST_SPEC C74-C77).
+        case cast
+    }
+
+    /// Not observed: read for the saved delay as it is now, and by the debug
+    /// trace of an apply.
+    let model: AppModel
+    /// The row's key in `delayPanels` and the drafts.
+    let id: String
+    let kind: Kind
+    let ms: Double
+    /// The field's VoiceOver label.
+    let label: String
+    let text: UIStrings
+    @ObservedObject var draft: SyncDraft
+    /// Escape: every typed delay is dropped and every panel closes; the focus
+    /// goes to the delay value.
+    let escape: () -> Void
+    let apply: (Double) -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// AppKit hides the focus ring while the window isn't active; the drawn
+    /// one follows.
+    @Environment(\.appearsActive) private var appearsActive
+
+    var body: some View {
+        // Typing not yet applied: a dashed underline under the field and a
+        // hint under the steps, so the cue isn't color alone. Out of range,
+        // or a keystroke just blocked: a red outline, and the hint says the
+        // range and what applies, or what the field takes.
+        let pending = draft.field.isPending(saved: ms, format: shown)
+        let outOfRange = draft.field.isOutOfRange(sanitize: clamped)
+        let invalid = outOfRange || draft.blocked
+        let problem = outOfRange ? rangeMessage : text.delayFieldTakes
+        let cue = invalid ? problem : pending ? text.delayDraftHint : ""
+        let rings = DelayFieldRings(invalid: invalid, focused: draft.fieldFocused && appearsActive)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                step(-100)
+                step(-10)
+                DelayTextField(rowID: id, text: draft.field.text, placeholder: text.delayFieldPlaceholder,
+                               label: text.delayFieldLabel(label), hint: cue,
+                               typed: { typed in
+                                   draft.clearBlock()
+                                   draft.field.type(typed)
+                               },
+                               blocked: {
+                                   if draft.block() {
+                                       AccessibilityNotification.Announcement(text.delayFieldTakes).post()
+                                   }
+                               },
+                               submit: { commit("Return") },
+                               escape: escape,
+                               focusChanged: focusChanged)
+                .frame(width: 72)
+                .focusEffectDisabled()
+                .overlay {
+                    DelayFieldRing(rings: rings)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: rings)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+                // Below the focus ring, so the two don't overlap.
+                .overlay(alignment: .bottom) {
+                    if pending {
+                        DraftUnderline()
+                            .stroke(Brand.tealText, style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
+                            .frame(height: 1.5)
+                            .offset(y: 5)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
+                Text(text.millisecondsUnit).font(.callout).foregroundStyle(Brand.secondaryText)
+                step(10)
+                step(100)
+            }
+            // VoiceOver hears this as the field's hint. Hidden, it keeps its
+            // line, so the text below doesn't jump on the first keystroke or
+            // when the value applies.
+            if invalid {
+                Label(problem, systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(Brand.errorText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityHidden(true)
+            } else {
+                Label(text.delayDraftHint, systemImage: "return")
+                    .font(.caption)
+                    .foregroundStyle(Brand.tealText)
+                    .opacity(pending ? 1 : 0)
+                    .accessibilityHidden(true)
+            }
+            Text(hint)
+                .font(.caption)
+                .foregroundStyle(Brand.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // Escape on a step; the field handles its own.
+        .onExitCommand(perform: escape)
+        .onAppear {
+            // A field removed while focused never hears that it lost the focus.
+            draft.fieldFocused = false
+            draft.field.show(ms, format: shown)
+        }
+        .onChange(of: ms) { _, value in draft.field.show(value, format: shown) }
+        // Command-S, or a click on another row's delay.
+        .onChange(of: draft.applyRequests) { _, _ in commit("apply request") }
+        // The hint is read only on focus: VoiceOver hears the range once as
+        // the number goes out of it, not at every keystroke after.
+        .onChange(of: outOfRange) { _, now in
+            if now { AccessibilityNotification.Announcement(rangeMessage).post() }
+        }
+        // A panel closing applies what was typed, unless Escape dropped it.
+        .onDisappear { commit("panel closed") }
+    }
+
+    /// The saved delay as the model holds it now: an apply as the focus
+    /// leaves the field can land between a click's press and its release,
+    /// before this view redraws with the new `ms`.
+    private var savedMs: Double { model.savedDelay(of: id) ?? ms }
+
+    private func focusChanged(_ focused: Bool) {
+        // Cleared before the apply on purpose: VoiceOver is reading whatever took
+        // the focus, and a "delay set" announcement would cut it off.
+        draft.fieldFocused = focused
+        if let value = draft.field.focusChanged(to: focused, saved: savedMs, sanitize: clamped, format: shown) {
+            applied(value, "focus left")
+        }
+    }
+
+    /// The range, and the value a commit applies instead of the typed one.
+    private var rangeMessage: String {
+        let typed = LocalDelay.wholeMs(draft.field.text) ?? 0
+        return text.delayOutOfRange(lowest: shown(clamped(-.greatestFiniteMagnitude) ?? 0),
+                                    highest: shown(clamped(.greatestFiniteMagnitude) ?? 0),
+                                    applies: shown(clamped(typed) ?? 0))
+    }
+
+    private var hint: String {
+        switch kind {
+        case .offset(let hasReference): return text.offsetHint(hasReference: hasReference)
+        case .airPlay: return text.airPlayDelayHint
+        case .cast: return text.castSyncHint
+        }
+    }
+
+    /// A typed value in this delay's range (S175, S178).
+    private func clamped(_ typed: Double) -> Double? {
+        switch kind {
+        case .offset: return LocalDelay.sanitizedOffset(typed)
+        case .airPlay: return LocalDelay.sanitizedAirPlayDelay(typed)
+        case .cast: return CastModel.clampedOffset(typed)
+        }
+    }
+
+    /// A value as the field shows it: an offset with its sign.
+    private func shown(_ value: Double) -> String {
+        switch kind {
+        case .offset: return text.offsetNumber(value)
+        case .airPlay, .cast: return String(Int(value.rounded()))
+        }
+    }
+
+    /// Apply the typed value, once (Return and the panel closing after it
+    /// both get here).
+    private func commit(_ how: String) {
+        let typed = draft.field.isEditing ? draft.field.text : nil
+        if let value = draft.field.commit(saved: savedMs, sanitize: clamped, format: shown) {
+            applied(value, how)
+        } else if let typed {
+            DebugTrace.log("[AudioSync] delay \(id) \(how): typed \"\(typed)\" applies nothing, saved \(shown(savedMs))")
+        }
+    }
+
+    /// Applies `value`, counts it for the row's delay value
+    /// (`SyncDraft.applied`) and traces what that value reads after.
+    private func applied(_ value: Double, _ how: String) {
+        apply(value)
+        draft.applied += 1
+        DebugTrace.log("[AudioSync] delay \(id) \(how): saved \(shown(ms)) -> \(shown(value)), "
+            + "row value reads \(model.savedDelayText(of: id) ?? "none")")
+    }
+
+    private func step(_ delta: Int) -> some View {
+        Button(text.delayStep(delta)) {
+            if let value = draft.field.step(Double(delta), saved: savedMs, sanitize: clamped, format: shown) {
+                applied(value, "step")
+                // The delay value announces it instead while the field has the focus.
+                if !draft.fieldFocused, let now = model.savedDelayText(of: id) {
+                    AccessibilityNotification.Announcement(text.delaySet(label, to: now)).post()
+                }
+            }
+        }
+            .accessibilityLabel(text.delayStepAccessibility(delta))
+            .controlSize(.small)
+            .font(.caption.monospacedDigit())
+            // Caption-size text needs the primary color: the window's teal tint
+            // would put it below 4.5:1 contrast.
+            .foregroundStyle(.primary)
+            .background(DelayStepArea(rowID: id).accessibilityHidden(true))
+    }
+}

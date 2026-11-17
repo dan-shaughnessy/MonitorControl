@@ -1,0 +1,429 @@
+import Foundation
+
+/// Tells a local output whose render callback stopped while its device stays
+/// alive (S334): per output, the frames its callback handed the device,
+/// silence included, against the uptime clock, which stands still while the
+/// Mac sleeps. Main queue only.
+struct OutputStallWatch {
+    /// How long an output that took frames once may take none.
+    static let stallAfterS = 2.0
+    /// How often the host reads the counts.
+    static let checkEveryS = 0.5
+
+    /// One output's count at a check; `attach` tells a re-attached output,
+    /// whose new renderer counts from 0 (`AttachTokens`).
+    struct Reading: Equatable {
+        var attach: UInt64
+        var frames: Int64
+    }
+
+    struct Stall: Equatable {
+        var uid: String
+        /// Uptime seconds since its count last moved.
+        var quietS: Double
+    }
+
+    private struct Seen {
+        var attach: UInt64
+        var frames: Int64
+        var movedAtS: Double
+        var tookFrames: Bool
+    }
+
+    private var seen: [String: Seen] = [:]
+    private var paused = false
+
+    /// The outputs in `readings` that stalled by uptime `nowS`, sorted by UID.
+    /// A stalled output is forgotten, so it stalls once per attach.
+    mutating func check(_ readings: [String: Reading], nowS: Double) -> [Stall] {
+        guard !paused else { return [] }
+        seen = seen.filter { readings[$0.key] != nil }
+        var stalls: [Stall] = []
+        for (uid, reading) in readings {
+            guard let was = seen[uid], was.attach == reading.attach else {
+                seen[uid] = Seen(attach: reading.attach, frames: reading.frames, movedAtS: nowS,
+                                 tookFrames: reading.frames > 0)
+                continue
+            }
+            if reading.frames != was.frames {
+                seen[uid] = Seen(attach: reading.attach, frames: reading.frames, movedAtS: nowS, tookFrames: true)
+            } else if was.tookFrames, nowS - was.movedAtS >= Self.stallAfterS {
+                stalls.append(Stall(uid: uid, quietS: nowS - was.movedAtS))
+                seen[uid] = nil
+            }
+        }
+        return stalls.sorted { $0.uid < $1.uid }
+    }
+
+    mutating func reset() {
+        seen = [:]
+    }
+
+    /// From the Mac's will-sleep notice to its wake no output stalls: uptime
+    /// still runs between the notice and the sleep itself.
+    mutating func pause() {
+        paused = true
+    }
+
+    /// At the wake: the 2 s start over at uptime `nowS`.
+    mutating func resume(nowS: Double) {
+        paused = false
+        for uid in seen.keys { seen[uid]?.movedAtS = nowS }
+    }
+}
+
+/// What the host read on the main queue about a stalled output's device.
+enum OutputStallSign: Equatable {
+    case hogMode(pid: Int32)
+    case deviceNotRunning
+    case none
+
+    /// `hogOwner` is the process holding the device in hog mode, nil when
+    /// none does or it can't be read; `running` is nil when unreadable.
+    static func read(hogOwner: Int32?, ownPID: Int32, running: Bool?) -> OutputStallSign {
+        if let owner = hogOwner, owner > 0, owner != ownPID { return .hogMode(pid: owner) }
+        if running == false { return .deviceNotRunning }
+        return .none
+    }
+
+    /// The debug line for a stall of output `number` (its status-line number, never its device's name).
+    static func line(number: Int, quietS: Double, sign: OutputStallSign) -> String {
+        let what: String
+        switch sign {
+        case .hogMode(let pid): what = "another process (PID \(pid)) holds its device in hog mode"
+        case .deviceNotRunning: what = "its device is no longer running"
+        case .none: what = "no sign"
+        }
+        return "output \(number) stalled: no frame for " + String(format: "%.1f", quietS) + " s, \(what)"
+    }
+}
+
+/// Why the engine dropped a local output whose speaker stays on.
+enum OutputLoss: Equatable {
+    /// The device stopped being alive (S68).
+    case deviceGone
+    /// Its render callback took no frame for `quietS` seconds (S334).
+    case stalled(quietS: Double, sign: OutputStallSign)
+    /// Its device's rate or channel count changed under it (S330).
+    case formatChanged(old: OutputDeviceFormat, new: OutputDeviceFormat)
+    /// `percent` of its callbacks starved while the others played (S347).
+    case ranAway(percent: Int)
+
+    var reason: String {
+        switch self {
+        case .deviceGone: return "device lost"
+        case .stalled: return "stalled"
+        case .formatChanged: return "format changed"
+        case .ranAway: return "ran away"
+        }
+    }
+}
+
+/// Local outputs whose device went while they played (S68): each gets the
+/// disconnected notice at the next sync that no longer lists its device, so
+/// one listed again at once (a Core Audio restart) gets none. An output
+/// refused for 30 s (S331) gets it too; a busy one's notice is kept here so
+/// that a switch-off or a stop ends it. Main queue only.
+struct OutputGoneNotices {
+    private var gone: Set<String> = []
+    /// The outputs whose disconnected notice is up.
+    private var shown: Set<String> = []
+
+    mutating func deviceGone(_ uid: String) {
+        gone.insert(uid)
+    }
+
+    /// The engine dropped output `uid` for `loss` while its speaker stays on.
+    /// A stall or a runaway counts too, since a Bluetooth device can leave the
+    /// list with its alive flag still true (S334); a format change keeps it listed.
+    mutating func lost(_ uid: String, _ loss: OutputLoss) {
+        if case .formatChanged = loss { return }
+        deviceGone(uid)
+    }
+
+    mutating func refusedLost(_ uid: String) {
+        shown.insert(uid)
+    }
+
+    /// Output `uid` started, or its busy device left the list, and the sync clears its notice.
+    mutating func started(_ uid: String) {
+        shown.remove(uid)
+    }
+
+    /// `post`: the outputs whose notice is due now, still on and not listed.
+    /// `clear`: those switched off, whose notice ends.
+    mutating func settle(enabled: Set<String>, listed: Set<String>) -> (post: Set<String>, clear: Set<String>) {
+        let post = gone.intersection(enabled).subtracting(listed)
+        let clear = shown.subtracting(enabled)
+        gone = []
+        shown = shown.intersection(enabled).union(post)
+        return (post, clear)
+    }
+
+    /// Streaming stopped: the notices that end.
+    mutating func stop() -> Set<String> {
+        defer { gone = []; shown = [] }
+        return shown
+    }
+}
+
+/// What follows a stall (S334, S326): a first stall reopens the output at
+/// once. A stall before the reopened stream has played 5 s, or a start the
+/// device refuses after a stall, is a stall in a row: the output stays on
+/// and is tried again every 10 s until a stream plays 5 s. Main queue only.
+struct OutputStallRetry {
+    /// How long a reopened stream plays before its stall is over.
+    static let trialS = 5.0
+    static let retryEveryS = 10.0
+
+    enum Step: Equatable {
+        case reopenNow
+        /// A stall in a row: the next try at uptime `atS`.
+        case retry(atS: Double)
+    }
+
+    private struct Entry {
+        var startedAtS: Double?
+        var retryAtS: Double?
+        var lost = false
+    }
+
+    private var entries: [String: Entry] = [:]
+
+    /// The outputs whose stall isn't over yet.
+    var tracked: Set<String> { Set(entries.keys) }
+
+    /// The outputs that stalled in a row, whose disconnected notice is up
+    /// until their stall is over.
+    var lost: Set<String> { Set(entries.filter { $0.value.lost }.keys) }
+
+    /// The outputs a sync starts again after a stall; `formatReopens` are
+    /// starting again because their device's format changed (S330).
+    func afterStall(formatReopens: Set<String>) -> Set<String> {
+        tracked.subtracting(formatReopens)
+    }
+
+    mutating func stalled(_ uid: String, nowS: Double) -> Step {
+        if let started = entries[uid]?.startedAtS, nowS - started < Self.trialS {
+            let at = nowS + Self.retryEveryS
+            entries[uid] = Entry(startedAtS: nil, retryAtS: at, lost: true)
+            return .retry(atS: at)
+        }
+        entries[uid] = Entry(startedAtS: nil, retryAtS: nil)
+        return .reopenNow
+    }
+
+    /// Output `uid` started again; nothing for one that didn't stall.
+    mutating func started(_ uid: String, nowS: Double) {
+        guard entries[uid] != nil else { return }
+        entries[uid]?.startedAtS = nowS
+        entries[uid]?.retryAtS = nil
+    }
+
+    /// The device refused the start of `uid`: after a stall that is a stall
+    /// in a row, tried again at the uptime returned. nil for an output that
+    /// didn't stall: a refusal stays on (S331), a hard error is switched off (S69).
+    mutating func refused(_ uid: String, nowS: Double) -> Double? {
+        guard entries[uid] != nil else { return nil }
+        let at = nowS + Self.retryEveryS
+        entries[uid]?.startedAtS = nil
+        entries[uid]?.retryAtS = at
+        return at
+    }
+
+    /// What a failed start of `uid` leads to.
+    enum Failed: Equatable {
+        /// A stall in a row, tried again at uptime `atS` (S334).
+        case retry(atS: Double)
+        /// A refusal that followed no stall (S331).
+        case refused(String)
+        /// Switched off with its could-not-start notice (S69).
+        case hard
+    }
+
+    mutating func failed(_ failure: LocalOutputSync.Failure, afterStall: Bool, nowS: Double) -> Failed {
+        if afterStall, failure.refusal != nil, let at = refused(failure.uid, nowS: nowS) { return .retry(atS: at) }
+        if let refusal = failure.refusal { return .refused(refusal) }
+        forget(failure.uid)
+        return .hard
+    }
+
+    /// The outputs waiting for their next try, which no sync starts yet.
+    func held(nowS: Double) -> Set<String> {
+        Set(entries.filter { ($0.value.retryAtS ?? -.infinity) > nowS }.keys)
+    }
+
+    /// Forgets the outputs whose stream has played 5 s, those switched off
+    /// and those whose device left the list, which S68 covers. Returns those
+    /// of them that were lost: their notice ends.
+    @discardableResult
+    mutating func settle(enabled: Set<String>, listed: Set<String>, nowS: Double) -> Set<String> {
+        let before = lost
+        entries = entries.filter { uid, entry in
+            guard enabled.contains(uid), listed.contains(uid) else { return false }
+            guard let started = entry.startedAtS else { return true }
+            return nowS - started < Self.trialS
+        }
+        return before.subtracting(lost)
+    }
+
+    /// Output `uid` failed to start for good and is switched off: its stall
+    /// ends without clearing the notice that says why (S334).
+    mutating func forget(_ uid: String) {
+        entries[uid] = nil
+    }
+
+    mutating func reset() {
+        entries = [:]
+    }
+}
+
+/// A local output whose device pulls faster than the capture writes (S347):
+/// at least half its callbacks starve while every other output starves
+/// under a tenth. The first runaway reopens it; a second within 30 s of
+/// that reopen posts the struggling notice and it plays on. Uptime. Main
+/// queue only.
+struct OutputRunawayRetry {
+    static let runawayPercent = 50
+    static let othersBelowPercent = 10
+    static let noticeWithinS = 30.0
+
+    enum Step: Equatable {
+        case reopen
+        case notice
+        case quiet
+    }
+
+    /// The outputs among `percents`, each one's starved share, that ran away.
+    static func runaways(_ percents: [String: Int]) -> Set<String> {
+        Set(percents.filter { uid, percent in
+            percent >= runawayPercent && percents.allSatisfy { $0.key == uid || $0.value < othersBelowPercent }
+        }.keys)
+    }
+
+    private struct Entry {
+        var reopenedAtS: Double
+        var noticed: Bool
+    }
+
+    private var entries: [String: Entry] = [:]
+
+    /// The outputs whose struggling notice is up.
+    var struggling: Set<String> { Set(entries.filter { $0.value.noticed }.keys) }
+
+    mutating func ranAway(_ uid: String, nowS: Double) -> Step {
+        guard let entry = entries[uid], nowS - entry.reopenedAtS < Self.noticeWithinS else {
+            // A notice already up stays through a later reopen.
+            entries[uid] = Entry(reopenedAtS: nowS, noticed: entries[uid]?.noticed ?? false)
+            return .reopen
+        }
+        if entry.noticed { return .quiet }
+        entries[uid]?.noticed = true
+        return .notice
+    }
+
+    /// Forgets the outputs switched off and those whose device left the
+    /// list. Returns those of them whose notice ends.
+    @discardableResult
+    mutating func settle(enabled: Set<String>, listed: Set<String>) -> Set<String> {
+        let before = struggling
+        entries = entries.filter { enabled.contains($0.key) && listed.contains($0.key) }
+        return before.subtracting(struggling)
+    }
+
+    mutating func reset() {
+        entries = [:]
+    }
+}
+
+/// The runaways already reported, by each output's attach token, so a
+/// reopened output, which gets a new token, is reported again (S347). A
+/// renderer's identity can't key it: a reopened one may take a freed one's
+/// address. Main queue only.
+struct OutputRunawayReports {
+    private var reported: [String: UInt64] = [:]
+
+    /// The outputs among `runaways` not yet reported under their current
+    /// token, now counted as reported; forgets those whose token changed.
+    mutating func fresh(_ runaways: Set<String>, tokens: [String: UInt64]) -> Set<String> {
+        reported = reported.filter { tokens[$0.key] == $0.value }
+        let fresh = runaways.filter { uid in tokens[uid].map { reported[uid] != $0 } ?? false }
+        for uid in fresh { reported[uid] = tokens[uid] }
+        return fresh
+    }
+}
+
+/// A listed output whose device refuses its start (S331): it stays on and is
+/// tried again every 3 s for as long as the user leaves it on; refused for
+/// 30 s, it counts as lost, unless another process holds the device, which
+/// gets the busy notice at once instead. Uptime, which stands still while the Mac sleeps.
+/// Main queue only.
+struct OutputRefusalRetry {
+    static let retryEveryS = 3.0
+    static let lostAfterS = 30.0
+
+    /// What the debug log tells, once each.
+    enum Tell: Equatable {
+        case refused
+        case lost
+        /// Another process holds the device in hog mode.
+        case busy
+    }
+
+    struct Step: Equatable {
+        /// The next try, at uptime.
+        var retryAtS: Double
+        var tell: Tell?
+    }
+
+    private struct Entry {
+        var sinceS: Double
+        var retryAtS: Double
+        var lost: Bool
+        var busy: Bool
+    }
+
+    private var entries: [String: Entry] = [:]
+
+    mutating func refused(_ uid: String, nowS: Double, busy: Bool = false) -> Step {
+        let at = nowS + Self.retryEveryS
+        // A device no longer busy but still refusing starts its 30 s as a refusal.
+        guard let was = entries[uid], busy || !was.busy else {
+            entries[uid] = Entry(sinceS: nowS, retryAtS: at, lost: false, busy: busy)
+            return Step(retryAtS: at, tell: busy ? .busy : .refused)
+        }
+        let lost = !busy && nowS - was.sinceS >= Self.lostAfterS
+        entries[uid] = Entry(sinceS: was.sinceS, retryAtS: at, lost: lost, busy: busy)
+        if busy { return Step(retryAtS: at, tell: was.busy ? nil : .busy) }
+        return Step(retryAtS: at, tell: lost && !was.lost ? .lost : nil)
+    }
+
+    /// Output `uid` started: the seconds its device refused it, nil for one it didn't.
+    mutating func started(_ uid: String, nowS: Double) -> Double? {
+        entries.removeValue(forKey: uid).map { nowS - $0.sinceS }
+    }
+
+    /// Whether output `uid`'s last refusal came from another process holding its device.
+    func busy(_ uid: String) -> Bool {
+        entries[uid]?.busy == true
+    }
+
+    /// The outputs waiting for their next try, which no sync starts yet.
+    func held(nowS: Double) -> Set<String> {
+        Set(entries.filter { $0.value.retryAtS > nowS }.keys)
+    }
+
+    /// Forgets the outputs switched off, and those whose device left the list,
+    /// which S68 covers; listed again, a refusal starts its 30 s over. Returns
+    /// the busy ones whose device left the list: their busy notice ends.
+    @discardableResult
+    mutating func settle(enabled: Set<String>, listed: Set<String>) -> Set<String> {
+        let unlistedBusy = Set(entries.filter { $0.value.busy && !listed.contains($0.key) }.keys)
+        entries = entries.filter { enabled.contains($0.key) && listed.contains($0.key) }
+        return unlistedBusy
+    }
+
+    mutating func reset() {
+        entries = [:]
+    }
+}

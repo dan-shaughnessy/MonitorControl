@@ -1,0 +1,58 @@
+import AppKit
+
+/// Runs a closure when its menu item is chosen.
+@MainActor
+final class MenuAction: NSObject {
+    let run: () -> Void
+    init(_ run: @escaping () -> Void) { self.run = run }
+    // Not named perform(_:): in a static method that name resolves to NSObject's performSelector:.
+    @objc func choose(_ sender: Any?) { run() }
+
+    /// A menu item that runs `run`.
+    static func item(_ title: String, _ run: @escaping () -> Void) -> NSMenuItem {
+        let action = MenuAction(run)
+        let item = NSMenuItem(title: title, action: #selector(choose(_:)), keyEquivalent: "")
+        item.target = action
+        item.representedObject = action   // the target is weak
+        return item
+    }
+}
+
+@MainActor
+extension NSMenu {
+    /// Opens the menu under `view`, as a pull-down from a button.
+    func popUp(under view: NSView) {
+        keepUntilNextPopUp()
+        let below = view.isFlipped ? view.bounds.maxY + 4 : view.bounds.minY - 4
+        _ = popUp(positioning: nil, at: NSPoint(x: view.bounds.minX, y: below), in: view)
+    }
+
+    /// Holds the menu, its items and their targets until the next menu opens:
+    /// AppKit can send the chosen item's action after the pop-up call returns.
+    func keepUntilNextPopUp() { OpenMenu.current = self }
+}
+
+/// The menu a right-click on the menu bar icon opens: the commands of the
+/// Windows tray menu that the Mac has, in its order.
+@MainActor
+enum StatusItemMenu {
+    static func make(text t: UIStrings, running: Bool, launchAtLogin: Bool, open: @escaping () -> Void,
+                     setPower: @escaping (Bool) -> Void, setLaunchAtLogin: @escaping (Bool) -> Void,
+                     quit: @escaping () -> Void) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(MenuAction.item(t.openApp, open))
+        menu.addItem(MenuAction.item(running ? t.menuTurnStreamingOff : t.menuTurnStreamingOn) { setPower(!running) })
+        menu.addItem(.separator())
+        let login = MenuAction.item(t.launchAtLogin) { setLaunchAtLogin(!launchAtLogin) }
+        login.state = launchAtLogin ? .on : .off
+        menu.addItem(login)
+        menu.addItem(.separator())
+        menu.addItem(MenuAction.item(t.quitApp, quit))
+        return menu
+    }
+}
+
+@MainActor
+private enum OpenMenu {
+    static var current: NSMenu?
+}

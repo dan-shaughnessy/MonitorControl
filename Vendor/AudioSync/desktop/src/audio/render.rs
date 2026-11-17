@@ -1,0 +1,1167 @@
+//! An output's render pipeline: the core's renderer from the shared ring,
+//! through the output's delay reader, to the device's rate, channels, gain
+//! and fade, plus the endpoint's side of a stop.
+//!
+//! Per device callback the core's [`Renderer`] reads session-rate frames
+//! through its [`Reader`] (at the output's delay, with its own drift
+//! correction, held while it plays), converts them to the device's rate,
+//! sizing each read from what the resampler needs (S62), maps stereo onto
+//! the device's channels (S63), applies the output's gain, ramped over one
+//! callback when it changes (S64, S65), and then its 20 ms fade at the
+//! device rate (S183): the first audio fades in (S184), a stop fades out over
+//! 20 ms whatever a callback holds (S185), and a delay change fades out, lands
+//! and fades in again (S187). Delay and lag stay in session-rate frames.
+//!
+//! WASAPI keeps up to a whole endpoint buffer queued, so the end of a fade is
+//! heard well after it was rendered: an output counts as faded only once the
+//! endpoint's clock has played past the fade's last frame, or without a
+//! clock, once it holds nothing but zeros and its stream latency has passed
+//! since ([`RenderPipeline::has_played_its_fade`]).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::Duration;
+
+use audiosync_core::clock;
+use audiosync_core::reader::Reader;
+use audiosync_core::render::{Renderer, RendererControl, fade_tail_frames};
+use audiosync_core::volume::SharedGain;
+
+use super::SESSION_RATE;
+use super::backend::BackendError;
+
+/// What an endpoint still holds when the render loop asks whether a fade has
+/// played, in device frames.
+#[derive(Clone, Copy, Debug)]
+pub struct EndpointQueue {
+    /// Frames queued in the stream buffer (`GetCurrentPadding`).
+    pub padding: u32,
+    /// Frames written but not yet played by the endpoint's clock
+    /// (`IAudioClock`), when it could be read.
+    pub clock_queued: Option<u64>,
+    /// The stream latency the endpoint reports (`GetStreamLatency`).
+    pub latency_frames: u32,
+    /// The device rate.
+    pub rate: u32,
+}
+
+/// The render pipeline of one output, owned by its render thread.
+///
+/// All buffers are allocated by [`RenderPipeline::new`];
+/// [`RenderPipeline::render`] never allocates, locks or blocks.
+pub struct RenderPipeline {
+    renderer: Renderer,
+}
+
+impl RenderPipeline {
+    /// A pipeline that reads through `reader`, controlled through `control`
+    /// (made for that reader), and plays at the gain in `gain`, for a device
+    /// running at `device_rate` with `channels` interleaved float channels.
+    pub fn new(
+        reader: Reader,
+        control: &RendererControl,
+        gain: Arc<SharedGain>,
+        device_rate: u32,
+        channels: usize,
+    ) -> Result<RenderPipeline, BackendError> {
+        let renderer = Renderer::new(reader, control, gain, SESSION_RATE, device_rate, channels)
+            .map_err(|_| BackendError::UnsupportedFormat)?;
+        Ok(RenderPipeline { renderer })
+    }
+
+    /// Channels per device frame.
+    #[cfg_attr(
+        not(windows),
+        expect(dead_code, reason = "the WASAPI render loop sizes its packets with it")
+    )]
+    pub fn channels(&self) -> usize {
+        self.renderer.channels()
+    }
+
+    /// The device rate.
+    #[cfg(test)]
+    pub fn device_rate(&self) -> u32 {
+        self.renderer.device_rate()
+    }
+
+    /// Device frames played as silence because the resampler lacked input.
+    #[cfg(test)]
+    pub fn shortfall_frames(&self) -> u64 {
+        self.renderer.shortfall_frames()
+    }
+
+    /// Sets the endpoint's period, in device frames: what each wake refills
+    /// when it is on time, which the output's lead counts rather than a late
+    /// wake's larger fill (S206). Call it before the first render.
+    #[cfg_attr(
+        all(not(windows), not(target_os = "linux"), not(test)),
+        expect(dead_code, reason = "the WASAPI and PipeWire render loops set it")
+    )]
+    pub fn set_period_frames(&mut self, frames: usize) {
+        self.renderer.set_period_frames(frames);
+    }
+
+    /// The lead the output's reader got at its last callback (S206).
+    #[cfg(test)]
+    pub fn lead_frames(&self) -> i64 {
+        self.renderer.lead_frames()
+    }
+
+    /// Fills `out`, interleaved with [`RenderPipeline::channels`] channels,
+    /// reading now on the core's clock, the one the capture stamps its
+    /// blocks with, so a converting output follows the capture's clock
+    /// (S207).
+    pub fn render(&mut self, out: &mut [f32]) {
+        self.renderer.render_at(out, clock::now_ns());
+    }
+
+    /// [`RenderPipeline::render`] for a callback whose first frame is heard
+    /// at `output_time_ns` on the core's clock, read at `now_ns`, so a
+    /// fade-out's end is published and the output's lateness is known
+    /// (S207, S209).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "the PipeWire render loop knows its output time")
+    )]
+    pub fn render_timed(&mut self, out: &mut [f32], output_time_ns: u64, now_ns: u64) {
+        self.renderer.render_timed_at(out, output_time_ns, now_ns);
+    }
+
+    /// Whether the endpoint has played the requested fade-out (S185): the
+    /// frames written after its last frame cover what `queue` says is still
+    /// queued ([`fade_tail_frames`]).
+    #[cfg_attr(
+        all(not(windows), not(test)),
+        expect(dead_code, reason = "the WASAPI render loop asks it")
+    )]
+    pub fn has_played_its_fade(&self, queue: EndpointQueue) -> bool {
+        self.renderer.frames_after_fade().is_some_and(|after| {
+            after
+                >= fade_tail_frames(
+                    u64::from(queue.padding),
+                    queue.clock_queued,
+                    u64::from(queue.latency_frames),
+                    queue.rate,
+                )
+        })
+    }
+
+    /// Marks the output as faded for the control thread (a release store).
+    #[cfg_attr(
+        all(not(windows), not(test)),
+        expect(dead_code, reason = "the WASAPI render loop calls it")
+    )]
+    pub fn mark_faded(&self) {
+        self.renderer.mark_faded();
+    }
+}
+
+/// The wakes of an output's render loop that came late, for the debug log's
+/// status line: written by the render thread, read by the status timer. A
+/// late wake found more than one and a half device periods free, so it came
+/// at least half a period after the device asked; an empty one found nothing
+/// queued, so the device had played all it was given and may have played a
+/// gap before the refill.
+#[derive(Debug, Default)]
+#[cfg_attr(
+    all(not(windows), not(test)),
+    allow(dead_code, reason = "only the WASAPI render loop counts its wakes")
+)]
+pub struct WakeCounters {
+    late: AtomicU64,
+    empty: AtomicU64,
+}
+
+#[cfg_attr(
+    all(not(windows), not(test)),
+    allow(dead_code, reason = "only the WASAPI render loop counts its wakes")
+)]
+impl WakeCounters {
+    /// Counts a wake that found `padding` of the stream's `buffer_frames`
+    /// still queued, on a device whose period is `period_frames` (0 when
+    /// unknown: then no wake counts as late). Never allocates, locks or
+    /// blocks.
+    pub fn count_wake(&self, padding: u32, buffer_frames: u32, period_frames: usize) {
+        let free = u64::from(buffer_frames.saturating_sub(padding));
+        if period_frames > 0 && free * 2 > period_frames as u64 * 3 {
+            self.late.fetch_add(1, Ordering::Relaxed);
+        }
+        if padding == 0 {
+            self.empty.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The wakes counted so far.
+    pub fn counts(&self) -> WakeCounts {
+        WakeCounts {
+            late: self.late.load(Ordering::Relaxed),
+            empty: self.empty.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// An output's [`WakeCounters`] as the status line shows them; zero for an
+/// output that doesn't count them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WakeCounts {
+    /// Wakes that came at least half a period late.
+    pub late: u64,
+    /// Wakes that found the device's buffer empty.
+    pub empty: u64,
+}
+
+/// What the log names as the sign of an output stream that took no frame
+/// (S326): every padding read showed the whole buffer still queued, and
+/// with a clock that had run, it stood still too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallSign {
+    /// The buffer stayed full.
+    FullPadding,
+    /// The buffer stayed full and the device clock, which had run, stopped.
+    FrozenClock,
+    /// The render loop panicked (a bug), which takes the stall's retries so
+    /// a loop that panics each time isn't reopened every poll.
+    Panicked,
+}
+
+/// An output stream that stopped taking frames (S326): for how long, and
+/// what showed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stall {
+    pub span: Duration,
+    pub sign: StallSign,
+}
+
+/// Where a render thread leaves the [`Stall`] that ended its stream, for the
+/// controller to log once the stream is released.
+#[derive(Debug, Default)]
+#[cfg_attr(
+    all(not(windows), not(test)),
+    allow(dead_code, reason = "only the WASAPI render loop watches for stalls")
+)]
+pub struct StallSlot {
+    span_ms: AtomicU64,
+    /// 0 while there is none, then 1 + the sign's index.
+    sign: AtomicU8,
+}
+
+#[cfg_attr(
+    all(not(windows), not(test)),
+    allow(dead_code, reason = "only the WASAPI render loop watches for stalls")
+)]
+impl StallSlot {
+    /// Keeps `stall`. Never allocates, locks or blocks.
+    pub fn record(&self, stall: Stall) {
+        let span_ms = u64::try_from(stall.span.as_millis()).unwrap_or(u64::MAX);
+        self.span_ms.store(span_ms, Ordering::Relaxed);
+        let sign = match stall.sign {
+            StallSign::FullPadding => 1,
+            StallSign::FrozenClock => 2,
+            StallSign::Panicked => 3,
+        };
+        self.sign.store(sign, Ordering::Release);
+    }
+
+    /// The stall kept, if any.
+    pub fn get(&self) -> Option<Stall> {
+        let sign = match self.sign.load(Ordering::Acquire) {
+            1 => StallSign::FullPadding,
+            2 => StallSign::FrozenClock,
+            3 => StallSign::Panicked,
+            _ => return None,
+        };
+        Some(Stall {
+            span: Duration::from_millis(self.span_ms.load(Ordering::Relaxed)),
+            sign,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::f64::consts::PI;
+
+    use audiosync_core::render::RendererControl;
+    use audiosync_core::ring::{Ring, RingWriter};
+
+    use super::*;
+
+    // covers: S229
+    #[test]
+    fn a_wake_counts_as_late_past_half_a_period_and_as_empty_with_nothing_queued() {
+        // A 20 ms buffer of two 10 ms periods at 48 kHz.
+        let (buffer, period) = (960, 480);
+        let wakes = WakeCounters::default();
+        // On time: one period free.
+        wakes.count_wake(480, buffer, period);
+        // Just under half a period late.
+        wakes.count_wake(241, buffer, period);
+        assert_eq!(wakes.counts(), WakeCounts::default());
+        // Over half a period late.
+        wakes.count_wake(239, buffer, period);
+        assert_eq!(wakes.counts(), WakeCounts { late: 1, empty: 0 });
+        // A whole period late: the device played everything.
+        wakes.count_wake(0, buffer, period);
+        assert_eq!(wakes.counts(), WakeCounts { late: 2, empty: 1 });
+        // Without a known period only an empty buffer counts.
+        wakes.count_wake(0, buffer, 0);
+        wakes.count_wake(100, buffer, 0);
+        assert_eq!(wakes.counts(), WakeCounts { late: 2, empty: 2 });
+    }
+
+    struct Setup {
+        writer: RingWriter,
+        gain: Arc<SharedGain>,
+        control: RendererControl,
+        pipeline: RenderPipeline,
+        /// Session-rate frames the live capture owes the ring.
+        owed: f64,
+    }
+
+    /// A ring at the session rate and a pipeline reading it at `delay_frames`.
+    fn setup(device_rate: u32, channels: usize, delay_frames: i64, gain: f32) -> Setup {
+        let ring = Ring::for_rate(SESSION_RATE).unwrap();
+        let writer = ring.writer().unwrap();
+        let reader = Reader::new(ring, SESSION_RATE);
+        reader.control().set_delay_frames(delay_frames);
+        let control = RendererControl::new(&reader);
+        let gain = Arc::new(SharedGain::new(gain));
+        let pipeline =
+            RenderPipeline::new(reader, &control, Arc::clone(&gain), device_rate, channels)
+                .unwrap();
+        Setup {
+            writer,
+            gain,
+            control,
+            pipeline,
+            owed: 0.0,
+        }
+    }
+
+    /// The converter's latency at the session rate (S85): a fade-in starts on
+    /// the first frame that leaves it.
+    const LATENCY: usize = 21;
+
+    /// A fade's frames at `rate` (S182): 20 ms.
+    fn fade_len(rate: u32) -> usize {
+        (rate as usize * 20 + 500) / 1000
+    }
+
+    /// w of frame `i` of a fade-in, or of a fade-out, of `len` frames (S182).
+    fn fade_in(i: usize, len: usize) -> f64 {
+        0.5 - 0.5 * (PI * (i + 1) as f64 / len as f64).cos()
+    }
+
+    fn fade_out(i: usize, len: usize) -> f64 {
+        0.5 + 0.5 * (PI * (i + 1) as f64 / len as f64).cos()
+    }
+
+    /// Renders `frames` frames in callbacks of `callback` frames and returns
+    /// the first channel.
+    fn play(s: &mut Setup, frames: usize, callback: usize) -> Vec<f32> {
+        let mut played = Vec::new();
+        while played.len() < frames {
+            let n = callback.min(frames - played.len());
+            let mut out = vec![9.0f32; n * 2];
+            s.pipeline.render(&mut out);
+            played.extend(out.as_chunks::<2>().0.iter().map(|frame| frame[0]));
+        }
+        played
+    }
+
+    /// Like [`play`], with a capture that writes 0.5 at the pace the device
+    /// plays before each callback.
+    fn live(s: &mut Setup, frames: usize, callback: usize) -> Vec<f32> {
+        let mut played = Vec::new();
+        while played.len() < frames {
+            let n = callback.min(frames - played.len());
+            s.owed += n as f64 * f64::from(SESSION_RATE) / f64::from(s.pipeline.device_rate());
+            let write = s.owed.floor();
+            s.owed -= write;
+            let write = write as usize;
+            s.writer.write(&vec![0.5f32; write * 2], write);
+            played.extend(play(s, n, n));
+        }
+        played
+    }
+
+    /// A pipeline at a 100 ms delay whose ring holds those 100 ms, so the
+    /// first live callback primes it.
+    fn primed(device_rate: u32) -> Setup {
+        let mut s = setup(device_rate, 2, 4_800, 1.0);
+        s.writer.write(&vec![0.5f32; 4_800 * 2], 4_800);
+        s
+    }
+
+    // covers: S184
+    #[test]
+    fn the_first_audio_of_a_session_fades_in_over_20_ms() {
+        let mut s = primed(SESSION_RATE);
+        let played = live(&mut s, 4_000, 480);
+        let len = fade_len(SESSION_RATE);
+        assert!(played[..LATENCY].iter().all(|&sample| sample == 0.0));
+        for (i, &sample) in played[LATENCY..LATENCY + len].iter().enumerate() {
+            let expected = 0.5 * fade_in(i, len);
+            assert!(
+                (f64::from(sample) - expected).abs() <= 1e-6,
+                "frame {i}: {sample}, the fade says {expected}"
+            );
+        }
+        assert!(
+            played[LATENCY + len - 1..]
+                .iter()
+                .all(|&sample| sample == 0.5)
+        );
+
+        // At another device rate the fade counts that rate's frames.
+        let mut s = primed(44_100);
+        let played = live(&mut s, 4_000, 441);
+        let len = fade_len(44_100);
+        assert_eq!(len, 882);
+        assert!(played[100].abs() < 0.05, "{}", played[100]);
+        assert!((played[len / 2] - 0.25).abs() < 0.02, "{}", played[len / 2]);
+        assert!(
+            played[len + 64..]
+                .iter()
+                .all(|&sample| (sample - 0.5).abs() < 1e-3)
+        );
+    }
+
+    // covers: S182, S185
+    #[test]
+    fn a_stop_fades_out_over_20_ms_whatever_the_callback_holds() {
+        let len = fade_len(SESSION_RATE);
+        for callback in [64usize, 480, 1_056, 4_096] {
+            let mut s = primed(SESSION_RATE);
+            live(&mut s, 2_048, callback);
+            s.control.request_fade_out();
+            let played = live(&mut s, 3_000, callback);
+            for (i, &sample) in played[..len].iter().enumerate() {
+                let expected = 0.5 * fade_out(i, len);
+                assert!(
+                    (f64::from(sample) - expected).abs() <= 1e-6,
+                    "{callback}-frame callbacks, frame {i}: {sample} for {expected}"
+                );
+            }
+            assert!(
+                played[len - 1..].iter().all(|&sample| sample == 0.0),
+                "{callback}-frame callbacks: silent after 20 ms"
+            );
+        }
+    }
+
+    // covers: S187
+    #[test]
+    fn a_delay_change_fades_out_first_and_in_after() {
+        let len = fade_len(SESSION_RATE);
+        let mut s = setup(SESSION_RATE, 2, 4_800, 1.0);
+        let block = vec![0.5f32; 480 * 2];
+        let tick = |s: &mut Setup| {
+            s.writer.write(&block, 480);
+            play(s, 480, 480)
+        };
+        for _ in 0..20 {
+            tick(&mut s);
+        }
+        assert_eq!(s.control.lag_frames(), 4_800 - 480 - LATENCY as i64);
+        s.control.set_delay_frames(2_400);
+        let mut played = Vec::new();
+        for _ in 0..6 {
+            played.extend(tick(&mut s));
+        }
+        for i in 0..len {
+            let out = 0.5 * fade_out(i, len);
+            let back = 0.5 * fade_in(i, len);
+            assert!((f64::from(played[i]) - out).abs() <= 1e-6, "out {i}");
+            let at = len + LATENCY + i;
+            assert!((f64::from(played[at]) - back).abs() <= 1e-6, "in {i}");
+        }
+        assert!(
+            played[len..len + LATENCY]
+                .iter()
+                .all(|&sample| sample == 0.0)
+        );
+        assert_eq!(
+            s.control.lag_frames(),
+            2_400 - 480 - LATENCY as i64,
+            "the change landed exactly after the fade-out"
+        );
+    }
+
+    /// The runs of silence in `played`, as (first frame, frames).
+    fn silences(played: &[f32]) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (i, &sample) in played.iter().enumerate() {
+            if sample != 0.0 {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((first, frames)) if *first + *frames == i => *frames += 1,
+                _ => runs.push((i, 1)),
+            }
+        }
+        runs
+    }
+
+    /// A live output at 50 ms raised by 100 ms, as an AirPlay switch-on
+    /// raises it by L, then by `raise` frames `after` callbacks later; what
+    /// it played from the first raise on.
+    fn raised_twice(after: usize, raise: i64) -> Vec<f32> {
+        let mut s = setup(SESSION_RATE, 2, 2_400, 1.0);
+        let block = vec![0.5f32; 480 * 2];
+        let tick = |s: &mut Setup| {
+            s.writer.write(&block, 480);
+            play(s, 480, 480)
+        };
+        for _ in 0..20 {
+            tick(&mut s);
+        }
+        s.control.set_delay_frames(2_400 + 4_800);
+        let mut played = Vec::new();
+        for _ in 0..after {
+            played.extend(tick(&mut s));
+        }
+        s.control.set_delay_frames(2_400 + 4_800 + raise);
+        for _ in 0..40 {
+            played.extend(tick(&mut s));
+        }
+        played
+    }
+
+    // covers: S281
+    #[test]
+    fn a_raise_during_the_inserted_silence_lengthens_it_and_a_later_one_inserts_more() {
+        let len = fade_len(SESSION_RATE);
+        // The fade-out's last frame is silent, then the converter's latency.
+        let gap = |raise: usize| raise + LATENCY + 1;
+        assert_eq!(silences(&raised_twice(0, 0)), [(len - 1, gap(4_800))]);
+        assert_eq!(
+            silences(&raised_twice(3, 960)),
+            [(len - 1, gap(4_800 + 960))],
+            "one silence, longer by the raise"
+        );
+
+        let played = raised_twice(20, 960);
+        let later = 20 * 480;
+        assert_eq!(
+            silences(&played),
+            [(len - 1, gap(4_800)), (later + len - 1, gap(960))]
+        );
+        let back = later + len - 1 + gap(960);
+        for i in 0..len {
+            let out = 0.5 * fade_out(i, len);
+            assert!(
+                (f64::from(played[later + i]) - out).abs() <= 1e-6,
+                "out {i}"
+            );
+            let fade_in = 0.5 * fade_in(i, len);
+            assert!(
+                (f64::from(played[back + i]) - fade_in).abs() <= 1e-6,
+                "in {i}"
+            );
+        }
+    }
+
+    /// What the endpoint holds, as the render loop reads it at 48 kHz.
+    fn queue(padding: u32, clock_queued: Option<u64>, latency_frames: u32) -> EndpointQueue {
+        EndpointQueue {
+            padding,
+            clock_queued,
+            latency_frames,
+            rate: 48_000,
+        }
+    }
+
+    // covers: S185
+    #[test]
+    fn a_fade_has_played_only_once_the_endpoint_clock_has_passed_its_end() {
+        let mut s = primed(SESSION_RATE);
+        live(&mut s, 2_400, 480);
+        s.control.request_fade_out();
+        live(&mut s, 480, 480);
+        play(&mut s, 480, 480);
+        // Only zeros are queued, but the clock says 30 ms more than the
+        // padding is written and not yet played: the end of the fade is
+        // among them, and GetStreamLatency says 0.
+        play(&mut s, 480, 480);
+        let behind = 480 + 1_440;
+        assert!(
+            !s.pipeline.has_played_its_fade(queue(480, Some(behind), 0)),
+            "the clock hasn't reached the fade's last frame"
+        );
+        play(&mut s, 1_440, 480);
+        assert!(s.pipeline.has_played_its_fade(queue(480, Some(behind), 0)));
+    }
+
+    // covers: S185
+    #[test]
+    fn a_clock_far_behind_the_padding_holds_a_stop_at_most_the_tail_cap() {
+        let mut s = primed(SESSION_RATE);
+        live(&mut s, 2_400, 480);
+        s.control.request_fade_out();
+        live(&mut s, 480, 480);
+        play(&mut s, 480, 480);
+        // A clock 1 s behind counts as the padding plus 100 ms.
+        play(&mut s, 480 + 4_320, 480);
+        assert!(!s.pipeline.has_played_its_fade(queue(480, Some(48_480), 0)));
+        play(&mut s, 480, 480);
+        assert!(s.pipeline.has_played_its_fade(queue(480, Some(48_480), 0)));
+        // A clock ahead of the padding (it counted a glitch's silence)
+        // still waits for the padding.
+        assert!(!s.pipeline.has_played_its_fade(queue(9_999, Some(0), 0)));
+    }
+
+    // covers: S185
+    #[test]
+    fn an_output_is_faded_only_when_the_endpoint_holds_nothing_but_zeros() {
+        let mut s = primed(SESSION_RATE);
+        live(&mut s, 2_400, 480);
+        assert!(
+            !s.pipeline.has_played_its_fade(queue(0, None, 0)),
+            "no stop asked for"
+        );
+        s.control.request_fade_out();
+        live(&mut s, 480, 480);
+        assert!(
+            !s.pipeline.has_played_its_fade(queue(0, None, 0)),
+            "half the fade rendered"
+        );
+        // The fade's last frame is this callback's last.
+        play(&mut s, 480, 480);
+        assert!(s.pipeline.has_played_its_fade(queue(0, None, 0)));
+        assert!(
+            !s.pipeline.has_played_its_fade(queue(480, None, 0)),
+            "the endpoint still holds the end of the fade"
+        );
+        play(&mut s, 480, 480);
+        assert!(
+            s.pipeline.has_played_its_fade(queue(480, None, 0)),
+            "only zeros queued"
+        );
+        assert!(
+            !s.pipeline.has_played_its_fade(queue(480, None, 240)),
+            "the stream latency hasn't passed since"
+        );
+        play(&mut s, 240, 240);
+        assert!(s.pipeline.has_played_its_fade(queue(480, None, 240)));
+        assert!(!s.control.is_faded());
+        s.pipeline.mark_faded();
+        assert!(s.control.is_faded());
+    }
+
+    /// A pipeline whose fade-out's last frame was rendered `after` frames
+    /// ago.
+    fn faded_and_followed_by(after: usize) -> Setup {
+        let mut s = primed(SESSION_RATE);
+        live(&mut s, 2_400, 480);
+        s.control.request_fade_out();
+        live(&mut s, 480, 480);
+        play(&mut s, 480, 480);
+        play(&mut s, after, 480);
+        s
+    }
+
+    // covers: S185
+    #[test]
+    fn with_a_clock_reading_a_stop_waits_on_the_padding_not_the_stream_latency() {
+        let s = faded_and_followed_by(960);
+        // 500 ms of reported latency holds nothing once the queue is zeros.
+        assert!(
+            s.pipeline
+                .has_played_its_fade(queue(960, Some(480), 24_000))
+        );
+        assert!(
+            !s.pipeline.has_played_its_fade(queue(1_440, Some(480), 0)),
+            "the padding still holds the end of the fade"
+        );
+    }
+
+    // covers: S209, S317
+    #[test]
+    fn without_output_times_no_wake_counts_late_and_no_start_step_is_made() {
+        let mut s = primed(SESSION_RATE);
+        s.pipeline.set_period_frames(480);
+        // Late wakes refill two or three periods at once.
+        for callback in [480, 960, 480, 1_440].repeat(40) {
+            live(&mut s, callback, callback);
+        }
+        let c = &s.control;
+        assert_eq!((c.late_max_ns(), c.late_callbacks()), (0, 0));
+        assert_eq!((c.floor_drop_ns(), c.time_steps()), (0, 0));
+        assert_eq!((c.start_steps(), c.start_step_frames()), (0, 0));
+        assert_eq!(c.counters().starved_renders, 0);
+    }
+
+    // covers: S324
+    #[test]
+    fn a_wasapi_output_skips_the_silence_its_device_played_after_a_late_wake_found_it_dry() {
+        // Set up as the WASAPI loop does: a 10 ms period, a 20 ms buffer
+        // and no output times. The second wake comes 70 ms late, so the
+        // device plays 60 ms of silence.
+        const BUFFER: u64 = 960;
+        let mut s = primed(SESSION_RATE);
+        s.pipeline.set_period_frames(480);
+        let start = clock::now_ns();
+        let (mut t, mut captured, mut queued_until) = (start, 0, BUFFER);
+        let mut silence = Vec::new();
+        for wake in 0..100 {
+            t += if wake == 1 { 80_000_000 } else { 10_000_000 };
+            let now = (t - start) * u64::from(SESSION_RATE) / 1_000_000_000;
+            let write = (now - captured) as usize;
+            s.writer.write_at(&vec![0.5f32; write * 2], write, t);
+            captured = now;
+            if now > queued_until {
+                silence.push(now - queued_until);
+                queued_until = now;
+            }
+            let free = BUFFER - (queued_until - now);
+            queued_until += free;
+            let mut out = vec![0.0f32; free as usize * 2];
+            s.pipeline.renderer.render_at(&mut out, t);
+        }
+        assert_eq!(silence, [2_880]);
+        assert_eq!(s.control.start_steps(), 1);
+        let stepped = s.control.start_step_frames();
+        assert!(stepped.abs_diff(2_880) <= 96, "stepped {stepped} frames");
+    }
+
+    // covers: S190
+    #[test]
+    fn a_stop_asked_from_the_control_thread_comes_back_as_faded() {
+        let mut s = primed(SESSION_RATE);
+        let control = s.control.clone();
+        let (rendering, started) = std::sync::mpsc::channel();
+        let render = std::thread::spawn(move || {
+            let mut last = Vec::new();
+            for wake in 0..10_000 {
+                if s.pipeline.has_played_its_fade(queue(480, Some(480), 0)) {
+                    s.pipeline.mark_faded();
+                    return last;
+                }
+                last = live(&mut s, 480, 480);
+                if wake == 10 {
+                    rendering.send(()).unwrap();
+                }
+            }
+            panic!("the fade-out never played");
+        });
+        started.recv().unwrap();
+        control.request_fade_out();
+        let last = render.join().unwrap();
+        assert!(control.is_faded());
+        assert!(last.iter().all(|&sample| sample == 0.0));
+    }
+
+    /// Writes stereo frames whose left sample is `index / 1e6` and right
+    /// sample its negative, from `first` on.
+    fn write_ramp(writer: &mut RingWriter, first: usize, frames: usize) {
+        let samples: Vec<f32> = (first..first + frames)
+            .flat_map(|i| {
+                let value = i as f32 / 1e6;
+                [value, -value]
+            })
+            .collect();
+        writer.write(&samples, frames);
+    }
+
+    fn tone(writer: &mut RingWriter, first: usize, frames: usize, hz: f64) {
+        let samples: Vec<f32> = (first..first + frames)
+            .flat_map(|i| {
+                let value = (0.5
+                    * (i as f64 * hz / f64::from(SESSION_RATE) * std::f64::consts::TAU).sin())
+                    as f32;
+                [value, value]
+            })
+            .collect();
+        writer.write(&samples, frames);
+    }
+
+    /// Plays past the first audio's fade-in.
+    fn warm_up(s: &mut Setup) {
+        play(s, 1_024, 512);
+    }
+
+    // covers: S45, S62
+    #[test]
+    fn at_the_session_rate_frames_play_at_the_delay() {
+        let mut s = setup(SESSION_RATE, 2, 4_000, 1.0);
+        write_ramp(&mut s.writer, 0, 10_000);
+        let mut out = vec![9.0; 480 * 2];
+        // Anchored at W - delay = 6000; 960 frames fade in after the
+        // converter's latency.
+        s.pipeline.render(&mut out);
+        assert!(out[0].abs() < 1e-6, "the fade-in starts from silence");
+        for _ in 0..3 {
+            s.pipeline.render(&mut out);
+        }
+        assert_eq!(out[0], 7_440.0 / 1e6);
+        assert_eq!(out[1], -7_440.0 / 1e6);
+        assert_eq!(out[479 * 2], 7_919.0 / 1e6);
+        s.pipeline.render(&mut out);
+        assert_eq!(out[0], 7_920.0 / 1e6, "the next block follows on");
+        assert_eq!(s.pipeline.shortfall_frames(), 0);
+    }
+
+    // covers: S63
+    #[test]
+    fn stereo_feeds_the_first_two_channels_and_the_rest_stay_silent() {
+        let mut s = setup(SESSION_RATE, 6, 4_000, 1.0);
+        write_ramp(&mut s.writer, 0, 10_000);
+        let mut out = vec![9.0; 1_024 * 6];
+        s.pipeline.render(&mut out);
+        let mut out = vec![9.0; 100 * 6];
+        s.pipeline.render(&mut out);
+        let first = &out[..6];
+        let value = 7_024.0 / 1e6;
+        assert_eq!(first, [value, -value, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    // covers: S63
+    #[test]
+    fn a_mono_device_gets_the_average_of_both_channels() {
+        let mut s = setup(SESSION_RATE, 1, 4_000, 1.0);
+        let samples: Vec<f32> = (0..5_000).flat_map(|_| [0.5, 0.25]).collect();
+        s.writer.write(&samples, 5_000);
+        let mut out = vec![9.0; 1_024];
+        s.pipeline.render(&mut out);
+        let mut out = vec![9.0; 64];
+        s.pipeline.render(&mut out);
+        assert!(out.iter().all(|&sample| sample == 0.375));
+    }
+
+    // covers: S64
+    #[test]
+    fn the_gain_is_applied_and_follows_changes_from_the_next_callback() {
+        let mut s = setup(SESSION_RATE, 2, 4_000, 0.5);
+        let samples = vec![0.8f32; 20_000];
+        s.writer.write(&samples, 10_000);
+        warm_up(&mut s);
+        let mut out = vec![0.0; 256 * 2];
+        s.pipeline.render(&mut out);
+        assert!(out.iter().all(|&sample| sample == 0.4), "plays at the gain");
+        s.gain.set(0.25);
+        s.pipeline.render(&mut out);
+        assert!((0.2..0.4).contains(&out[0]), "ramps over one callback");
+        assert_eq!(out[255 * 2], 0.2);
+        s.pipeline.render(&mut out);
+        assert!(out.iter().all(|&sample| sample == 0.2));
+    }
+
+    // covers: S64
+    #[test]
+    fn an_output_at_gain_0_writes_exact_zeros_from_the_first_callback() {
+        for device_rate in [SESSION_RATE, 44_100] {
+            let mut s = setup(device_rate, 2, 4_000, 0.0);
+            s.writer.write(&vec![0.8f32; 20_000], 10_000);
+            let mut out = vec![9.0; 256 * 2];
+            for callback in 0..8 {
+                s.pipeline.render(&mut out);
+                assert!(
+                    out.iter().all(|&sample| sample == 0.0),
+                    "{device_rate} Hz, callback {callback}"
+                );
+            }
+        }
+    }
+
+    // covers: S65
+    #[test]
+    fn samples_that_are_not_finite_reach_the_device_as_zero() {
+        let mut s = setup(SESSION_RATE, 2, 4_000, 1.0);
+        // Not finite on the left up to frame 8000, finite from there.
+        let samples: Vec<f32> = (0..10_000)
+            .flat_map(|i| match i {
+                8_000.. => [0.5, 0.5],
+                _ if i % 2 == 0 => [f32::NAN, 0.5],
+                _ => [f32::INFINITY, 0.5],
+            })
+            .collect();
+        s.writer.write(&samples, 10_000);
+        let mut out = vec![9.0; 1_024 * 2];
+        s.pipeline.render(&mut out);
+        assert!(out.iter().all(|sample| sample.is_finite()), "fading in");
+        let mut out = vec![9.0; 128 * 2];
+        s.pipeline.render(&mut out);
+        // The converter clears what it still had to play on both channels
+        // at each non-finite sample (S125).
+        assert!(out.iter().all(|&sample| sample == 0.0));
+        let mut out = vec![9.0; 1_024 * 2];
+        s.pipeline.render(&mut out);
+        assert!(out.iter().all(|sample| sample.is_finite()));
+        let mut out = vec![9.0; 128 * 2];
+        s.pipeline.render(&mut out);
+        assert!(out.iter().all(|&sample| sample == 0.5), "finite again");
+    }
+
+    // covers: S45
+    #[test]
+    fn before_enough_audio_arrived_the_output_plays_silence() {
+        let mut s = setup(SESSION_RATE, 2, 96_000, 1.0);
+        write_ramp(&mut s.writer, 0, 1_000);
+        let mut out = vec![9.0; 480 * 2];
+        s.pipeline.render(&mut out);
+        assert!(out.iter().all(|&sample| sample == 0.0));
+    }
+
+    // covers: S62
+    #[test]
+    fn a_trailing_partial_frame_stays_silent() {
+        let mut s = setup(SESSION_RATE, 2, 1_000, 1.0);
+        write_ramp(&mut s.writer, 0, 5_000);
+        let mut out = vec![9.0; 11];
+        s.pipeline.render(&mut out);
+        assert_eq!(out[10], 0.0);
+    }
+
+    /// Plays a 1 kHz tone through a device at `device_rate`, in callbacks of
+    /// `callback` device frames, and checks the result.
+    fn play_tone_at(device_rate: u32, callback: usize) {
+        let mut s = setup(device_rate, 2, 4_800, 1.0);
+        let mut written = 0;
+        let mut played = Vec::new();
+        // Two seconds, the capture writing 10 ms blocks.
+        let device_frames_per_block = device_rate as usize / 100;
+        let mut owed = 0usize;
+        for _ in 0..200 {
+            tone(&mut s.writer, written, 480, 1_000.0);
+            written += 480;
+            owed += device_frames_per_block;
+            while owed >= callback {
+                let mut out = vec![0.0; callback * 2];
+                s.pipeline.render(&mut out);
+                assert!(out.iter().all(|sample| sample.is_finite()));
+                played.extend(out.as_chunks::<2>().0.iter().map(|frame| frame[0]));
+                owed -= callback;
+            }
+        }
+        assert_eq!(s.pipeline.device_rate(), device_rate);
+        assert_eq!(s.pipeline.shortfall_frames(), 0);
+        // The last second: a 1 kHz tone at half scale, at the device's rate.
+        let last_second = &played[played.len() - device_rate as usize..];
+        let peak = last_second.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        assert!(
+            (0.45..0.55).contains(&peak),
+            "peak {peak} at {device_rate} Hz"
+        );
+        let crossings = last_second
+            .windows(2)
+            .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
+            .count();
+        assert!(
+            (1_990..=2_010).contains(&crossings),
+            "{crossings} zero crossings in a second at {device_rate} Hz"
+        );
+    }
+
+    // covers: S62
+    #[test]
+    fn a_device_at_44_1_khz_gets_the_tone_converted() {
+        play_tone_at(44_100, 441);
+    }
+
+    // covers: S62
+    #[test]
+    fn a_device_at_96_khz_gets_the_tone_converted() {
+        play_tone_at(96_000, 960);
+    }
+
+    // covers: S62
+    #[test]
+    fn a_device_at_the_session_rate_plays_the_tone_unchanged() {
+        play_tone_at(SESSION_RATE, 480);
+    }
+
+    // covers: S62
+    #[test]
+    fn odd_callback_sizes_at_another_rate_never_run_short() {
+        play_tone_at(44_100, 1_031);
+        play_tone_at(22_050, 97);
+    }
+
+    // covers: S206
+    /// The capture has run for a second, writing a 10 ms block on its own
+    /// clock, when an endpoint whose clock runs 100 ppm fast starts asking
+    /// for one 10 ms period per event, at hold-back 0: the output never runs
+    /// dry after its start when it converts (S206).
+    #[test]
+    fn a_converting_output_at_hold_back_0_never_runs_dry_after_its_start() {
+        for device_rate in [44_100, 96_000] {
+            for phase in [0.0, 0.25, 0.5, 0.75, 0.95] {
+                let mut s = setup(device_rate, 2, 0, 1.0);
+                let block = SESSION_RATE as usize / 100;
+                let period = device_rate as usize / 100;
+                for _ in 0..100 {
+                    s.writer.write(&vec![0.5f32; block * 2], block);
+                }
+                // Time in units of 1 / (session rate × device rate × 10^4)
+                // seconds; the endpoint's period is 10^-4 short.
+                let write_every = block as u128 * u128::from(device_rate) * 10_000;
+                let pull_every = period as u128 * u128::from(SESSION_RATE) * 9_999;
+                let offset = (phase * write_every as f64) as u128;
+                let (mut written, mut pulled) = (1u128, 0u128);
+                let mut played = Vec::new();
+                // Five seconds.
+                while played.len() < 5 * device_rate as usize {
+                    if pulled * pull_every + offset < written * write_every {
+                        played.extend(play(&mut s, period, period));
+                        pulled += 1;
+                    } else {
+                        s.writer.write(&vec![0.5f32; block * 2], block);
+                        written += 1;
+                    }
+                }
+                let counters = s.control.counters();
+                assert_eq!(
+                    (
+                        counters.starved_renders,
+                        counters.drift_skips,
+                        counters.drift_silences
+                    ),
+                    (0, 0, 0),
+                    "{device_rate} Hz, phase {phase}"
+                );
+                let first = played.iter().position(|&x| x != 0.0).unwrap();
+                let open = first + fade_len(device_rate) + 64;
+                assert!(
+                    played[open..].iter().all(|&x| (x - 0.5).abs() < 1e-3),
+                    "a gap after the fade-in at {device_rate} Hz, phase {phase}"
+                );
+            }
+        }
+    }
+
+    // covers: S206
+    /// An endpoint whose period the pipeline knows: a late wake's fill of
+    /// two periods gets a lead for two periods, and the next on-time wake is
+    /// back at one (S206).
+    #[test]
+    fn a_late_wake_raises_the_lead_for_its_own_fill_only() {
+        let mut s = setup(44_100, 2, 0, 1.0);
+        s.pipeline.set_period_frames(441);
+        for _ in 0..100 {
+            s.writer.write(&[0.5f32; 960], 480);
+        }
+        play(&mut s, 441, 441);
+        let on_time = s.pipeline.lead_frames();
+        s.writer.write(&[0.5f32; 960], 480);
+        s.writer.write(&[0.5f32; 960], 480);
+        play(&mut s, 882, 882);
+        let late = s.pipeline.lead_frames();
+        s.writer.write(&[0.5f32; 960], 480);
+        play(&mut s, 441, 441);
+        assert!(late > on_time, "{late} after a late wake, {on_time} before");
+        assert_eq!(s.pipeline.lead_frames(), on_time);
+        assert_eq!(s.control.counters().starved_renders, 0);
+    }
+
+    // covers: S208
+    /// A 44.1 kHz output at hold-back 0, which converts, and a 48 kHz one
+    /// held back by `held_back` frames read one ring in 10 ms periods, the
+    /// capture writing a ramp in 10 ms blocks: frame 147 n of the first and
+    /// 160 n of the second play at the same instant, `held_back` apart.
+    #[test]
+    fn local_outputs_play_exactly_their_hold_backs_apart_with_the_converter() {
+        for held_back in [240i64, 4_800] {
+            let ring = Ring::for_rate(SESSION_RATE).unwrap();
+            let mut writer = ring.writer().unwrap();
+            let gain = Arc::new(SharedGain::new(1.0));
+            let make = |rate: u32, delay: i64| {
+                let reader = Reader::new(Arc::clone(&ring), SESSION_RATE);
+                reader.control().set_delay_frames(delay);
+                let control = RendererControl::new(&reader);
+                let mut pipeline =
+                    RenderPipeline::new(reader, &control, Arc::clone(&gain), rate, 2).unwrap();
+                pipeline.set_period_frames(rate as usize / 100);
+                (pipeline, control)
+            };
+            let mut outputs = [make(44_100, 0), make(SESSION_RATE, held_back)];
+            let mut written = 0;
+            for _ in 0..100 {
+                write_ramp(&mut writer, written, 480);
+                written += 480;
+            }
+            let mut played = [Vec::new(), Vec::new()];
+            // The periods' own clock: on the wall clock, a test thread
+            // descheduled under load reads as a late wake (S324).
+            for period in 0..300u64 {
+                write_ramp(&mut writer, written, 480);
+                written += 480;
+                for ((pipeline, _), played) in outputs.iter_mut().zip(&mut played) {
+                    let mut out = vec![0.0f32; pipeline.device_rate() as usize / 100 * 2];
+                    pipeline.renderer.render_at(&mut out, period * 10_000_000);
+                    played.extend(out.as_chunks::<2>().0.iter().map(|frame| frame[0]));
+                }
+            }
+            for (_, control) in &outputs {
+                assert_eq!(control.counters().starved_renders, 0, "{held_back}");
+            }
+            let start = played[0].iter().position(|&x| x != 0.0).unwrap();
+            assert!(start < 44_100 / 20, "the earliest starts at frame {start}");
+            for n in 30..890 {
+                let difference =
+                    (f64::from(played[0][147 * n]) - f64::from(played[1][160 * n])) * 1e6;
+                assert!(
+                    (difference - held_back as f64).abs() < 0.5,
+                    "at {n}/300 s: {difference} frames apart, not {held_back}"
+                );
+            }
+        }
+    }
+
+    /// The capture frames the converter was sped up by over five seconds of
+    /// 10 ms callbacks against a capture 1000 ppm faster than the device,
+    /// its blocks stamped on the core's clock when `stamped`.
+    fn sped_against_a_slow_device(device_rate: u32, stamped: bool) -> u64 {
+        let mut s = primed(device_rate);
+        let period = device_rate as usize / 100;
+        for _ in 0..500 {
+            s.owed += period as f64 * f64::from(SESSION_RATE) / f64::from(device_rate) * 1.001;
+            let write = s.owed.floor();
+            s.owed -= write;
+            let write = write as usize;
+            let block = vec![0.5f32; write * 2];
+            if stamped {
+                s.writer.write_at(&block, write, clock::now_ns());
+            } else {
+                s.writer.write(&block, write);
+            }
+            play(&mut s, period, period);
+        }
+        s.control.sped_frames()
+    }
+
+    // covers: S207, S226
+    #[test]
+    fn each_callback_reads_on_the_stamps_clock_so_the_trim_follows_the_capture() {
+        for device_rate in [SESSION_RATE, 44_100] {
+            assert!(
+                sped_against_a_slow_device(device_rate, true) > 0,
+                "{device_rate} Hz with stamps"
+            );
+            assert_eq!(
+                sped_against_a_slow_device(device_rate, false),
+                0,
+                "{device_rate} Hz without stamps"
+            );
+        }
+    }
+
+    // covers: S62
+    #[test]
+    fn a_device_without_channels_or_at_an_unsupported_rate_is_refused() {
+        let ring = Ring::for_rate(SESSION_RATE).unwrap();
+        let gain = Arc::new(SharedGain::new(1.0));
+        let reader = Reader::new(Arc::clone(&ring), SESSION_RATE);
+        let control = RendererControl::new(&reader);
+        assert!(matches!(
+            RenderPipeline::new(reader, &control, Arc::clone(&gain), SESSION_RATE, 0),
+            Err(BackendError::UnsupportedFormat)
+        ));
+        let reader = Reader::new(ring, SESSION_RATE);
+        let control = RendererControl::new(&reader);
+        assert!(matches!(
+            RenderPipeline::new(reader, &control, gain, 1_000_000, 2),
+            Err(BackendError::UnsupportedFormat)
+        ));
+    }
+}

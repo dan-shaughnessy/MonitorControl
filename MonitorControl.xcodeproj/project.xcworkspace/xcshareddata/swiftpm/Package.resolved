@@ -1,5 +1,5 @@
 {
-  "originHash" : "f1e1257b2b6f49d4a2249ee595030e60931b7b84f7eee8197554bac73d4e024c",
+  "originHash" : "2175294e643c65ef2934a735dbc1b0b86aadec0c3f7019bbc0e883b6391ca9f3",
   "pins" : [
     {
       "identity" : "mediakeytap",
@@ -32,8 +32,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sparkle-project/Sparkle",
       "state" : {
-        "branch" : "2.x",
-        "revision" : "9042c8dbd9c6f6a1bebc2e4c4b878eac6984ddbd"
+        "revision" : "eef1a539a373c1f1a320624b1130fc5de7b2e100",
+        "version" : "2.10.0"
       }
     },
     {

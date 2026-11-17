@@ -1,0 +1,911 @@
+import Foundation
+import CoreAudio
+import CoreWLAN
+
+/// The streaming session: one capture feeding one set of the core's parts
+/// (`EngineParts`: the equalizer and the delay ring), and one
+/// `OutputRenderer` per local output reading that ring at its own delay
+/// (S6, S7, S112–S117). The capture also feeds AudioSync's own AirPlay
+/// sender (`NativeAirPlayTap`). Clause numbers (S…) refer to
+/// docs/ENGINE_SPEC.md.
+///
+/// Every session gets new parts, so it never plays the previous session's
+/// history (S39).
+///
+/// Nothing stops in mid-waveform (S185, S186): a stop asks every output and
+/// the AirPlay input to fade out at once, and only once the outputs'
+/// devices have played their fades (at most 500 ms later) do capture and
+/// the outputs stop, in that order. A switched-off output
+/// fades out the same way before its IO stops. Neither waits on the main
+/// thread: a short timer finishes them. A start after a stop waits for that
+/// stop to finish, so the new source fades in only after the old one faded
+/// out; quitting waits for it with `finishStopping`.
+///
+/// Every call, and both callbacks, run on the main thread (S113).
+final class StreamEngine {
+
+    enum StartError: Error, CustomStringConvertible {
+        /// The core could not make the session's parts.
+        case coreUnavailable
+
+        /// For the debug log; the host shows its own wording.
+        var description: String {
+            switch self {
+            case .coreUnavailable:
+                return "the audio core could not make the session's equalizer or delay ring"
+            }
+        }
+    }
+
+    /// The capture changed rate or lost its source (S20, S21). The session is
+    /// already stopping (its outputs fade out) when this is called.
+    var onInterrupted: ((SourceCapture.Interruption) -> Void)?
+
+    /// An app the capture followed quit (`SourceCapture.onAppQuit`), with its processes.
+    var onAppQuit: ((String, [pid_t]) -> Void)? {
+        get { capture.onAppQuit }
+        set { capture.onAppQuit = newValue }
+    }
+
+    /// A local output's device went away (S68) or its render callback stopped
+    /// (S334), with the output's UID and which. Its renderer is already
+    /// halted and detached; the speaker stays on.
+    var onOutputGone: ((String, OutputLoss) -> Void)?
+
+    /// A local output ran away (S347), with its UID and starved share; once
+    /// per attach. The host decides whether `dropRunaway` ends it.
+    var onOutputRunaway: ((String, Int) -> Void)?
+    private var runawayReports = OutputRunawayReports()
+    /// A reopen try met an input another process holds (S333), or the input
+    /// device left (S329), with its error, the first time; nil once a try
+    /// opens it again.
+    var onInputBusy: ((SourceCapture.CaptureError?) -> Void)?
+
+    /// Now Playing's latest reading, nil while the monitor doesn't run (S335 D3).
+    var nowPlayingReading: (() -> NowPlayingMonitor.Track?)?
+
+    /// True from a successful `start` until `stop`; false while a stop's
+    /// outputs still fade out.
+    private(set) var isRunning = false
+
+    private let capture = SourceCapture()
+    /// The running session's parts; nil while stopped or stopping.
+    private var parts: EngineParts?
+    /// Writes silence while the capture gives nothing, for the whole session,
+    /// so the ring keeps time across a paused app (S335).
+    private var quietFill: QuietFill?
+    /// The renderers of the running local outputs, by device UID.
+    private var renderers: [String: OutputRenderer] = [:]
+    /// The start leads of speakers whose devices went away, still counted in
+    /// the session lead, with the uptime of the loss (S328). The host lets
+    /// them go; a stop ends them all.
+    private var heldLeads: [String: (lead: CoreHeldLead, since: Double)] = [:]
+    /// The latest equalizer settings, for the running session and the next ones.
+    private(set) var equalizerSettings = Equalizer.Settings()
+    /// Outputs fading out before they stop, and the stop that waits for them.
+    private let retirement = OutputRetirement()
+    /// Asks AudioSync's own AirPlay and Cast inputs to fade out at a stop (S186, S189).
+    var fadeSenderInputs: () -> Void = {
+        NativeAirPlayTap.requestFadeOut()
+        CastTap.requestFadeOut()
+    }
+    /// Finishes what `retirement` waits for, while it waits for anything.
+    private var fadeTimer: DispatchSourceTimer?
+    /// Set by `deinit`, which finishes what fades itself.
+    private var tearingDown = false
+    /// With the debug log on, the 5 s status line's timer and the counts it
+    /// last printed, so each line shows what changed since.
+    private var statusTimer: DispatchSourceTimer?
+    private var statusLast: (tally: SessionTally, at: TimeInterval)?
+    /// Each output's number in the status line, kept for the whole session so
+    /// an output that joins or leaves never renumbers the others.
+    private var statusNumbers: [String: Int] = [:]
+    /// Each attached output's token; a re-attach under the same UID is a new
+    /// renderer whose counters start at 0.
+    private var attachTokens = AttachTokens()
+    /// The running session's capture watch (S335), its 0.5 s timer, what a
+    /// reopen opens and the last try's error.
+    private var flowWatch = CaptureFlowWatch()
+    /// Kept here so a session restarted inside the latest wake's window keeps it (S332).
+    private var wakeWindowEnds = -TimeInterval.infinity
+    private var flowTimer: DispatchSourceTimer?
+    private var opened: (source: AudioSource, inputPair: Int)?
+    private var reopenError: SourceCapture.CaptureError?
+    /// The uptime of the first try that met a busy input; nil when none did.
+    private var busySince: TimeInterval?
+    /// Whether the input device left and the capture waits for it (S329).
+    private(set) var inputAway = false
+    /// Whether the capture waits for an input that left or another process holds, its notice up.
+    var waitsForInput: Bool { inputAway || busySince != nil }
+    /// Whether the capture is closed for a try or waits for its input (S350).
+    var captureClosed: Bool { flowWatch.closed }
+    /// The 0.5 s check for outputs whose render callback stopped (S334).
+    private var stallTimer: DispatchSourceTimer?
+    private var stallWatch = OutputStallWatch()
+    /// Between the Mac's will-sleep notice and its wake neither watch acts.
+    private var asleep = false
+
+    init() {
+        capture.onInterrupted = { [weak self] reason in self?.handleInterruption(reason) }
+    }
+
+    deinit {
+        tearingDown = true
+        stop()
+        retirement.finishAll()
+        fadeTimer?.cancel()
+        statusTimer?.cancel()
+        flowTimer?.cancel()
+        stallTimer?.cancel()
+    }
+
+    /// Some frame this session captured was not silent; false while stopped.
+    /// A frame count can't tell: a denied tap delivers zeros (S17).
+    var sessionHeard: Bool { capture.sessionHeard }
+
+    /// Some frame a system or app tap captured in this app run was not silent.
+    var runHeard: Bool { SourceCapture.runHeard }
+
+    /// The capture's callbacks so far this session; nil while stopped.
+    var captureCallbacks: UInt64? { capture.counts?.callbacks }
+
+    /// The session's captured blocks with a sample above zero so far (S451).
+    var captureSoundBlocks: UInt64 { capture.soundBlocks }
+
+    /// The rate the running capture delivers at, which the ring's frames are
+    /// clocked at (S16).
+    var captureRate: Double { capture.sampleRate }
+
+    /// The UIDs of the outputs that have a renderer, sorted; outputs fading
+    /// out on their way out aren't among them.
+    var activeOutputUIDs: [String] { renderers.keys.sorted() }
+
+    /// The speakers whose start leads are held (S328), with the uptime each
+    /// was lost at.
+    var heldLeadTimes: [String: Double] { heldLeads.mapValues { $0.since } }
+
+    /// Whether output `uid` plays again with a renderer that has published
+    /// its start lead (S328).
+    func publishedLead(uid: String) -> Bool { renderers[uid]?.publishedLead ?? false }
+
+    /// The hold-back the host now counts for lost speaker `uid` (S328).
+    func setHeldLeadDelay(uid: String, ms: Double) {
+        heldLeads[uid]?.lead.setHoldBack(ms: ms)
+    }
+
+    /// Lost speaker `uid`'s start lead no longer counts (S328).
+    func releaseHeldLead(uid: String) {
+        guard heldLeads.removeValue(forKey: uid) != nil else { return }
+        DebugTrace.log("[AudioSync] output \(uid): its start lead no longer counts")
+    }
+
+    /// New equalizer settings: the running session takes them at its next
+    /// block (S31), and every later session starts with them.
+    func updateEqualizer(_ settings: Equalizer.Settings) {
+        equalizerSettings = settings
+        parts?.equalizer.update(settings)
+    }
+
+    // MARK: - Session
+
+    /// Starts a session capturing `source` (S114): new parts, then capture,
+    /// which reads the capture rate and prepares the parts for it before its
+    /// first block. Local outputs are added by the host afterwards. On
+    /// failure nothing is left running. While a session runs this does
+    /// nothing: the host stops it first (S114). A stop still
+    /// waiting for its outputs' fades finishes first, which takes at most
+    /// 500 ms (S186). An input source reads the channel pair stored as
+    /// `inputPair` (`InputChannelPair.index`).
+    func start(source: AudioSource, inputPair: Int = 0, rebuild: Bool = false) throws {
+        guard !isRunning else {
+            DebugTrace.log("[AudioSync] session start ignored: a session is already running")
+            return
+        }
+        if !retirement.isIdle {
+            DebugTrace.log("[AudioSync] session start waits for the last outputs to fade out")
+            finishStopping()
+        }
+        guard let parts = EngineParts.make(equalizer: equalizerSettings) else {
+            DebugTrace.log("[AudioSync] session not started: \(StartError.coreUnavailable)")
+            throw StartError.coreUnavailable
+        }
+        try capture.start(source: source, parts: parts, inputPair: inputPair, rebuild: rebuild)
+        run(parts, captureRate: capture.sampleRate)
+        startFlowWatch(source: source, inputPair: inputPair)
+        DebugTrace.log("[AudioSync] session started: \(source) at \(capture.sampleRate) Hz")
+        startStallWatch()
+        if DebugTrace.enabled {
+            DispatchQueue.global(qos: .utility).async { DebugTrace.log("[AudioSync] network: \(WiFiNote.current())") }
+            startStatusLine()
+        }
+    }
+
+    /// The session runs on `parts`, captured at `captureRate` Hz: `start` calls
+    /// this once its capture runs.
+    func run(_ parts: EngineParts, captureRate: Double) {
+        self.parts = parts
+        isRunning = true
+        let fill = QuietFill(parts: parts, captureRate: captureRate)
+        fill.start()
+        quietFill = fill
+    }
+
+    /// Logs every 5 s what capture and each local output counted since the
+    /// previous line, so a dropout shows when it happened. Reads the
+    /// counters on the main queue; the IO threads only bump them.
+    private func startStatusLine() {
+        statusTimer?.cancel()
+        statusNumbers = [:]
+        statusLast = (tally(), ProcessInfo.processInfo.systemUptime)
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.isRunning, let last = self.statusLast else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let current = self.tally()
+            DebugTrace.log("[AudioSync] " + SessionTally.statusText(since: last.tally, now: current,
+                                                                    seconds: now - last.at))
+            self.statusLast = (current, now)
+        }
+        timer.resume()
+        statusTimer = timer
+    }
+
+    /// Reads each output's frame count against the uptime clock every 0.5 s
+    /// on the main queue (S334); the render threads only bump the counts.
+    private func startStallWatch() {
+        stallTimer?.cancel()
+        stallWatch.reset()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        let every = OutputStallWatch.checkEveryS
+        timer.schedule(deadline: .now() + every, repeating: every, leeway: .milliseconds(50))
+        timer.setEventHandler { [weak self] in self?.checkStalls() }
+        timer.resume()
+        stallTimer = timer
+    }
+
+    /// The Mac's will-sleep notice: until `macWoke`, no output stalls and the
+    /// capture watch asks for nothing (S334, S335).
+    func macWillSleep() {
+        asleep = true
+        stallWatch.pause()
+        flowWatch.pause()
+    }
+
+    /// The wake: both watches count again from now.
+    func macWoke() {
+        guard asleep else { return }
+        asleep = false
+        let now = ProcessInfo.processInfo.systemUptime
+        stallWatch.resume(nowS: now)
+        flowWatch.resume(at: now)
+        wakeWindowEnds = flowWatch.wakeWindowEnds
+    }
+
+    private func stopStallWatch() {
+        stallTimer?.cancel()
+        stallTimer = nil
+        stallWatch.reset()
+    }
+
+    /// Drops each output that took no frame for 2 s, without a fade, after
+    /// reading its device's sign; its speaker stays on (S334).
+    private func checkStalls() {
+        guard isRunning else { return }
+        var readings: [String: OutputStallWatch.Reading] = [:]
+        for (uid, renderer) in renderers {
+            readings[uid] = OutputStallWatch.Reading(attach: attachTokens.byUID[uid] ?? 0,
+                                                     frames: renderer.framesRendered.load(ordering: .relaxed))
+        }
+        for stall in stallWatch.check(readings, nowS: ProcessInfo.processInfo.systemUptime) {
+            guard let renderer = renderers[stall.uid] else { continue }
+            let state = renderer.deviceState()
+            let sign = OutputStallSign.read(hogOwner: state.hogOwner, ownPID: getpid(), running: state.running)
+            renderer.noteStalled()
+            handleOutputLost(stall.uid, renderer, .stalled(quietS: stall.quietS, sign: sign))
+        }
+        let percents = renderers.mapValues(\.starvedPercent)
+        for uid in runawayReports.fresh(OutputRunawayRetry.runaways(percents), tokens: attachTokens.byUID) {
+            onOutputRunaway?(uid, percents[uid] ?? 0)
+        }
+    }
+
+    /// Ends output `uid`'s stream as a stall does, the speaker on, so the next
+    /// sync opens it again (S347).
+    func dropRunaway(_ uid: String, percent: Int) {
+        guard let renderer = renderers[uid] else { return }
+        handleOutputLost(uid, renderer, .ranAway(percent: percent))
+    }
+
+    /// Output `uid`'s number in the status line, given now if it has none, so
+    /// a debug line can name an output without its device's name.
+    func outputNumber(_ uid: String) -> Int {
+        SessionTally.number([uid], in: &statusNumbers)
+        return statusNumbers[uid] ?? 0
+    }
+
+    private func stopStatusLine() {
+        statusTimer?.cancel()
+        statusTimer = nil
+        statusLast = nil
+        statusNumbers = [:]
+    }
+
+    private func tally() -> SessionTally {
+        SessionTally.number(renderers.keys, in: &statusNumbers)
+        var outputs: [String: SessionTally.Output] = [:]
+        for (uid, renderer) in renderers {
+            let counted = renderer.counters
+            outputs[uid] = SessionTally.Output(
+                number: statusNumbers[uid] ?? 0, attach: attachTokens.byUID[uid] ?? 0,
+                frames: renderer.framesRendered.load(ordering: .relaxed),
+                starvedRenders: counted.starvedRenders, starvedFrames: counted.starvedFrames,
+                driftSkips: counted.driftSkips, driftSilences: counted.driftSilences,
+                rejectedCopies: counted.rejectedCopies,
+                lateCallbacks: renderer.lateCallbacks, overloads: renderer.ioOverloads,
+                anchor: renderer.takeAnchorSpan())
+        }
+        return SessionTally(capture: capture.counts ?? CaptureCounts(), outputs: outputs)
+    }
+
+    /// The largest sample magnitude captured since the last call (1 is full
+    /// scale), for the input level meter; nil while no session runs.
+    func takePeak() -> Float? { parts?.ring.takePeak() }
+
+    /// The local outputs' session lead in ms once each has reported its
+    /// start lead (S208), for the debug log; nil before that.
+    func sessionLeadMs() -> Double? {
+        guard let frames = parts?.ring.publishedSessionLeadFrames, capture.sampleRate > 0 else { return nil }
+        return Double(frames) * 1000 / capture.sampleRate
+    }
+
+    /// Ends the session (S115, S186): every output and the AirPlay input
+    /// fade out at once while capture still runs; once the outputs' devices
+    /// have played their fades (at most 500 ms later), capture stops, so no
+    /// block arrives after that, then every output, and then `completion`.
+    /// Returns at once: `isRunning` is false from now on, and a short timer
+    /// finishes the stop. Without a session, `completion` runs once a stop
+    /// under way has finished, or now. Idempotent.
+    func stop(then completion: (() -> Void)? = nil) {
+        guard isRunning, let parts else {
+            if let completion { retirement.afterSessionStop(completion) }
+            return
+        }
+        quietFill?.stop()
+        quietFill = nil
+        stopStallWatch()
+        stopStatusLine()
+        stopFlowWatch()
+        isRunning = false
+        self.parts = nil
+        let leaving = renderers.keys.sorted().compactMap { uid in renderers[uid].map { (uid: uid, renderer: $0) } }
+        let bluetooth = bluetoothOutputs
+        renderers = [:]
+        heldLeads = [:]
+        let capture = self.capture
+        let inputs = Self.inputsFadedCheck(ring: parts.ring, captureRate: capture.sampleRate)
+        DebugTrace.log("[AudioSync] session stopping: \(leaving.count) output(s) and the AirPlay inputs fade out")
+        retirement.stopSession(leaving.map { $0.renderer }, fadeInputs: fadeSenderInputs,
+                               inputsFaded: inputs.faded, inputsFallbackNs: inputs.fallbackNs, stopCapture: {
+            capture.halt()
+        }, then: {
+            for output in leaving {
+                StreamEngine.logStopped(output.uid, output.renderer, why: "session stopped", bluetoothOutputs: bluetooth)
+            }
+            DebugTrace.log("[AudioSync] session stopped")
+            completion?()
+        })
+        watchFades()
+    }
+
+    /// When the AirPlay input has had its fade-out (S189), at a stop asked
+    /// for now: the native input takes the same blocks as the ring, so once
+    /// the ring has had the fade's 20 ms and then one block more, the block
+    /// that finished the fade has reached it too. While capture gives nothing (a tap whose source is silent),
+    /// the wait ends after 20 ms and the largest block capture hands on.
+    private static func inputsFadedCheck(ring: CoreDelayRing, captureRate: Double)
+        -> (faded: () -> Bool, fallbackNs: UInt64) {
+        let rate = captureRate.isFinite && captureRate > 0 ? captureRate : 48_000
+        let fadeFrames = Int64((0.020 * rate).rounded())
+        let asked = ring.framesWritten
+        var faded: Int64?   // frames written once the fade's frames were in
+        let check: () -> Bool = {
+            let written = ring.framesWritten
+            if let faded { return written > faded }
+            if written - asked >= fadeFrames { faded = written }
+            return false
+        }
+        let fallback = (0.020 + Double(CaptureChannels.blockFrames) / rate) * 1_000_000_000
+        return (check, UInt64(fallback.rounded()))
+    }
+
+    /// Finishes a stop and the switch-offs still waiting for their outputs'
+    /// fades, waiting on this thread at most 500 ms after the latest of them
+    /// (S186). For a start after a stop, and for quitting.
+    func finishStopping() {
+        retirement.finishAll()
+        watchFades()
+    }
+
+    /// The capture can't go on as built (S20, S21): stop the session, then
+    /// tell the host, which rebuilds it or reports the lost source.
+    private func handleInterruption(_ reason: SourceCapture.Interruption) {
+        guard isRunning else { return }
+        if let sign = CaptureFlowWatch.sign(of: reason) {
+            follow(flowWatch.report(sign, at: ProcessInfo.processInfo.systemUptime))
+            return
+        }
+        if case .sourceLost(.inputDisconnected) = reason {
+            inputLeft(.inputDisconnected)
+            return
+        }
+        stop()
+        onInterrupted?(reason)
+    }
+
+    /// Polls `retirement` on a short main-queue timer while it waits for
+    /// anything, and drops the timer once it doesn't.
+    private func watchFades() {
+        guard !retirement.isIdle, !tearingDown else {
+            fadeTimer?.cancel()
+            fadeTimer = nil
+            return
+        }
+        guard fadeTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(5), repeating: .milliseconds(5),
+                       leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.retirement.poll()
+            self.watchFades()
+        }
+        timer.resume()
+        fadeTimer = timer
+    }
+
+    // MARK: - Capture watch
+
+    /// Core Audio's service restarted (S335): every object the session held
+    /// died with it, so each output is dropped without a fade, to be attached
+    /// again by UID at the next sync, and the capture counts as stopped at once.
+    func serviceRestarted() {
+        guard isRunning else { return }
+        for (uid, renderer) in renderers.sorted(by: { $0.key < $1.key }) { handleOutputLost(uid, renderer, .deviceGone) }
+        follow(flowWatch.report(.serviceRestarted, at: ProcessInfo.processInfo.systemUptime))
+    }
+
+    private func startFlowWatch(source: AudioSource, inputPair: Int) {
+        stopFlowWatch()
+        flowWatch = CaptureFlowWatch(wakeWindowEnds: wakeWindowEnds)
+        if asleep { flowWatch.pause() }
+        opened = (source, inputPair)
+        reopenError = nil
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500), leeway: .milliseconds(50))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.isRunning else { return }
+            let watched = self.opened.map { CaptureFlowWatch.source($0.source, reading: self.nowPlayingReading?()) }
+            var listed = true
+            if case .input(let uid)? = self.opened?.source { listed = SourceCapture.inputListed(uid: uid) }
+            self.follow(self.flowWatch.tick(callbacks: self.capture.counts?.callbacks, reading: self.capture.isReading,
+                                            source: watched ?? .unwatched, at: ProcessInfo.processInfo.systemUptime,
+                                            inputListed: listed))
+        }
+        timer.resume()
+        flowTimer = timer
+    }
+
+    private func stopFlowWatch() {
+        flowTimer?.cancel()
+        flowTimer = nil
+        opened = nil
+        busySince = nil
+        inputAway = false
+    }
+
+    private func follow(_ step: CaptureFlowWatch.Step) {
+        switch step {
+        case .none:
+            return
+        case .stopped(let sign):
+            let held = capture.inputHolder.map { ", process \($0) holds the input in hog mode" } ?? ""
+            capture.halt()
+            DebugTrace.log("[AudioSync] capture stopped delivering (\(sign.description)\(held)); "
+                           + "opening the capture again while the outputs and speakers play on")
+        case .tryOpen(let number):
+            reopenCapture(try: number)
+        case .kept(let number):
+            DebugTrace.log("[AudioSync] capture reopen try \(number) of \(CaptureFlowWatch.tries) kept")
+        case .giveUp:
+            DebugTrace.log("[AudioSync] capture reopen: all \(CaptureFlowWatch.tries) tries failed")
+            stopForLostCapture(reopenError ?? .aggregateDeviceFailed(kAudioHardwareNotRunningError))
+        }
+    }
+
+    private func reopenTry(_ number: Int) -> String {
+        guard !flowWatch.inWakeWindow(at: ProcessInfo.processInfo.systemUptime) else {
+            return "after-wake try, outside the \(CaptureFlowWatch.tries) tries"
+        }
+        return "try \(number) of \(CaptureFlowWatch.tries)"
+    }
+
+    /// Opens only the capture again, into the session's parts: every output
+    /// keeps its renderer and hold-back and the senders stay fed (S335).
+    private func reopenCapture(try number: Int) {
+        guard let parts, let opened else { return }
+        let rate = capture.sampleRate
+        do {
+            try capture.reopen(source: opened.source, parts: parts, inputPair: opened.inputPair)
+        } catch {
+            let failure = error as? SourceCapture.CaptureError ?? .tapNotCreated(kAudioHardwareUnspecifiedError)
+            if case .inputBusy = failure {
+                let now = ProcessInfo.processInfo.systemUptime
+                DebugTrace.log("[AudioSync] capture reopen try \(number): \(failure); again in "
+                               + "\(Int(CaptureFlowWatch.busySpacing)) s, outside the \(CaptureFlowWatch.tries) tries")
+                if busySince == nil {
+                    busySince = now
+                    onInputBusy?(failure)
+                }
+                flowWatch.busy(at: now)
+                return
+            }
+            DebugTrace.log("[AudioSync] capture reopen \(reopenTry(number)) failed: \(failure)")
+            reopenError = failure
+            var listed = false
+            if case .input(let uid) = opened.source { listed = SourceCapture.inputListed(uid: uid) }
+            switch failure {
+            case .inputNotFound, .inputDisconnected:
+                guard listed else {
+                    inputLeft(failure)
+                    return
+                }
+            default: break
+            }
+            guard CaptureFlowWatch.retries(after: failure, inputListed: listed) else {
+                stopForLostCapture(failure)
+                return
+            }
+            follow(flowWatch.failed(at: ProcessInfo.processInfo.systemUptime))
+            return
+        }
+        DebugTrace.log("[AudioSync] capture reopen \(reopenTry(number)): "
+                       + "open at \(capture.sampleRate) Hz")
+        reopenError = nil
+        if let since = busySince {
+            busySince = nil
+            let held = (ProcessInfo.processInfo.systemUptime - since).rounded()
+            DebugTrace.log("[AudioSync] capture: the input was held by another process for about \(Int(held)) s")
+            onInputBusy?(nil)
+        }
+        if inputAway {
+            inputAway = false
+            onInputBusy?(nil)
+        }
+        if CaptureRate.needsRestart(current: rate, reported: capture.sampleRate) {
+            DebugTrace.log("[AudioSync] capture rate changed: \(rate) → \(capture.sampleRate) Hz")
+            stop()
+            onInterrupted?(.formatChanged)
+        }
+    }
+
+    /// The input device the capture waits for is listed under the new UID
+    /// `uid` (S329): the watch's next check tries that one.
+    func followInput(to uid: String) {
+        guard let opened, case .input = opened.source else { return }
+        self.opened = (source: .input(uid: uid), inputPair: opened.inputPair)
+    }
+
+    /// The pair `pair` was picked while the input device is away (S329): the
+    /// reopen once it is back reads that pair.
+    func followInputPair(_ pair: Int) {
+        guard inputAway, let opened else { return }
+        self.opened = (source: opened.source, inputPair: pair)
+    }
+
+    /// The input device left (S329): only the capture closes, the notice says
+    /// so, and the capture opens again once the device is listed again.
+    private func inputLeft(_ error: SourceCapture.CaptureError) {
+        if !inputAway {
+            inputAway = true
+            onInputBusy?(error)
+        }
+        follow(flowWatch.deviceLeft(at: ProcessInfo.processInfo.systemUptime))
+    }
+
+    private func stopForLostCapture(_ error: SourceCapture.CaptureError) {
+        stop()
+        onInterrupted?(.sourceLost(error))
+    }
+
+    // MARK: - Local outputs
+
+    /// Starts rendering the session on `deviceID` as output `uid`, at
+    /// `delayMs` and linear `gain`, both applied from its first callback
+    /// (S45, S64); it fades in on its first audio (S184). Does nothing while
+    /// no session runs (S117) or while `uid` is already attached; throws when
+    /// the output can't start.
+    func attachOutput(uid: String, device: AudioObjectID, delayMs: Double, gain: Double) throws {
+        guard isRunning, let parts else {
+            DebugTrace.log("[AudioSync] output \(uid) not added: no session is running")
+            return
+        }
+        guard renderers[uid] == nil else {
+            DebugTrace.log("[AudioSync] output \(uid) not added: it is already attached")
+            return
+        }
+        guard let renderer = parts.makeRenderer(captureRate: capture.sampleRate) else {
+            throw OutputRenderer.StartFailure.coreUnavailable
+        }
+        let (played, returnedDb) = parts.equalizer.returnedGain(gain)
+        renderer.setGain(linear: gain, givingBack: parts.equalizer)
+        renderer.onDeviceGone = { [weak self, weak renderer] in
+            guard let self, let renderer else { return }
+            self.handleOutputLost(uid, renderer, .deviceGone)
+        }
+        renderer.onFormatChanged = { [weak self, weak renderer] old, new in
+            guard let self, let renderer else { return }
+            self.handleOutputLost(uid, renderer, .formatChanged(old: old, new: new))
+        }
+        try renderer.start(on: device, captureRate: capture.sampleRate, delayMs: delayMs)
+        renderers[uid] = renderer
+        attachTokens.attached(uid)
+        DebugTrace.log("[AudioSync] output added: \(uid) on device \(device), delay \(delayMs) ms, gain \(played), "
+            + "EQ headroom returned \(String(format: "%.2f", returnedDb)) dB")
+        if DebugTrace.enabled {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self, weak renderer] in
+                guard let self, let renderer, self.renderers[uid] === renderer else { return }
+                DebugTrace.log("[AudioSync] output at 1 minute: \(uid), "
+                    + renderer.statusText(bluetoothOutputs: self.bluetoothOutputs))
+            }
+            logLevel(uid, renderer)
+        }
+    }
+
+    /// Logs the level output `uid` got every 10 s while `renderer` plays it.
+    private func logLevel(_ uid: String, _ renderer: OutputRenderer) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self, weak renderer] in
+            guard let self, let renderer, self.renderers[uid] === renderer else { return }
+            if let level = renderer.takeLevel() {
+                DebugTrace.log("[AudioSync] output level: \(uid), peak "
+                    + String(format: "%.1f dBFS, RMS %.1f dBFS", level.peakDb, level.rmsDb))
+            }
+            self.logLevel(uid, renderer)
+        }
+    }
+
+    /// The running outputs on a Bluetooth device, for the debug log (S229).
+    private var bluetoothOutputs: Int { renderers.values.filter { $0.isBluetooth }.count }
+
+    /// Switches output `uid` off; see `detachOutputs`.
+    func detachOutput(uid: String) {
+        detachOutputs(uids: [uid])
+    }
+
+    /// The `LocalOutputEngine` requirement; see `detachOutputs(uids:then:)`.
+    func detachOutputs(uids: [String]) {
+        detachOutputs(uids: uids, then: nil)
+    }
+
+    /// The `LocalOutputEngine` requirement; see `detachOutputs(uids:keepingLeads:then:)`.
+    func detachOutputs(uids: [String], keepingLeads: Bool) {
+        detachOutputs(uids: uids, keepingLeads: keepingLeads, then: nil)
+    }
+
+    /// Switches outputs off (S185, S186): all of them fade out at once and
+    /// stop together once their devices have played the fades, at most
+    /// 500 ms later, without holding up the main thread. Unknown UIDs are
+    /// skipped. `completion` runs on the main thread once they stopped, at
+    /// once when none of `uids` is attached. With `keepingLeads`, each
+    /// output's start lead stays held as a lost speaker's does (S328).
+    func detachOutputs(uids: [String], keepingLeads: Bool = false, then completion: (() -> Void)?) {
+        let bluetooth = bluetoothOutputs
+        let leaving = uids.sorted().compactMap { uid in
+            renderers.removeValue(forKey: uid).map { (uid: uid, renderer: $0) }
+        }
+        for output in leaving where keepingLeads {
+            if let lead = output.renderer.holdLead() {
+                heldLeads[output.uid] = (lead, ProcessInfo.processInfo.systemUptime)
+            }
+        }
+        guard !leaving.isEmpty else {
+            completion?()
+            return
+        }
+        DebugTrace.log("[AudioSync] output(s) fading out: " + leaving.map { $0.uid }.joined(separator: ", "))
+        retirement.remove(leaving.map { $0.renderer }) {
+            for output in leaving {
+                StreamEngine.logStopped(output.uid, output.renderer, why: "removed", bluetoothOutputs: bluetooth)
+            }
+            completion?()
+        }
+        watchFades()
+    }
+
+    /// A new delay for output `uid`: it fades out, lands exactly on the new
+    /// delay and fades back in (S187).
+    func setDelay(uid: String, ms: Double) {
+        guard let renderer = renderers[uid] else { return }
+        renderer.setDelay(ms: ms)
+        DebugTrace.log("[AudioSync] output \(uid): delay \(ms) ms")
+    }
+
+    /// Output `uid`'s newest delay in capture-rate frames, a step's move
+    /// (S281) included; nil without a running renderer.
+    func delayFrames(uid: String) -> Int64? { renderers[uid]?.currentDelayFrames }
+
+    /// For the debug log: how far output `uid`'s reader trails the newest
+    /// frame against its delay, which drift may move inside the 50 ms dead
+    /// band (S50, S56), and the corrections it counted (S158).
+    func driftNote(uid: String) -> String {
+        guard let renderer = renderers[uid] else { return "\(uid): no renderer" }
+        let lag = renderer.lagFrames
+        let delay = renderer.newestDelayFrames
+        let counted = renderer.counters
+        let ms = captureRate > 0 ? Double(lag - delay) * 1000 / captureRate : 0
+        return "\(uid): lag \(lag) delay \(delay) frames, lag-delay \(ms) ms, drift skips \(counted.driftSkips) "
+            + "(\(counted.driftSkipFrames) frames), drift silences \(counted.driftSilences) "
+            + "(\(counted.driftSilenceFrames) frames)"
+    }
+
+    /// A new linear gain for output `uid`, with the equalizer's headroom cut
+    /// given back (S26, S71), applied from its next callback (S64).
+    func setGain(uid: String, g: Double) {
+        renderers[uid]?.setGain(linear: g, givingBack: parts?.equalizer)
+    }
+
+    /// Logs the gain output `uid` plays linear gain `g` at, the equalizer's
+    /// headroom cut given back; nothing when it isn't playing.
+    func logGain(uid: String, g: Double) {
+        guard DebugTrace.enabled, renderers[uid] != nil, let parts else { return }
+        let (played, returnedDb) = parts.equalizer.returnedGain(g)
+        DebugTrace.log("[AudioSync] output gain: \(uid), gain \(String(format: "%.3f", played)), "
+            + "EQ headroom returned \(String(format: "%.2f", returnedDb)) dB")
+    }
+
+    /// The device of output `uid` is gone (S68), its render callback stopped
+    /// (S334) or its device's format changed (S330): its renderer halts at
+    /// once, without a fade (S185), also when it was fading out on its way
+    /// out. A running one is dropped and reported to the host, which keeps
+    /// the speaker on and adds it again once its device is listed (S137,
+    /// S161). A stall's or a format change's debug line comes after the
+    /// renderer is released.
+    private func handleOutputLost(_ uid: String, _ renderer: OutputRenderer, _ loss: OutputLoss) {
+        renderer.onDeviceGone = nil
+        renderer.onFormatChanged = nil
+        if renderers[uid] === renderer, let lead = renderer.holdLead() {
+            heldLeads[uid] = (lead, ProcessInfo.processInfo.systemUptime)
+        }
+        retirement.stopLost(renderer)
+        watchFades()
+        guard renderers[uid] === renderer else { return }
+        let bluetooth = bluetoothOutputs
+        renderers.removeValue(forKey: uid)
+        StreamEngine.logStopped(uid, renderer, why: loss.reason, bluetoothOutputs: bluetooth)
+        if case .stalled(let quietS, let sign) = loss {
+            DebugTrace.log("[AudioSync] " + OutputStallSign.line(number: outputNumber(uid), quietS: quietS, sign: sign))
+        }
+        if case .formatChanged(let old, let new) = loss {
+            DebugTrace.log("[AudioSync] " + OutputFormatWatch.line(number: outputNumber(uid), old: old, new: new))
+        }
+        if case .ranAway(let percent) = loss {
+            DebugTrace.log("[AudioSync] output \(outputNumber(uid)) ran away: \(percent)% of its callbacks starved "
+                + "over 5 s while the capture wrote; it opens again")
+        }
+        onOutputGone?(uid, loss)
+    }
+
+    /// Logs what output `uid` rendered, how it stopped, what its reader
+    /// counted and what the observer saw, with `bluetoothOutputs` playing
+    /// until it stopped.
+    private static func logStopped(_ uid: String, _ renderer: OutputRenderer, why reason: String,
+                                   bluetoothOutputs: Int) {
+        renderer.onDeviceGone = nil
+        renderer.onFormatChanged = nil
+        DebugTrace.log("[AudioSync] output stopped (\(reason)): \(uid), \(renderer.stopNote), "
+                + renderer.statusText(bluetoothOutputs: bluetoothOutputs))
+    }
+}
+
+extension WiFiNote {
+    /// Reads the Wi-Fi interface through CoreWLAN, which never shows a
+    /// prompt: what macOS withholds without Location Services reads as n/a.
+    /// The network's name and address are never asked for.
+    static func current() -> String {
+        guard let interface = CWWiFiClient.shared().interface() else { return "Wi-Fi n/a" }
+        let channel = interface.wlanChannel()
+        return text(poweredOn: interface.powerOn(), band: channel.map { $0.channelBand.rawValue },
+                    channel: channel?.channelNumber, rssi: interface.rssiValue())
+    }
+}
+
+/// Capture's counts so far in a session.
+struct CaptureCounts: Equatable {
+    var callbacks: UInt64 = 0
+    var frames: UInt64 = 0
+    var silentCallbacks: UInt64 = 0
+}
+
+/// Hands each attach of a local output a token no earlier attach had, so the
+/// status line tells a re-attached output (replug, lost device, fresh link)
+/// from the renderer it replaced under the same UID.
+struct AttachTokens {
+    private var last: UInt64 = 0
+    private(set) var byUID: [String: UInt64] = [:]
+
+    mutating func attached(_ uid: String) {
+        last &+= 1
+        byUID[uid] = last
+    }
+}
+
+/// What the periodic debug line reads: capture's counts and each local
+/// output's, keyed by device UID only to match outputs between two lines.
+struct SessionTally: Equatable {
+    struct Output: Equatable {
+        /// The output's number in the line, kept for the session.
+        var number = 0
+        /// The output's attach token (`AttachTokens`).
+        var attach: UInt64 = 0
+        /// Device frames its render callback handed the device, silence included (S334).
+        var frames: Int64 = 0
+        var starvedRenders: Int64 = 0
+        var starvedFrames: Int64 = 0
+        var driftSkips: Int64 = 0
+        var driftSilences: Int64 = 0
+        var rejectedCopies: Int64 = 0
+        var lateCallbacks: Int64 = 0
+        var overloads: Int64 = 0
+        /// Not a count: the span since the previous line (`AnchorSpan`).
+        var anchor: AnchorSpan? = nil
+    }
+
+    var capture = CaptureCounts()
+    var outputs: [String: Output] = [:]
+
+    /// Gives each UID in `uids` without a number the next free one, in UID
+    /// order, so the numbers of outputs already seen never change.
+    static func number<S: Sequence>(_ uids: S, in numbers: inout [String: Int]) where S.Element == String {
+        var next = (numbers.values.max() ?? 0) + 1
+        for uid in uids.sorted() where numbers[uid] == nil {
+            numbers[uid] = next
+            next += 1
+        }
+    }
+
+    /// The status line for `seconds` from `old` to `new`, in counts only:
+    /// outputs show by their session number, so no device name reaches the log.
+    static func statusText(since old: SessionTally, now new: SessionTally, seconds: Double) -> String {
+        let frames = change(new.capture.frames, since: old.capture.frames)
+        let rate = seconds > 0 ? Double(frames) / seconds : 0
+        let callbacks = change(new.capture.callbacks, since: old.capture.callbacks)
+        let silent = change(new.capture.silentCallbacks, since: old.capture.silentCallbacks)
+        var text = "status over " + String(format: "%.1f", seconds) + " s: capture \(frames) frames ("
+        text += String(format: "%.0f", rate) + " frames/s), \(callbacks) callbacks, \(silent) without usable channels"
+        let outputs = new.outputs.sorted { ($0.value.number, $0.key) < ($1.value.number, $1.key) }
+        if outputs.isEmpty { return text + "; no local outputs" }
+        for (uid, now) in outputs {
+            // A re-attached output is a new renderer counting from 0, so its old totals are no baseline.
+            let before = old.outputs[uid].flatMap { $0.attach == now.attach ? $0 : nil } ?? Output()
+            let rendered = change(now.frames, since: before.frames)
+            let starved = change(now.starvedRenders, since: before.starvedRenders)
+            let starvedFrames = change(now.starvedFrames, since: before.starvedFrames)
+            let skips = change(now.driftSkips, since: before.driftSkips)
+            let silences = change(now.driftSilences, since: before.driftSilences)
+            let rejected = change(now.rejectedCopies, since: before.rejectedCopies)
+            let late = change(now.lateCallbacks, since: before.lateCallbacks)
+            let overloads = change(now.overloads, since: before.overloads)
+            text += "; output \(now.number): \(rendered) frames, starved \(starved) (\(starvedFrames) frames), "
+            text += "drift skips \(skips), drift silences \(silences), rejected copies \(rejected), "
+            text += "late callbacks \(late), IO overloads \(overloads)"
+            if let anchor = now.anchor { text += ", " + anchor.text }
+        }
+        return text
+    }
+
+    /// A count that went down was restarted (a new capture), so all of it is
+    /// new.
+    static func change<T: BinaryInteger>(_ new: T, since old: T) -> T {
+        new >= old ? new - old : new
+    }
+}

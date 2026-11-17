@@ -1,0 +1,2341 @@
+//! What AirPlay receivers with a screen, such as a TV, show while AudioSync
+//! streams to them: the playing track's title, artist, album and artwork,
+//! read from the media sessions Windows lists (the system media transport
+//! controls) or the MPRIS players on Linux, as the Mac app reads its players.
+//!
+//! A [`TrackReader`] reads the sessions every [`POLL_INTERVAL`], and at
+//! once when Windows reports a change, on a thread of its own, only while
+//! AirPlay receivers play; [`TrackInfo`] turns its readings into what
+//! the sender is given, at the backend's polls, and
+//! gives it only what changed. The sender keeps that and sends it to every
+//! speaker that starts, until the last receiver stops: then it is cleared,
+//! so a receiver that starts later never shows a track from before. The
+//! rules, as on the Mac:
+//!
+//! - with the whole system as the source, the track of a session that
+//!   plays, or the paused one of the app seen playing last, until another
+//!   plays, it stops or quits, or the source changes; with one app as the
+//!   source, that app's session only, paused or playing; with a mix, a
+//!   playing session only ([`pick`], [`decide`]);
+//! - with no such track, AudioSync's own labels ([`ReceiverLabels`], worded
+//!   in the UI's strings), the source's name as the artist, and its icon:
+//!   never blank fields, since a TV may then show no text at all;
+//! - a Spotify track without artwork waits up to [`ARTWORK_WAIT`] for it,
+//!   since Spotify's comes a moment after its title, then gets the icon;
+//!   another app's gets the icon at once. On Linux no player is waited for:
+//!   Spotify's artwork there is a web address the MPRIS reader doesn't load;
+//! - right after reading starts, nothing goes out until the first reading,
+//!   for at most [`READING_WAIT`], so a track from before never does;
+//! - artwork goes out as two JPEGs, [`LARGE_ARTWORK`] for AirPlay 2
+//!   receivers and [`SMALL_ARTWORK`] for AirPlay 1 receivers and after a
+//!   refusal ([`fit_artwork`]); the sender picks per receiver;
+//! - a playing track whose session reports its length gets its progress
+//!   ([`Timeline`]); a live stream, a paused track and AudioSync's labels
+//!   get none. The receiver counts on by itself, so progress goes out again
+//!   only when the track changes or the position jumps by more than
+//!   [`PROGRESS_SLACK`], as a seek does.
+//!
+//! Reading never runs on the UI thread or an audio thread: a session that
+//! hangs holds up the reader's thread only, and a failed reading counts as
+//! no track.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use audiosync_airplay::metadata::{Artwork as SenderArtwork, TrackInfo as TrackFields};
+use audiosync_airplay::sender::{NowPlaying, Progress};
+use audiosync_cast::media::Metadata;
+
+use super::cast::CastTrack;
+use crate::debug_log::DebugLog;
+use crate::now_playing_card::Transport;
+
+/// How often the sessions are read while AirPlay receivers play.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a track waits for its artwork before the icon takes its place.
+pub const ARTWORK_WAIT: Duration = Duration::from_secs(5);
+/// How long track info waits for the first reading once reading starts.
+pub const READING_WAIT: Duration = Duration::from_secs(3);
+/// How long readings in a row neither playing nor paused last before the
+/// paused track of the app that played last goes (S218). A time, not a
+/// count: a change Windows reports can bring several such readings at once.
+pub const DROP_AFTER: Duration = Duration::from_secs(6);
+/// The image for AirPlay 2 receivers: large enough for a TV-sized cover
+/// (S272).
+pub const LARGE_ARTWORK: ArtworkLimits = ArtworkLimits {
+    side: 1024,
+    bytes: 128 * 1024,
+};
+/// The image for AirPlay 1 receivers, and for any receiver that refused the
+/// large one (S272).
+pub const SMALL_ARTWORK: ArtworkLimits = ArtworkLimits {
+    side: 600,
+    bytes: 40 * 1024,
+};
+/// The image for Cast devices: C53 allows 1280 by 720, so a square cover
+/// fits at 720.
+pub const CAST_ARTWORK: ArtworkLimits = ArtworkLimits {
+    side: 720,
+    bytes: 256 * 1024,
+};
+/// How far a track's position may stray from where the progress sent last
+/// puts it by now before progress goes out again.
+pub const PROGRESS_SLACK: Duration = Duration::from_secs(1);
+const SMALLEST_SIDE: u32 = 64;
+const JPEG_QUALITIES: [f32; 3] = [0.65, 0.5, 0.4];
+
+/// The most an artwork JPEG may be: its longest side in pixels, and bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtworkLimits {
+    pub side: u32,
+    pub bytes: usize,
+}
+
+/// One picture fitted for receivers ([`fit_artwork`]); a picture within
+/// the small limits is the same bytes in all three.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FittedArtwork {
+    pub large: Arc<[u8]>,
+    pub small: Arc<[u8]>,
+    pub cast: Arc<[u8]>,
+}
+
+impl FittedArtwork {
+    /// One encoding for all three images.
+    pub fn single(jpeg: Arc<[u8]>) -> FittedArtwork {
+        FittedArtwork {
+            large: jpeg.clone(),
+            small: jpeg.clone(),
+            cast: jpeg,
+        }
+    }
+
+    pub fn for_sender(&self) -> SenderArtwork {
+        SenderArtwork {
+            large: self.large.to_vec(),
+            small: self.small.to_vec(),
+        }
+    }
+}
+
+/// What receivers show while no track counts, worded by the UI
+/// (`receiver-*` and `source-system` in ui/strings.slint).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceiverLabels {
+    pub title: String,
+    pub album: String,
+    /// The artist with the whole system as the source.
+    pub whole_system: String,
+    /// The artist when the source has no name to show.
+    pub unnamed_source: String,
+    /// Between a mix's app names, as the source picker joins them.
+    pub list_separator: String,
+    /// The picker's name for every app but a mix's, `{}` standing for their names.
+    pub all_except: String,
+}
+
+impl ReceiverLabels {
+    fn mix_name(&self, mix: &Mix) -> String {
+        let apps = mix.apps.join(&self.list_separator);
+        if mix.except {
+            self.all_except.replacen("{}", &apps, 1)
+        } else {
+            apps
+        }
+    }
+}
+
+/// The labels, handed to track info before the UI's strings exist and set
+/// once they do, before any receiver can play. Without them receivers get
+/// nothing.
+#[derive(Clone, Default)]
+pub struct SharedLabels(Rc<RefCell<Option<ReceiverLabels>>>);
+
+impl SharedLabels {
+    pub fn set(&self, labels: ReceiverLabels) {
+        *self.0.borrow_mut() = Some(labels);
+    }
+
+    fn get(&self) -> Option<ReceiverLabels> {
+        self.0.borrow().clone()
+    }
+}
+
+/// A media session as the system lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaSession {
+    /// The app's user model ID on Windows, the player's bus name on Linux.
+    pub app_id: String,
+    /// The executable behind `app_id`, where the system tells it.
+    pub executable: Option<String>,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub playing: bool,
+    /// The app reports itself paused: false while it plays, and while it is
+    /// stopped, changing tracks or opening.
+    pub paused: bool,
+}
+
+/// Which sessions count, from the capture source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Follow {
+    /// The whole system: any app's.
+    AnyApp,
+    /// One app, by its executable's file name: its own only. Where the
+    /// system tells which process a session belongs to, the source's
+    /// process ID (`pid`) tells it first.
+    App {
+        executable: String,
+        pid: Option<u32>,
+    },
+    /// Several apps: those running one of `executables`, or with `except`
+    /// every app but those, as the mix captures them.
+    Mix {
+        executables: Vec<String>,
+        except: bool,
+    },
+}
+
+impl Follow {
+    pub fn admits(&self, session: &MediaSession) -> bool {
+        match self {
+            Follow::AnyApp => true,
+            Follow::App { executable, .. } => app_matches(&session.app_id, executable),
+            Follow::Mix { .. } => self.mix_admits(|executable| {
+                app_matches(&session.app_id, executable)
+                    || session.executable.as_deref().is_some_and(|path| {
+                        app_matches(path, executable) || beside(path, executable)
+                    })
+            }),
+        }
+    }
+
+    /// Whether a mix captures the app `runs` tells apart by executable; any
+    /// other follow admits it.
+    pub fn mix_admits(&self, runs: impl Fn(&str) -> bool) -> bool {
+        match self {
+            Follow::Mix {
+                executables,
+                except,
+            } => executables.iter().any(|executable| runs(executable)) != *except,
+            _ => true,
+        }
+    }
+}
+
+/// Whether `executable` sits in the folder of the file at `path`: a launcher
+/// such as Firefox's `private_browsing.exe` starts the app beside it.
+fn beside(path: &str, executable: &str) -> bool {
+    !executable.is_empty()
+        && std::path::Path::new(path)
+            .parent()
+            .is_some_and(|folder| folder.join(executable).is_file())
+}
+
+/// Whether the session app ID `app_id` is the app that runs `executable`.
+/// A desktop app's ID is mostly its executable's name, with or without
+/// `.exe` (`Spotify.exe`, `Chrome`), or a path to it; a packaged app's ends
+/// in `!` and the app's own name (`…!Spotify`). An app whose ID is none of
+/// these, such as a hash, never matches, so its track never shows while
+/// that app alone is captured: AudioSync's labels show instead.
+pub fn app_matches(app_id: &str, executable: &str) -> bool {
+    let stem = executable_stem(executable);
+    if stem.is_empty() {
+        return false;
+    }
+    let id = app_id.to_lowercase();
+    let last = id.rsplit(['\\', '/', '!']).next().unwrap_or(&id);
+    executable_stem(last) == stem
+}
+
+fn executable_stem(name: &str) -> String {
+    let name = name.to_lowercase();
+    match name.strip_suffix(".exe") {
+        Some(stem) => stem.to_owned(),
+        None => name,
+    }
+}
+
+/// The session whose track counts for `follow`: the first that plays, else
+/// the first paused one. Sessions with a blank title, and those of other
+/// apps when one app is followed, never count.
+pub fn pick(sessions: &[MediaSession], follow: &Follow) -> Option<usize> {
+    let mut paused = None;
+    for (index, session) in sessions.iter().enumerate() {
+        if session.title.trim().is_empty() || !follow.admits(session) {
+            continue;
+        }
+        if session.playing {
+            return Some(index);
+        }
+        paused.get_or_insert(index);
+    }
+    paused
+}
+
+/// A track read from a media session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Track {
+    pub session: MediaSession,
+    /// Its artwork, already fitted ([`fit_artwork`]); `None` while the
+    /// session has none, or it couldn't be fitted.
+    pub artwork: Option<FittedArtwork>,
+    /// Where the track stands; `None` when its length is unknown.
+    pub timeline: Option<Timeline>,
+}
+
+/// A session's timeline as Windows reports it, all in 100 ns units: the
+/// track's start and end, the position, and the time that position was
+/// current, counted from 1601 in UTC (0 when the app gives none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawTimeline {
+    pub start: i64,
+    pub end: i64,
+    pub position: i64,
+    pub updated: i64,
+}
+
+/// Where a track stands: `elapsed` into it at `at`, and its length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeline {
+    pub elapsed: Duration,
+    pub length: Duration,
+    pub at: Instant,
+    /// What it was read from, which tells a timeline left from the previous
+    /// track apart from a new one.
+    pub raw: RawTimeline,
+}
+
+const TICK_NANOS: u64 = 100;
+/// 1601 to 1970, in 100 ns units.
+const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+
+/// `time` in the units and from the epoch of [`RawTimeline::updated`].
+pub fn wall_ticks(time: SystemTime) -> i64 {
+    let since = |duration: Duration| i64::try_from(duration.as_nanos() / 100).unwrap_or(i64::MAX);
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => UNIX_EPOCH_TICKS.saturating_add(since(after)),
+        Err(before) => UNIX_EPOCH_TICKS.saturating_sub(since(before.duration())),
+    }
+}
+
+fn ticks(count: i64) -> Duration {
+    Duration::from_nanos(u64::try_from(count).unwrap_or(0).saturating_mul(TICK_NANOS))
+}
+
+impl Timeline {
+    /// `raw` as read at `read_at`, when the wall clock stood at `read_wall`
+    /// ([`wall_ticks`]). `None` for a track without a length (a live
+    /// stream), or a position that can't be placed in time. Without an
+    /// update time the position counts as current when read.
+    pub fn read(raw: RawTimeline, read_wall: i64, read_at: Instant) -> Option<Timeline> {
+        let length = raw
+            .end
+            .checked_sub(raw.start)
+            .filter(|length| *length > 0)?;
+        let elapsed = raw.position.saturating_sub(raw.start).clamp(0, length);
+        let age = if raw.updated > 0 {
+            ticks(read_wall.saturating_sub(raw.updated))
+        } else {
+            Duration::ZERO
+        };
+        Some(Timeline {
+            elapsed: ticks(elapsed),
+            length: ticks(length),
+            at: read_at.checked_sub(age)?,
+            raw,
+        })
+    }
+
+    /// The progress at `now` of a track that plays on; `None` once past its
+    /// end, where a timeline the app stopped updating would put it.
+    pub fn progress_at(&self, now: Instant) -> Option<Progress> {
+        let elapsed = self.elapsed + now.saturating_duration_since(self.at);
+        (elapsed <= self.length).then_some(Progress {
+            elapsed,
+            length: self.length,
+        })
+    }
+}
+
+/// One reading of the sessions: the track that counts, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub track: Option<Track>,
+}
+
+/// Reads the media sessions.
+pub trait TrackReader {
+    /// Reads every [`POLL_INTERVAL`] from now on, for `follow`, or stops
+    /// reading (`None`). A reading made for an earlier follow is dropped.
+    fn follow(&mut self, follow: Option<Follow>);
+
+    /// The newest reading since the last call, if one was made.
+    fn take_reading(&mut self) -> Option<Reading>;
+
+    /// AudioSync's icon, fitted as artwork is; `None` until it is made, or
+    /// when it can't be.
+    fn icon(&mut self) -> Option<FittedArtwork>;
+
+    /// Sends `command` to the session that counts for what it follows, as
+    /// the card's buttons do; nothing while it follows nothing.
+    fn send(&mut self, command: Transport);
+
+    /// With the whole system followed, the app seen playing last: while no
+    /// session plays, its paused session is the one read, or none.
+    fn played_last(&mut self, app_id: Option<&str>);
+}
+
+/// What the source looks like to track info.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackSource {
+    pub follow: Follow,
+    /// The source's name as the source list shows it, if there is one; the
+    /// whole system's and a mix's come from the labels.
+    pub name: Option<String>,
+    /// A mix of apps, which shows only a playing track (S218).
+    pub mix: Option<Mix>,
+}
+
+/// A mix's apps by name, and whether it captures every app but these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mix {
+    pub apps: Vec<String>,
+    pub except: bool,
+}
+
+/// The artwork receivers should show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Artwork {
+    Track(FittedArtwork),
+    /// AudioSync's icon: no track counts, or its app gave it no artwork.
+    Icon,
+    /// The track has no artwork yet: none until [`ARTWORK_WAIT`] is over,
+    /// then the icon.
+    Wait,
+}
+
+/// What receivers should show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shown {
+    pub fields: TrackFields,
+    pub artwork: Artwork,
+}
+
+/// What receivers should show for `track`, the newest reading's, with
+/// `source` captured. A paused track counts when its app is the source or
+/// is `last_played`, the app seen playing last. A track's fields go out as
+/// its app gave them, blank artist or album included.
+pub fn decide(
+    track: Option<&Track>,
+    source: &TrackSource,
+    labels: &ReceiverLabels,
+    last_played: Option<&str>,
+) -> Shown {
+    if let Some(track) = track.filter(|track| counts(track, &source.follow, last_played)) {
+        let session = &track.session;
+        return Shown {
+            fields: TrackFields {
+                title: session.title.clone(),
+                artist: session.artist.clone(),
+                album: session.album.clone(),
+            },
+            artwork: match &track.artwork {
+                Some(artwork) => Artwork::Track(artwork.clone()),
+                None if app_matches(&session.app_id, "Spotify.exe") => Artwork::Wait,
+                None => Artwork::Icon,
+            },
+        };
+    }
+    let mix_name = source.mix.as_ref().map(|mix| labels.mix_name(mix));
+    let artist = source
+        .name
+        .as_deref()
+        .or(mix_name.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(match source.follow {
+            Follow::AnyApp | Follow::Mix { .. } => &labels.whole_system,
+            Follow::App { .. } => &labels.unnamed_source,
+        });
+    Shown {
+        fields: TrackFields {
+            title: labels.title.clone(),
+            artist: artist.to_owned(),
+            album: labels.album.clone(),
+        },
+        artwork: Artwork::Icon,
+    }
+}
+
+fn counts(track: &Track, follow: &Follow, last_played: Option<&str>) -> bool {
+    track.session.playing
+        || matches!(follow, Follow::App { .. })
+        || last_played == Some(track.session.app_id.as_str())
+}
+
+/// What a Cast device should show for `track`: its own fields and artwork
+/// only, nothing in place of what it lacks (Cast spec C53), and nothing at
+/// all when no track counts.
+pub fn cast_track(track: Option<&Track>, follow: &Follow, last_played: Option<&str>) -> CastTrack {
+    let Some(track) = track.filter(|track| counts(track, follow, last_played)) else {
+        return CastTrack::default();
+    };
+    let field = |text: &str| {
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    };
+    let session = &track.session;
+    CastTrack {
+        metadata: Metadata {
+            title: field(&session.title),
+            artist: field(&session.artist),
+            album_name: field(&session.album),
+            images: Vec::new(),
+        },
+        artwork: track.artwork.as_ref().map(|artwork| artwork.cast.clone()),
+    }
+}
+
+/// An image of `width` × `height` pixels as both receiver images of S272:
+/// [`LARGE_ARTWORK`] and [`SMALL_ARTWORK`], the large one's bytes for both
+/// when they fit the small limits, and the Cast image ([`CAST_ARTWORK`]),
+/// the large one's bytes when they are as large as Cast takes. `encode` makes a JPEG at a size and
+/// quality (0 to 1), or fails. `None` when not even the smallest small
+/// image fits, or `encode` failed.
+pub fn fit_artwork(
+    width: u32,
+    height: u32,
+    mut encode: impl FnMut(u32, u32, f32) -> Option<Vec<u8>>,
+) -> Option<FittedArtwork> {
+    let large = fit_jpeg(width, height, LARGE_ARTWORK, &mut encode);
+    if let Some((jpeg, side)) = &large
+        && *side <= SMALL_ARTWORK.side
+        && jpeg.len() <= SMALL_ARTWORK.bytes
+    {
+        return Some(FittedArtwork::single(jpeg.as_slice().into()));
+    }
+    let (small, _) = fit_jpeg(width, height, SMALL_ARTWORK, &mut encode)?;
+    let small: Arc<[u8]> = small.into();
+    let large = large.map(|(jpeg, side)| (Arc::<[u8]>::from(jpeg), side));
+    let cast = match &large {
+        Some((jpeg, side)) if *side == width.max(height).min(CAST_ARTWORK.side) => jpeg.clone(),
+        _ => fit_jpeg(width, height, CAST_ARTWORK, &mut encode)
+            .map_or_else(|| small.clone(), |(jpeg, _)| jpeg.into()),
+    };
+    Some(FittedArtwork {
+        large: large.map_or_else(|| small.clone(), |(jpeg, _)| jpeg),
+        small,
+        cast,
+    })
+}
+
+/// An image of `width` × `height` pixels as a JPEG within `limits`, with
+/// its longest side: as large and sharp as fits, the longest side up to
+/// `limits.side`, each side tried at every quality, best first, before the
+/// side steps down. `encode` makes the JPEG at a size and quality (0 to 1),
+/// or fails. `None` when not even the smallest fits, or `encode` failed.
+fn fit_jpeg(
+    width: u32,
+    height: u32,
+    limits: ArtworkLimits,
+    encode: &mut impl FnMut(u32, u32, f32) -> Option<Vec<u8>>,
+) -> Option<(Vec<u8>, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let longest = width.max(height);
+    let mut side = longest.min(limits.side);
+    loop {
+        let (scaled_width, scaled_height) =
+            (scale(width, side, longest), scale(height, side, longest));
+        let mut smallest = usize::MAX;
+        for quality in JPEG_QUALITIES {
+            let jpeg = encode(scaled_width, scaled_height, quality)?;
+            if jpeg.len() <= limits.bytes {
+                return Some((jpeg, scaled_width.max(scaled_height)));
+            }
+            smallest = smallest.min(jpeg.len());
+        }
+        if side <= SMALLEST_SIDE {
+            return None;
+        }
+        // The size grows about with the pixel count: aim at a side that
+        // should fit, but always step down.
+        let aim = f64::from(side) * (limits.bytes as f64 / smallest as f64).sqrt();
+        side = (aim as u32).min(side * 85 / 100).max(SMALLEST_SIDE);
+    }
+}
+
+fn scale(length: u32, side: u32, longest: u32) -> u32 {
+    let scaled = u64::from(length) * u64::from(side) / u64::from(longest);
+    u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
+}
+
+/// Track info for the sender: follows the source while AirPlay receivers
+/// play, and says what the sender should be given when that changes. See
+/// the module documentation.
+#[derive(Default)]
+pub struct TrackInfo {
+    reader: Option<Box<dyn TrackReader>>,
+    /// What the reader follows; `None` while it doesn't read.
+    following: Option<Follow>,
+    /// When the reader started following.
+    since: Option<Instant>,
+    /// The newest reading since then, if one came.
+    reading: Option<Reading>,
+    /// The app seen playing last since the source was chosen (S218).
+    last_played: Option<String>,
+    /// When its readings in a row neither playing nor paused began.
+    idle_since: Option<Instant>,
+    /// The fields receivers should show, and since when.
+    fields: Option<(TrackFields, Instant)>,
+    /// What the sender was given last, and when.
+    sent: Option<(NowPlaying, Instant)>,
+    timelines: TimelineGuard,
+    labels: SharedLabels,
+    log: DebugLog,
+}
+
+impl TrackInfo {
+    /// Reads through `reader` from now on.
+    pub fn set_reader(&mut self, reader: Box<dyn TrackReader>) {
+        self.reader = Some(reader);
+        self.following = None;
+    }
+
+    /// Sends what happens to `log`.
+    pub fn set_debug_log(&mut self, log: DebugLog) {
+        self.log = log;
+    }
+
+    /// Whether a reader was set.
+    pub fn reads(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    /// What a Cast device should show, from the reading [`TrackInfo::sync`]
+    /// took last: `None` while nothing is followed, and right after reading
+    /// starts until the first reading, for at most [`READING_WAIT`].
+    pub fn cast_track(&self, now: Instant) -> Option<CastTrack> {
+        let follow = self.following.as_ref()?;
+        let since = self.since.unwrap_or(now);
+        if self.reading.is_none() && now.saturating_duration_since(since) < READING_WAIT {
+            return None;
+        }
+        let track = self
+            .reading
+            .as_ref()
+            .and_then(|reading| reading.track.as_ref());
+        Some(cast_track(track, follow, self.last_played.as_deref()))
+    }
+
+    /// The session that counts in the newest reading, by app ID, and whether
+    /// it plays: what a speaker's remote controls (S274). `None` while
+    /// nothing is followed or no session counts.
+    pub fn playback(&self) -> Option<(String, bool)> {
+        self.following.as_ref()?;
+        let track = self.reading.as_ref()?.track.as_ref()?;
+        Some((track.session.app_id.clone(), track.session.playing))
+    }
+
+    /// The session that counts as the explicit pause reads it (S292): its
+    /// app ID and whether it plays; `None` unless it plays or is paused,
+    /// so a stop or a track change is never taken for a pause.
+    pub fn player_state(&self) -> Option<(String, bool)> {
+        self.following.as_ref()?;
+        let session = &self.reading.as_ref()?.track.as_ref()?.session;
+        (session.playing || session.paused).then(|| (session.app_id.clone(), session.playing))
+    }
+
+    /// Sends a speaker remote's control to the session that counts.
+    pub fn send(&mut self, command: Transport) {
+        if self.following.is_some()
+            && let Some(reader) = self.reader.as_mut()
+        {
+            reader.send(command);
+        }
+    }
+
+    /// Words what receivers show while no track counts.
+    pub fn set_labels(&mut self, labels: SharedLabels) {
+        self.labels = labels;
+    }
+
+    /// At each backend poll: `source` is what is captured while AirPlay
+    /// receivers play, `None` while none do. Returns what the sender should
+    /// be given, when it differs from what it was given last: nothing at
+    /// all once the last receiver stops, and everything again when one
+    /// plays again. `None` with no reader.
+    pub fn sync(&mut self, source: Option<&TrackSource>, now: Instant) -> Option<NowPlaying> {
+        let reader = self.reader.as_mut()?;
+        let follow = source.map(|source| source.follow.clone());
+        if follow != self.following {
+            reader.follow(follow.clone());
+            let stopped = follow.is_none();
+            self.following = follow;
+            self.since = Some(now);
+            self.reading = None;
+            self.last_played = None;
+            self.idle_since = None;
+            reader.played_last(None);
+            self.timelines = TimelineGuard::default();
+            if stopped {
+                self.fields = None;
+                if self.sent.take().is_some() {
+                    self.log
+                        .log(|| "AirPlay now playing: cleared, no receiver plays".to_owned());
+                    return Some(NowPlaying::default());
+                }
+            }
+        }
+        let source = source?;
+        let labels = self.labels.get()?;
+        if source.mix.is_some() {
+            self.last_played = None;
+        }
+        if let Some(reading) = reader.take_reading() {
+            let session = reading.track.as_ref().map(|track| &track.session);
+            self.idle_since = match session {
+                Some(session) if session.playing && source.mix.is_none() => {
+                    self.last_played = Some(session.app_id.clone());
+                    None
+                }
+                // Another app's paused track never counts, so it can't tell whether this one quit.
+                Some(session)
+                    if session.paused || self.last_played.as_ref() != Some(&session.app_id) =>
+                {
+                    None
+                }
+                // Windows reports a track change as neither playing nor paused, as it does a stop;
+                // no track may be an app that missed its answer.
+                _ => match self.idle_since {
+                    Some(since) if now.saturating_duration_since(since) >= DROP_AFTER => {
+                        self.last_played = None;
+                        None
+                    }
+                    since => Some(since.unwrap_or(now)),
+                },
+            };
+            reader.played_last(self.last_played.as_deref());
+            // An app paused when it was chosen never played, yet its paused track counts too.
+            let held = self
+                .reading
+                .as_ref()
+                .and_then(|reading| reading.track.as_ref())
+                .is_some_and(|track| {
+                    track.session.paused
+                        && counts(track, &source.follow, self.last_played.as_deref())
+                });
+            if reading.track.is_some()
+                || self.last_played.is_none() && (!held || self.idle_since.is_none())
+            {
+                self.reading = Some(reading);
+            }
+        }
+        let since = self.since.unwrap_or(now);
+        if self.reading.is_none() && now.saturating_duration_since(since) < READING_WAIT {
+            return None;
+        }
+        let track = self
+            .reading
+            .as_ref()
+            .and_then(|reading| reading.track.as_ref());
+        let shown = decide(track, source, &labels, self.last_played.as_deref());
+        let fields_since = match &self.fields {
+            Some((fields, since)) if *fields == shown.fields => *since,
+            _ => {
+                self.fields = Some((shown.fields.clone(), now));
+                now
+            }
+        };
+        let artwork = match shown.artwork {
+            Artwork::Track(jpeg) => Some(jpeg),
+            Artwork::Icon => reader.icon(),
+            Artwork::Wait if now.saturating_duration_since(fields_since) >= ARTWORK_WAIT => {
+                reader.icon()
+            }
+            Artwork::Wait => None,
+        };
+        let artwork = artwork.map(|artwork| artwork.for_sender());
+        let progress = self.timelines.progress(track, &shown.fields, now);
+        let next = NowPlaying {
+            track: Some(shown.fields),
+            artwork,
+            progress,
+        };
+        if let Some((sent, at)) = &self.sent
+            && sent.track == next.track
+            && sent.artwork == next.artwork
+            && progress_holds(sent.progress, *at, next.progress, now)
+        {
+            return None;
+        }
+        self.log.log(|| describe(&next, track));
+        self.sent = Some((next.clone(), now));
+        Some(next)
+    }
+}
+
+/// Keeps progress from a timeline an app may still report for a moment
+/// after the track changed, which is the previous track's.
+#[derive(Default)]
+struct TimelineGuard {
+    /// The fields shown last, and the last timeline read while they showed,
+    /// paused or playing.
+    timed: Option<(TrackFields, Option<RawTimeline>)>,
+    /// The previous track's timeline, while the reading still has it.
+    stale: Option<RawTimeline>,
+}
+
+impl TimelineGuard {
+    /// The progress at `now` of `track`, shown as `fields`: only while it
+    /// plays, and never from the timeline the previous track left.
+    fn progress(
+        &mut self,
+        track: Option<&Track>,
+        fields: &TrackFields,
+        now: Instant,
+    ) -> Option<Progress> {
+        if self.timed.as_ref().is_none_or(|(timed, _)| timed != fields) {
+            if let Some(previous) = self.timed.take().and_then(|(_, last)| last) {
+                self.stale = Some(previous);
+            }
+            self.timed = Some((fields.clone(), None));
+        }
+        if let Some(raw) = track
+            .and_then(|track| track.timeline)
+            .map(|timeline| timeline.raw)
+        {
+            if self.stale.is_some_and(|stale| same_place(stale, raw)) {
+                return None;
+            }
+            self.stale = None;
+            if let Some((_, last)) = &mut self.timed {
+                *last = Some(raw);
+            }
+        }
+        track
+            .filter(|track| track.session.playing)
+            .and_then(|track| track.timeline)?
+            .progress_at(now)
+    }
+}
+
+/// Whether two timelines put a track at the same place. The update time is
+/// left out: an app may refresh it on a timeline it no longer advances.
+fn same_place(one: RawTimeline, other: RawTimeline) -> bool {
+    (one.start, one.end, one.position) == (other.start, other.end, other.position)
+}
+
+/// Whether `sent` at `sent_at` still says what `next` says at `now`: both
+/// none, or the same length with `sent` carried to `now` within
+/// [`PROGRESS_SLACK`] of `next`.
+fn progress_holds(
+    sent: Option<Progress>,
+    sent_at: Instant,
+    next: Option<Progress>,
+    now: Instant,
+) -> bool {
+    match (sent, next) {
+        (None, None) => true,
+        (Some(sent), Some(next)) => {
+            let carried = sent.elapsed + now.saturating_duration_since(sent_at);
+            sent.length == next.length && carried.abs_diff(next.elapsed) <= PROGRESS_SLACK
+        }
+        _ => false,
+    }
+}
+
+fn describe(now_playing: &NowPlaying, track: Option<&Track>) -> String {
+    let fields = now_playing.track.as_ref();
+    let field = |pick: fn(&TrackFields) -> &str| fields.map_or("", pick).to_owned();
+    let from = track.map_or_else(
+        || "AudioSync's labels".to_owned(),
+        |track| format!("the session of {}", track.session.app_id),
+    );
+    let artwork = match &now_playing.artwork {
+        Some(artwork) if artwork.large == artwork.small => {
+            format!("artwork of {} bytes", artwork.large.len())
+        }
+        Some(artwork) => format!(
+            "artwork of {} and {} bytes",
+            artwork.large.len(),
+            artwork.small.len()
+        ),
+        None => "no artwork".to_owned(),
+    };
+    let progress = match &now_playing.progress {
+        Some(progress) => format!(
+            "{:.1} s of {:.1} s",
+            progress.elapsed.as_secs_f64(),
+            progress.length.as_secs_f64()
+        ),
+        None => "no progress".to_owned(),
+    };
+    format!(
+        "AirPlay now playing: \"{}\" by \"{}\" on \"{}\", from {from}, {artwork}, {progress}",
+        field(|fields| &fields.title),
+        field(|fields| &fields.artist),
+        field(|fields| &fields.album),
+    )
+}
+
+#[cfg(test)]
+pub mod fake {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use super::{
+        FittedArtwork, Follow, MediaSession, Reading, ReceiverLabels, SharedLabels, Track,
+        TrackReader, Transport,
+    };
+
+    /// Labels unlike the UI's, so a test sees they come from the strings.
+    pub fn labels() -> ReceiverLabels {
+        ReceiverLabels {
+            title: "Title label".to_owned(),
+            album: "Album label".to_owned(),
+            whole_system: "Whole system label".to_owned(),
+            unnamed_source: "Unnamed label".to_owned(),
+            list_separator: " + ".to_owned(),
+            all_except: "Every app but {}".to_owned(),
+        }
+    }
+
+    pub fn shared_labels() -> SharedLabels {
+        let shared = SharedLabels::default();
+        shared.set(labels());
+        shared
+    }
+
+    #[derive(Default)]
+    struct FakeState {
+        follow: Option<Follow>,
+        follows: Vec<Option<Follow>>,
+        reading: Option<Reading>,
+        icon: Option<Arc<[u8]>>,
+        sent: Vec<Transport>,
+        played_last: Option<String>,
+    }
+
+    /// A reader whose readings a test makes.
+    #[derive(Clone, Default)]
+    pub struct FakeReader(Rc<RefCell<FakeState>>);
+
+    impl FakeReader {
+        pub fn with_icon(icon: &[u8]) -> FakeReader {
+            let reader = FakeReader::default();
+            reader.0.borrow_mut().icon = Some(icon.into());
+            reader
+        }
+
+        pub fn reader(&self) -> Box<dyn TrackReader> {
+            Box::new(self.clone())
+        }
+
+        /// A reading of `track`, or of no session.
+        pub fn read(&self, track: Option<Track>) {
+            self.0.borrow_mut().reading = Some(Reading { track });
+        }
+
+        pub fn following(&self) -> Option<Follow> {
+            self.0.borrow().follow.clone()
+        }
+
+        /// Every control sent so far, and forgets them.
+        pub fn take_sent(&self) -> Vec<Transport> {
+            std::mem::take(&mut self.0.borrow_mut().sent)
+        }
+
+        /// Every follow change so far, and forgets them.
+        pub fn take_follows(&self) -> Vec<Option<Follow>> {
+            std::mem::take(&mut self.0.borrow_mut().follows)
+        }
+
+        pub fn played_last(&self) -> Option<String> {
+            self.0.borrow().played_last.clone()
+        }
+    }
+
+    impl TrackReader for FakeReader {
+        fn follow(&mut self, follow: Option<Follow>) {
+            let mut state = self.0.borrow_mut();
+            state.follow = follow.clone();
+            state.follows.push(follow);
+            state.reading = None;
+        }
+
+        fn take_reading(&mut self) -> Option<Reading> {
+            self.0.borrow_mut().reading.take()
+        }
+
+        fn played_last(&mut self, app_id: Option<&str>) {
+            self.0.borrow_mut().played_last = app_id.map(str::to_owned);
+        }
+
+        fn icon(&mut self) -> Option<FittedArtwork> {
+            self.0.borrow().icon.clone().map(FittedArtwork::single)
+        }
+
+        fn send(&mut self, command: Transport) {
+            self.0.borrow_mut().sent.push(command);
+        }
+    }
+
+    pub fn session(app_id: &str, title: &str, playing: bool) -> MediaSession {
+        MediaSession {
+            app_id: app_id.to_owned(),
+            executable: None,
+            title: title.to_owned(),
+            artist: format!("{title} artist"),
+            album: format!("{title} album"),
+            playing,
+            paused: !playing,
+        }
+    }
+
+    pub fn track(app_id: &str, title: &str, playing: bool, artwork: Option<&[u8]>) -> Track {
+        Track {
+            session: session(app_id, title, playing),
+            artwork: artwork.map(|jpeg| FittedArtwork::single(jpeg.into())),
+            timeline: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::{FakeReader, labels, session, shared_labels, track};
+    use super::*;
+
+    const ICON: &[u8] = b"icon jpeg";
+    const COVER: &[u8] = b"cover jpeg";
+
+    /// The large image `now_playing` hands the sender.
+    fn large_of(now_playing: &NowPlaying) -> Option<&[u8]> {
+        now_playing
+            .artwork
+            .as_ref()
+            .map(|artwork| artwork.large.as_slice())
+    }
+
+    fn whole_system() -> TrackSource {
+        TrackSource {
+            follow: Follow::AnyApp,
+            name: None,
+            mix: None,
+        }
+    }
+
+    fn app(executable: &str, name: &str) -> TrackSource {
+        TrackSource {
+            follow: Follow::App {
+                executable: executable.to_owned(),
+                pid: None,
+            },
+            name: Some(name.to_owned()),
+            mix: None,
+        }
+    }
+
+    fn fields(title: &str, artist: &str, album: &str) -> Option<TrackFields> {
+        Some(TrackFields {
+            title: title.to_owned(),
+            artist: artist.to_owned(),
+            album: album.to_owned(),
+        })
+    }
+
+    fn track_info(reader: &FakeReader) -> TrackInfo {
+        let mut info = TrackInfo::default();
+        info.set_reader(reader.reader());
+        info.set_labels(shared_labels());
+        info
+    }
+
+    // covers: S274
+    #[test]
+    fn a_remote_control_goes_to_the_session_track_info_follows() {
+        let reader = FakeReader::default();
+        let mut info = track_info(&reader);
+        let now = Instant::now();
+        info.send(Transport::Next);
+        assert!(reader.take_sent().is_empty(), "nothing is followed");
+        assert_eq!(info.playback(), None);
+        info.sync(Some(&whole_system()), now);
+        reader.read(Some(track("Spotify.exe", "Song", false, None)));
+        info.sync(Some(&whole_system()), now);
+        assert_eq!(info.playback(), Some(("Spotify.exe".to_owned(), false)));
+        info.send(Transport::PlayPause);
+        assert_eq!(reader.take_sent(), [Transport::PlayPause]);
+        reader.read(None);
+        info.sync(Some(&whole_system()), now);
+        assert_eq!(info.playback(), None, "no session counts");
+    }
+
+    // covers: S292
+    #[test]
+    fn only_a_session_that_plays_or_pauses_has_a_player_state() {
+        let reader = FakeReader::default();
+        let mut info = track_info(&reader);
+        let now = Instant::now();
+        info.sync(Some(&whole_system()), now);
+        let spotify = |playing: bool, paused: bool| {
+            let mut read = track("Spotify.exe", "Song", playing, None);
+            read.session.paused = paused;
+            read
+        };
+        let spotify_state = |playing| Some(("Spotify.exe".to_owned(), playing));
+        reader.read(Some(spotify(true, false)));
+        info.sync(Some(&whole_system()), now);
+        assert_eq!(info.player_state(), spotify_state(true));
+        reader.read(Some(spotify(false, false)));
+        info.sync(Some(&whole_system()), now);
+        assert_eq!(info.player_state(), None, "stopped or changing tracks");
+        assert_eq!(
+            info.playback(),
+            spotify_state(false),
+            "S274 still reads it as not playing"
+        );
+        reader.read(Some(spotify(false, true)));
+        info.sync(Some(&whole_system()), now);
+        assert_eq!(info.player_state(), spotify_state(false));
+    }
+
+    #[test]
+    fn app_ids_match_their_executable_by_name_path_or_package_app() {
+        assert!(app_matches("Spotify.exe", "spotify.exe"));
+        assert!(app_matches("Chrome", "chrome.exe"));
+        assert!(app_matches("MSEdge", "msedge.exe"));
+        assert!(app_matches(
+            "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify",
+            "Spotify.exe"
+        ));
+        assert!(app_matches(r"C:\Program Files\VLC\vlc.exe", "vlc.exe"));
+        assert!(!app_matches("308046B0AF4A39CB", "firefox.exe"));
+        assert!(!app_matches("Chrome", "chromium.exe"));
+        assert!(!app_matches("Chrome", ""));
+    }
+
+    // covers: S218
+    #[test]
+    fn a_playing_session_wins_over_a_paused_one_listed_first() {
+        let sessions = [
+            session("Spotify.exe", "Paused", false),
+            session("Chrome", "Playing", true),
+        ];
+        assert_eq!(pick(&sessions, &Follow::AnyApp), Some(1));
+    }
+
+    #[test]
+    fn with_nothing_playing_the_first_paused_session_counts() {
+        let sessions = [
+            session("Spotify.exe", "First", false),
+            session("Chrome", "Second", false),
+        ];
+        assert_eq!(pick(&sessions, &Follow::AnyApp), Some(0));
+    }
+
+    // covers: S218
+    #[test]
+    fn an_app_source_only_follows_its_own_session() {
+        let sessions = [
+            session("Chrome", "Video", true),
+            session("Spotify.exe", "Song", false),
+        ];
+        let spotify = Follow::App {
+            executable: "spotify.exe".to_owned(),
+            pid: None,
+        };
+        assert_eq!(pick(&sessions, &spotify), Some(1));
+        let vlc = Follow::App {
+            executable: "vlc.exe".to_owned(),
+            pid: None,
+        };
+        assert_eq!(pick(&sessions, &vlc), None);
+    }
+
+    // covers: S218
+    #[test]
+    fn a_mix_matches_a_session_by_the_executable_behind_its_app_id() {
+        let firefox = MediaSession {
+            executable: Some(r"C:\Program Files\Mozilla Firefox\firefox.exe".to_owned()),
+            ..session("308046B0AF4A39CB", "Video", true)
+        };
+        let mix = |except: bool| Follow::Mix {
+            executables: vec!["firefox.exe".to_owned()],
+            except,
+        };
+        assert_eq!(
+            pick(std::slice::from_ref(&firefox), &mix(true)),
+            None,
+            "an All Apps Except mix read the app it leaves out"
+        );
+        assert_eq!(
+            pick(&[firefox], &mix(false)),
+            Some(0),
+            "an Only the Checked Apps mix left out an app it captures"
+        );
+    }
+
+    // covers: S218
+    #[test]
+    fn a_mix_matches_a_launcher_by_the_app_beside_it() {
+        let dir = std::env::temp_dir().join(format!("audiosync-beside-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["launcher.exe", "app.exe"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let launched = MediaSession {
+            executable: Some(dir.join("launcher.exe").to_string_lossy().into_owned()),
+            ..session("0123456789ABCDEF;Private", "Video", true)
+        };
+        let mix = |except: bool| Follow::Mix {
+            executables: vec!["app.exe".to_owned()],
+            except,
+        };
+        let only = pick(std::slice::from_ref(&launched), &mix(false));
+        let except = pick(&[launched], &mix(true));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            only,
+            Some(0),
+            "an Only the Checked Apps mix left out the app's launcher"
+        );
+        assert_eq!(
+            except, None,
+            "an All Apps Except mix read the app's launcher"
+        );
+    }
+
+    #[test]
+    fn sessions_without_a_title_never_count() {
+        let sessions = [session("Chrome", " ", true)];
+        assert_eq!(pick(&sessions, &Follow::AnyApp), None);
+        assert_eq!(pick(&[], &Follow::AnyApp), None);
+    }
+
+    // covers: S218
+    #[test]
+    fn a_paused_track_counts_only_when_its_app_is_the_source() {
+        let paused = track("Spotify.exe", "Song", false, Some(COVER));
+        let shown = decide(Some(&paused), &whole_system(), &labels(), None);
+        assert_eq!(
+            Some(shown.fields),
+            fields("Title label", "Whole system label", "Album label")
+        );
+        assert_eq!(shown.artwork, Artwork::Icon);
+
+        let shown = decide(
+            Some(&paused),
+            &app("spotify.exe", "Spotify"),
+            &labels(),
+            None,
+        );
+        assert_eq!(
+            Some(shown.fields),
+            fields("Song", "Song artist", "Song album")
+        );
+        assert_eq!(
+            shown.artwork,
+            Artwork::Track(FittedArtwork::single(COVER.into()))
+        );
+    }
+
+    fn stopped(app_id: &str, title: &str) -> Track {
+        let mut stopped = track(app_id, title, false, Some(COVER));
+        stopped.session.paused = false;
+        stopped
+    }
+
+    fn whole_system_label() -> Option<TrackFields> {
+        fields("Title label", "Whole system label", "Album label")
+    }
+
+    // covers: S218
+    #[test]
+    fn whole_system_the_player_that_played_last_keeps_its_paused_track() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        let later = start + POLL_INTERVAL;
+        assert_eq!(info.sync(Some(&whole_system()), later), None, "it stays");
+        let cast = info.cast_track(later).expect("read");
+        assert_eq!(cast.metadata.title.as_deref(), Some("Song"), "Cast too");
+    }
+
+    // covers: S218
+    #[test]
+    fn whole_system_a_paused_track_survives_a_poll_with_no_answer() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+
+        reader.read(None);
+        assert_eq!(info.sync(Some(&whole_system()), start), None, "it stays");
+        assert_eq!(reader.played_last().as_deref(), Some("Spotify.exe"));
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        assert_eq!(info.sync(Some(&whole_system()), start), None, "still");
+    }
+
+    // covers: S218
+    #[test]
+    fn whole_system_another_player_that_plays_takes_over_from_a_paused_one() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+
+        reader.read(Some(track("Chrome", "Video", true, Some(COVER))));
+        let sent = info.sync(Some(&whole_system()), start).expect("Chrome");
+        assert_eq!(sent.track, fields("Video", "Video artist", "Video album"));
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        let sent = info.sync(Some(&whole_system()), start).expect("labels");
+        assert_eq!(sent.track, whole_system_label(), "Spotify didn't play last");
+    }
+
+    // covers: S218
+    #[test]
+    fn whole_system_a_paused_track_goes_when_its_player_quits_stops_or_the_source_changes() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        let play_then_pause = |info: &mut TrackInfo| {
+            info.sync(Some(&whole_system()), start);
+            reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+            info.sync(Some(&whole_system()), start);
+            reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+            info.sync(Some(&whole_system()), start);
+        };
+
+        play_then_pause(&mut info);
+        for at in [0, 3] {
+            reader.read(None);
+            assert_eq!(
+                info.sync(Some(&whole_system()), start + Duration::from_secs(at)),
+                None,
+                "no answer yet"
+            );
+        }
+        reader.read(None);
+        let sent = info
+            .sync(Some(&whole_system()), start + DROP_AFTER)
+            .expect("quit");
+        assert_eq!(sent.track, whole_system_label());
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        assert_eq!(info.sync(Some(&whole_system()), start), None, "forgotten");
+
+        play_then_pause(&mut info);
+        for at in [0, 3] {
+            reader.read(Some(stopped("Spotify.exe", "Song")));
+            info.sync(Some(&whole_system()), start + Duration::from_secs(at));
+        }
+        reader.read(Some(stopped("Spotify.exe", "Song")));
+        let sent = info
+            .sync(Some(&whole_system()), start + DROP_AFTER)
+            .expect("stopped");
+        assert_eq!(sent.track, whole_system_label());
+
+        play_then_pause(&mut info);
+        info.sync(Some(&app("chrome.exe", "Chrome")), start);
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        let sent = info.sync(Some(&whole_system()), start).expect("new source");
+        assert_eq!(sent.track, whole_system_label());
+    }
+
+    // covers: S218
+    #[test]
+    fn a_status_neither_playing_nor_paused_drops_the_paused_track_only_on_its_third_reading() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+
+        for at in [0, 3] {
+            reader.read(Some(stopped("Spotify.exe", "Song")));
+            let now = start + Duration::from_secs(at);
+            assert_eq!(info.sync(Some(&whole_system()), now), None, "it stays");
+        }
+        let paused = start + Duration::from_secs(5);
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        assert_eq!(
+            info.sync(Some(&whole_system()), paused),
+            None,
+            "paused again"
+        );
+        for at in [0, 3] {
+            reader.read(Some(stopped("Spotify.exe", "Song")));
+            let now = paused + Duration::from_secs(at);
+            assert_eq!(info.sync(Some(&whole_system()), now), None, "counts anew");
+        }
+        reader.read(Some(stopped("Spotify.exe", "Song")));
+        let sent = info
+            .sync(Some(&whole_system()), paused + DROP_AFTER)
+            .expect("dropped");
+        assert_eq!(sent.track, whole_system_label());
+    }
+
+    // covers: S218
+    #[test]
+    fn a_burst_of_readings_neither_playing_nor_paused_keeps_the_paused_track_for_6_s() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+
+        let stop = start + Duration::from_secs(1);
+        for at in [0, 100, 400, 2400, 5900] {
+            reader.read(Some(stopped("Spotify.exe", "Song")));
+            let now = stop + Duration::from_millis(at);
+            assert_eq!(info.sync(Some(&whole_system()), now), None, "it stays");
+        }
+        reader.read(Some(stopped("Spotify.exe", "Song")));
+        let sent = info
+            .sync(Some(&whole_system()), stop + DROP_AFTER)
+            .expect("dropped");
+        assert_eq!(sent.track, whole_system_label());
+    }
+
+    // covers: S218
+    #[test]
+    fn an_app_paused_when_chosen_keeps_its_track_until_the_third_empty_reading() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        let spotify = app("Spotify.exe", "Spotify");
+        info.sync(Some(&spotify), start);
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        let sent = info.sync(Some(&spotify), start).expect("paused track");
+        assert_eq!(sent.track, fields("Song", "Song artist", "Song album"));
+
+        for at in [0, 3] {
+            reader.read(None);
+            let now = start + Duration::from_secs(at);
+            assert_eq!(info.sync(Some(&spotify), now), None, "it stays");
+        }
+        reader.read(None);
+        let sent = info
+            .sync(Some(&spotify), start + DROP_AFTER)
+            .expect("dropped");
+        assert_eq!(sent.track, fields("Title label", "Spotify", "Album label"));
+    }
+
+    // covers: S218
+    #[test]
+    fn the_reader_learns_which_app_played_last_until_the_source_changes() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+        assert_eq!(reader.played_last().as_deref(), Some("Spotify.exe"));
+
+        info.sync(Some(&app("chrome.exe", "Chrome")), start);
+        assert_eq!(reader.played_last(), None);
+    }
+
+    // covers: S218
+    #[test]
+    fn with_no_track_the_source_name_stands_in_for_the_artist() {
+        let shown = decide(None, &app("player.exe", "Player"), &labels(), None);
+        assert_eq!(
+            Some(shown.fields),
+            fields("Title label", "Player", "Album label")
+        );
+        // An input device that isn't listed, as the controller gives it.
+        let unnamed = TrackSource {
+            follow: Follow::App {
+                executable: String::new(),
+                pid: None,
+            },
+            name: Some("  ".to_owned()),
+            mix: None,
+        };
+        assert_eq!(
+            Some(decide(None, &unnamed, &labels(), None).fields),
+            fields("Title label", "Unnamed label", "Album label")
+        );
+    }
+
+    // covers: S219
+    #[test]
+    fn a_track_reaches_the_sender_with_its_artwork_once_read() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        assert_eq!(
+            info.sync(Some(&whole_system()), start),
+            None,
+            "no reading yet"
+        );
+        assert_eq!(reader.following(), Some(Follow::AnyApp));
+
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        let sent = info.sync(Some(&whole_system()), start).expect("it is sent");
+        assert_eq!(sent.track, fields("Song", "Song artist", "Song album"));
+        assert_eq!(large_of(&sent), Some(COVER));
+        assert_eq!(sent.progress, None);
+    }
+
+    // covers: S219
+    #[test]
+    fn an_unchanged_track_is_not_sent_again() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        assert!(info.sync(Some(&whole_system()), start).is_some());
+
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        let later = start + POLL_INTERVAL;
+        assert_eq!(info.sync(Some(&whole_system()), later), None);
+        assert_eq!(info.sync(Some(&whole_system()), later + ARTWORK_WAIT), None);
+    }
+
+    // covers: S219
+    #[test]
+    fn a_new_track_is_sent_as_it_changes() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "First", true, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+
+        reader.read(Some(track("Spotify.exe", "Second", true, Some(b"second"))));
+        let sent = info
+            .sync(Some(&whole_system()), start + POLL_INTERVAL)
+            .expect("the new track is sent");
+        assert_eq!(
+            sent.track,
+            fields("Second", "Second artist", "Second album")
+        );
+        assert_eq!(large_of(&sent), Some(&b"second"[..]));
+    }
+
+    // covers: S219
+    #[test]
+    fn with_no_session_receivers_get_audiosyncs_labels_and_icon() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(None);
+        let sent = info
+            .sync(Some(&whole_system()), start)
+            .expect("labels go out");
+        assert_eq!(
+            sent.track,
+            fields("Title label", "Whole system label", "Album label")
+        );
+        assert_eq!(large_of(&sent), Some(ICON));
+    }
+
+    // covers: C53
+    #[test]
+    fn a_cast_device_gets_the_track_and_its_cover_once_read() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        assert_eq!(info.cast_track(start), None, "nothing is followed");
+        info.sync(Some(&whole_system()), start);
+        assert_eq!(info.cast_track(start), None, "no reading yet");
+
+        let mut song = track("Spotify.exe", "Song", true, Some(COVER));
+        song.session.album = "  ".to_owned();
+        reader.read(Some(song));
+        info.sync(Some(&whole_system()), start);
+        let shown = info.cast_track(start).expect("read");
+        assert_eq!(shown.metadata.title.as_deref(), Some("Song"));
+        assert_eq!(shown.metadata.artist.as_deref(), Some("Song artist"));
+        assert_eq!(shown.metadata.album_name, None, "a blank field is left out");
+        assert!(shown.metadata.images.is_empty());
+        assert_eq!(shown.artwork.as_deref(), Some(COVER));
+
+        info.sync(None, start);
+        assert_eq!(info.cast_track(start), None, "reading stopped");
+    }
+
+    // covers: C53
+    #[test]
+    fn a_cast_device_gets_no_labels_or_icon_without_a_track() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Paused", false, Some(COVER))));
+        info.sync(Some(&whole_system()), start);
+        assert_eq!(info.cast_track(start), Some(CastTrack::default()));
+
+        let mut other = track_info(&FakeReader::with_icon(ICON));
+        other.sync(Some(&whole_system()), start);
+        let later = start + READING_WAIT;
+        other.sync(Some(&whole_system()), later);
+        assert_eq!(other.cast_track(later), Some(CastTrack::default()));
+    }
+
+    // covers: S218
+    #[test]
+    fn with_no_reading_at_all_the_labels_go_out_after_the_reading_wait() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        assert_eq!(info.sync(Some(&whole_system()), start), None);
+        let just_before = start + READING_WAIT - Duration::from_millis(1);
+        assert_eq!(info.sync(Some(&whole_system()), just_before), None);
+        let sent = info
+            .sync(Some(&whole_system()), start + READING_WAIT)
+            .expect("labels go out");
+        assert_eq!(
+            sent.track,
+            fields("Title label", "Whole system label", "Album label")
+        );
+    }
+
+    // covers: S218, S219
+    #[test]
+    fn missing_artwork_waits_then_the_icon_takes_its_place() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Video", true, None)));
+        let sent = info
+            .sync(Some(&whole_system()), start)
+            .expect("the fields go");
+        assert_eq!(sent.track, fields("Video", "Video artist", "Video album"));
+        assert_eq!(sent.artwork, None, "no artwork while it may still come");
+
+        reader.read(Some(track("Spotify.exe", "Video", true, None)));
+        let waiting = start + ARTWORK_WAIT - Duration::from_millis(1);
+        assert_eq!(info.sync(Some(&whole_system()), waiting), None);
+        let sent = info
+            .sync(Some(&whole_system()), start + ARTWORK_WAIT)
+            .expect("the icon goes");
+        assert_eq!(large_of(&sent), Some(ICON));
+    }
+
+    // covers: S218
+    #[test]
+    fn only_an_app_whose_artwork_comes_after_its_track_is_waited_for() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Chrome", "Video", true, None)));
+        let sent = info
+            .sync(Some(&whole_system()), start)
+            .expect("the fields go");
+        assert_eq!(large_of(&sent), Some(ICON), "the icon at once");
+
+        for spotify in [
+            "Spotify.exe",
+            "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify",
+        ] {
+            reader.read(Some(track(spotify, spotify, true, None)));
+            let sent = info
+                .sync(Some(&whole_system()), start)
+                .expect("the next track goes");
+            assert_eq!(sent.artwork, None, "{spotify}: its artwork may still come");
+        }
+    }
+
+    // covers: S219
+    #[test]
+    fn artwork_that_arrives_during_the_wait_goes_out() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Video", true, None)));
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Video", true, Some(COVER))));
+        let sent = info
+            .sync(Some(&whole_system()), start + POLL_INTERVAL)
+            .expect("the cover goes");
+        assert_eq!(large_of(&sent), Some(COVER));
+    }
+
+    // covers: S219
+    #[test]
+    fn without_an_icon_no_artwork_goes_in_its_place() {
+        let reader = FakeReader::default();
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(None);
+        let sent = info
+            .sync(Some(&whole_system()), start)
+            .expect("labels go out");
+        assert_eq!(sent.artwork, None);
+    }
+
+    #[test]
+    fn reading_follows_the_source_and_stops_with_the_receivers() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        assert_eq!(info.sync(None, start), None);
+        assert!(reader.take_follows().is_empty(), "nothing to read yet");
+
+        info.sync(Some(&whole_system()), start);
+        info.sync(Some(&whole_system()), start);
+        let spotify = app("spotify.exe", "Spotify");
+        info.sync(Some(&spotify), start);
+        info.sync(None, start);
+        assert_eq!(
+            reader.take_follows(),
+            [Some(Follow::AnyApp), Some(spotify.follow.clone()), None]
+        );
+    }
+
+    // covers: S218
+    #[test]
+    fn a_new_source_waits_for_its_own_reading() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Chrome", "Video", true, Some(COVER))));
+        assert!(info.sync(Some(&whole_system()), start).is_some());
+
+        let spotify = app("spotify.exe", "Spotify");
+        let later = start + POLL_INTERVAL;
+        assert_eq!(
+            info.sync(Some(&spotify), later),
+            None,
+            "the old reading is dropped"
+        );
+        reader.read(Some(track("Spotify.exe", "Song", false, Some(COVER))));
+        let sent = info
+            .sync(Some(&spotify), later)
+            .expect("Spotify's track goes");
+        assert_eq!(sent.track, fields("Song", "Song artist", "Song album"));
+    }
+
+    #[test]
+    fn the_sender_is_cleared_when_the_last_receiver_stops() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        assert!(info.sync(Some(&whole_system()), start).is_some());
+
+        assert_eq!(info.sync(None, start), Some(NowPlaying::default()));
+        assert_eq!(info.sync(None, start), None, "cleared once");
+
+        let later = start + POLL_INTERVAL;
+        info.sync(Some(&whole_system()), later);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        let sent = info
+            .sync(Some(&whole_system()), later)
+            .expect("the same track goes again");
+        assert_eq!(sent.track, fields("Song", "Song artist", "Song album"));
+    }
+
+    // covers: S219
+    #[test]
+    fn another_image_for_the_same_track_goes_out_once() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        assert!(info.sync(Some(&whole_system()), start).is_some());
+
+        let later = start + POLL_INTERVAL;
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(b"new cover"))));
+        let sent = info
+            .sync(Some(&whole_system()), later)
+            .expect("the new image goes out");
+        assert_eq!(sent.track, fields("Song", "Song artist", "Song album"));
+        assert_eq!(large_of(&sent), Some(&b"new cover"[..]));
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(b"new cover"))));
+        assert_eq!(
+            info.sync(Some(&whole_system()), later + POLL_INTERVAL),
+            None
+        );
+    }
+
+    // covers: S219
+    #[test]
+    fn a_restarted_sender_gets_the_track_and_its_artwork_again() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        assert!(info.sync(Some(&whole_system()), start).is_some());
+        info.sync(None, start);
+
+        let restart = start + POLL_INTERVAL;
+        info.sync(Some(&whole_system()), restart);
+        reader.read(Some(track("Spotify.exe", "Song", true, Some(COVER))));
+        let sent = info
+            .sync(Some(&whole_system()), restart)
+            .expect("the same track goes again");
+        assert_eq!(sent.track, fields("Song", "Song artist", "Song album"));
+        assert_eq!(large_of(&sent), Some(COVER), "with its artwork");
+    }
+
+    // covers: S219
+    #[test]
+    fn a_restart_on_a_track_without_artwork_waits_for_it_again() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(track("Spotify.exe", "Video", true, None)));
+        info.sync(Some(&whole_system()), start);
+        info.sync(None, start + ARTWORK_WAIT);
+
+        let restart = start + ARTWORK_WAIT * 2;
+        info.sync(Some(&whole_system()), restart);
+        reader.read(Some(track("Spotify.exe", "Video", true, None)));
+        let sent = info
+            .sync(Some(&whole_system()), restart)
+            .expect("the fields go again");
+        assert_eq!(sent.artwork, None, "the wait starts over");
+        let sent = info
+            .sync(Some(&whole_system()), restart + ARTWORK_WAIT)
+            .expect("then the icon");
+        assert_eq!(large_of(&sent), Some(ICON));
+    }
+
+    #[test]
+    fn no_reader_means_nothing_for_the_sender() {
+        let mut info = TrackInfo::default();
+        assert_eq!(info.sync(Some(&whole_system()), Instant::now()), None);
+    }
+
+    #[test]
+    fn the_labels_come_from_the_ui_and_nothing_goes_out_before_them() {
+        let reader = FakeReader::with_icon(b"icon");
+        let mut info = TrackInfo::default();
+        info.set_reader(reader.reader());
+        let shared = SharedLabels::default();
+        info.set_labels(shared.clone());
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(None);
+        assert_eq!(info.sync(Some(&whole_system()), start), None);
+        shared.set(labels());
+        let sent = info.sync(Some(&whole_system()), start).expect("labels");
+        assert_eq!(
+            sent.track,
+            fields("Title label", "Whole system label", "Album label")
+        );
+    }
+
+    const SECOND: i64 = 10_000_000;
+
+    fn raw(start: i64, end: i64, position: i64, updated: i64) -> RawTimeline {
+        RawTimeline {
+            start: start * SECOND,
+            end: end * SECOND,
+            position: position * SECOND,
+            updated: updated * SECOND,
+        }
+    }
+
+    fn secs(count: u64) -> Duration {
+        Duration::from_secs(count)
+    }
+
+    /// A track `elapsed` seconds into `length` at `at`.
+    fn timed(title: &str, playing: bool, elapsed: i64, length: i64, at: Instant) -> Track {
+        Track {
+            timeline: Timeline::read(raw(0, length, elapsed, 0), 0, at),
+            ..track("Spotify.exe", title, playing, Some(COVER))
+        }
+    }
+
+    fn progress(elapsed: u64, length: u64) -> Option<Progress> {
+        Some(Progress {
+            elapsed: secs(elapsed),
+            length: secs(length),
+        })
+    }
+
+    // covers: S361
+    #[test]
+    fn a_timeline_gives_the_elapsed_time_and_length_as_of_its_update() {
+        let read_at = Instant::now() + secs(60);
+        let wall = 13_000_000_000;
+        let timeline = Timeline::read(raw(10, 210, 60, wall - 3), wall * SECOND, read_at)
+            .expect("the length is known");
+        assert_eq!((timeline.elapsed, timeline.length), (secs(50), secs(200)));
+        assert_eq!(timeline.at, read_at - secs(3));
+        assert_eq!(timeline.progress_at(read_at), progress(53, 200));
+        assert_eq!(
+            timeline.progress_at(read_at + secs(147)),
+            progress(200, 200)
+        );
+        assert_eq!(
+            timeline.progress_at(read_at + secs(148)),
+            None,
+            "past the end the timeline is out of date"
+        );
+    }
+
+    // covers: S361
+    #[test]
+    fn without_an_update_time_the_position_is_current_when_read() {
+        let read_at = Instant::now();
+        let timeline = Timeline::read(raw(0, 100, 30, 0), 13_000_000_000 * SECOND, read_at);
+        assert_eq!(timeline.map(|timeline| timeline.at), Some(read_at));
+        let ahead = Timeline::read(raw(0, 100, 30, 101), 100 * SECOND, read_at);
+        assert_eq!(
+            ahead.map(|timeline| timeline.at),
+            Some(read_at),
+            "an update time ahead of the clock counts as now"
+        );
+    }
+
+    // covers: S361
+    #[test]
+    fn an_unknown_or_zero_length_gives_no_timeline() {
+        let now = Instant::now();
+        assert_eq!(Timeline::read(raw(0, 0, 0, 0), 0, now), None, "live");
+        assert_eq!(Timeline::read(raw(5, 5, 5, 0), 0, now), None);
+        assert_eq!(Timeline::read(raw(10, 5, 7, 0), 0, now), None);
+    }
+
+    // covers: S361
+    #[test]
+    fn a_position_outside_the_track_is_held_to_its_bounds() {
+        let now = Instant::now();
+        let before = Timeline::read(raw(10, 110, 4, 0), 0, now).unwrap();
+        assert_eq!(before.elapsed, Duration::ZERO);
+        let after = Timeline::read(raw(10, 110, 500, 0), 0, now).unwrap();
+        assert_eq!(after.elapsed, secs(100));
+    }
+
+    // covers: S361
+    #[test]
+    fn wall_ticks_count_from_1601() {
+        assert_eq!(wall_ticks(UNIX_EPOCH), UNIX_EPOCH_TICKS);
+        assert_eq!(
+            wall_ticks(UNIX_EPOCH + secs(2)),
+            UNIX_EPOCH_TICKS + 2 * SECOND
+        );
+    }
+
+    // covers: S361
+    #[test]
+    fn a_playing_track_with_a_length_goes_out_with_its_progress() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(timed("Song", true, 30, 180, start)));
+        let sent = info
+            .sync(Some(&whole_system()), start + secs(1))
+            .expect("it is sent");
+        assert_eq!(sent.progress, progress(31, 180));
+        assert_eq!(sent.track, fields("Song", "Song artist", "Song album"));
+    }
+
+    // covers: S361
+    #[test]
+    fn progress_that_runs_on_as_sent_is_not_sent_again() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(timed("Song", true, 30, 180, start)));
+        assert!(info.sync(Some(&whole_system()), start).is_some());
+
+        let later = start + POLL_INTERVAL;
+        reader.read(Some(timed("Song", true, 32, 180, later)));
+        assert_eq!(info.sync(Some(&whole_system()), later), None);
+        let drifted = later + POLL_INTERVAL;
+        reader.read(Some(timed("Song", true, 35, 180, drifted)));
+        assert_eq!(
+            info.sync(Some(&whole_system()), drifted),
+            None,
+            "a second off is within the slack"
+        );
+    }
+
+    // covers: S361
+    #[test]
+    fn a_seek_sends_the_new_position() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(timed("Song", true, 30, 180, start)));
+        info.sync(Some(&whole_system()), start);
+
+        let later = start + POLL_INTERVAL;
+        reader.read(Some(timed("Song", true, 120, 180, later)));
+        let sent = info
+            .sync(Some(&whole_system()), later)
+            .expect("the seek is sent");
+        assert_eq!(sent.progress, progress(120, 180));
+    }
+
+    // covers: S361
+    #[test]
+    fn a_live_or_paused_track_or_the_labels_go_out_without_progress() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        let source = app("Spotify.exe", "Spotify");
+        info.sync(Some(&source), start);
+        reader.read(Some(track("Spotify.exe", "Live", true, Some(COVER))));
+        let live = info.sync(Some(&source), start).expect("it is sent");
+        assert_eq!(live.progress, None);
+
+        reader.read(Some(timed("Song", false, 30, 180, start)));
+        let paused = info.sync(Some(&source), start).expect("it is sent");
+        assert_eq!(paused.progress, None);
+
+        reader.read(Some(timed("Song", true, 30, 180, start)));
+        let resumed = info.sync(Some(&source), start).expect("it is sent");
+        assert_eq!(resumed.progress, progress(30, 180));
+
+        reader.read(None);
+        info.sync(Some(&source), start);
+        reader.read(None);
+        let labels = info
+            .sync(Some(&source), start + DROP_AFTER)
+            .expect("it is sent");
+        assert_eq!(labels.progress, None);
+    }
+
+    // covers: S361
+    #[test]
+    fn a_track_change_drops_the_previous_tracks_timeline() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        let first = timed("First", true, 170, 180, start);
+        let left = first.timeline;
+        reader.read(Some(first));
+        info.sync(Some(&whole_system()), start);
+
+        let later = start + POLL_INTERVAL;
+        reader.read(Some(Track {
+            timeline: left,
+            ..track("Spotify.exe", "Second", true, Some(COVER))
+        }));
+        let sent = info
+            .sync(Some(&whole_system()), later)
+            .expect("the new track is sent");
+        assert_eq!(
+            sent.track,
+            fields("Second", "Second artist", "Second album")
+        );
+        assert_eq!(
+            sent.progress, None,
+            "the old timeline isn't the new track's"
+        );
+
+        let next = later + POLL_INTERVAL;
+        reader.read(Some(timed("Second", true, 2, 240, next)));
+        let sent = info
+            .sync(Some(&whole_system()), next)
+            .expect("its own timeline is sent");
+        assert_eq!(sent.progress, progress(2, 240));
+    }
+
+    // covers: S361
+    #[test]
+    fn a_track_change_after_a_pause_still_drops_the_previous_tracks_timeline() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        let source = app("Spotify.exe", "Spotify");
+        info.sync(Some(&source), start);
+        let first = timed("First", true, 170, 180, start);
+        let left = first.timeline;
+        reader.read(Some(first));
+        info.sync(Some(&source), start);
+        reader.read(Some(track("Spotify.exe", "First", false, Some(COVER))));
+        info.sync(Some(&source), start + POLL_INTERVAL);
+
+        let later = start + POLL_INTERVAL * 2;
+        reader.read(Some(Track {
+            timeline: left,
+            ..track("Spotify.exe", "Second", true, Some(COVER))
+        }));
+        let sent = info
+            .sync(Some(&source), later)
+            .expect("the new track is sent");
+        assert_eq!(
+            sent.progress, None,
+            "the old timeline isn't the new track's"
+        );
+    }
+
+    // covers: S361
+    #[test]
+    fn an_old_timeline_with_a_fresh_update_time_is_still_the_old_one() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        let wall = 13_000_000_000;
+        reader.read(Some(Track {
+            timeline: Timeline::read(raw(0, 180, 170, wall), wall * SECOND, start),
+            ..track("Spotify.exe", "First", true, Some(COVER))
+        }));
+        info.sync(Some(&whole_system()), start);
+
+        let later = start + POLL_INTERVAL;
+        let refreshed = wall + 2;
+        reader.read(Some(Track {
+            timeline: Timeline::read(raw(0, 180, 170, refreshed), refreshed * SECOND, later),
+            ..track("Spotify.exe", "Second", true, Some(COVER))
+        }));
+        let sent = info
+            .sync(Some(&whole_system()), later)
+            .expect("the new track is sent");
+        assert_eq!(sent.progress, None);
+    }
+
+    // covers: S361
+    #[test]
+    fn stopping_clears_the_progress_with_the_rest() {
+        let reader = FakeReader::with_icon(ICON);
+        let mut info = track_info(&reader);
+        let start = Instant::now();
+        info.sync(Some(&whole_system()), start);
+        reader.read(Some(timed("Song", true, 30, 180, start)));
+        info.sync(Some(&whole_system()), start);
+        assert_eq!(info.sync(None, start), Some(NowPlaying::default()));
+    }
+
+    /// A fake JPEG encoder whose output grows with the pixel count, by
+    /// `per_pixel` bytes at full quality, and shrinks with the quality;
+    /// records each try.
+    fn encoder(
+        tries: &mut Vec<(u32, u32, f32)>,
+        per_pixel: f64,
+    ) -> impl FnMut(u32, u32, f32) -> Option<Vec<u8>> {
+        move |width, height, quality| {
+            tries.push((width, height, quality));
+            let bytes = f64::from(width * height) * f64::from(quality) * per_pixel;
+            Some(vec![0; bytes as usize])
+        }
+    }
+
+    /// Every quality at the first side, best first, then a smaller side of
+    /// the same shape: the quality goes down before the side does.
+    fn assert_quality_before_side(tries: &[(u32, u32, f32)], first: (u32, u32)) {
+        let at_first: Vec<_> = tries.iter().take_while(|t| (t.0, t.1) == first).collect();
+        assert_eq!(
+            at_first.iter().map(|t| t.2).collect::<Vec<_>>(),
+            JPEG_QUALITIES,
+            "{tries:?}"
+        );
+        let (width, height, _) = tries[at_first.len()];
+        // Each side is scaled on its own, so the shape holds to a pixel.
+        assert!(
+            width < first.0 && width.abs_diff(height * first.0 / first.1) <= 1,
+            "{tries:?}"
+        );
+    }
+
+    // covers: S272
+    #[test]
+    fn the_large_image_is_at_most_1024_px_a_side_and_128_kib() {
+        let mut tries = Vec::new();
+        let (jpeg, side) =
+            fit_jpeg(3000, 1500, LARGE_ARTWORK, &mut encoder(&mut tries, 1.0)).expect("it fits");
+        assert!(
+            jpeg.len() <= 128 * 1024 && side < 1024,
+            "{} bytes",
+            jpeg.len()
+        );
+        assert_quality_before_side(&tries, (1024, 512));
+    }
+
+    // covers: S272
+    #[test]
+    fn the_small_image_is_at_most_600_px_a_side_and_40_kib() {
+        let mut tries = Vec::new();
+        let (jpeg, side) =
+            fit_jpeg(3000, 1500, SMALL_ARTWORK, &mut encoder(&mut tries, 1.0)).expect("it fits");
+        assert!(
+            jpeg.len() <= 40 * 1024 && side < 600,
+            "{} bytes",
+            jpeg.len()
+        );
+        assert_quality_before_side(&tries, (600, 300));
+    }
+
+    // covers: S217, S272
+    #[test]
+    fn a_busy_cover_takes_a_lower_quality_before_a_smaller_side() {
+        let mut tries = Vec::new();
+        // At 0.65 it is over 128 KiB, at 0.5 just within.
+        let (jpeg, side) =
+            fit_jpeg(1024, 1024, LARGE_ARTWORK, &mut encoder(&mut tries, 0.25)).expect("it fits");
+        assert_eq!(side, 1024);
+        assert_eq!(tries, [(1024, 1024, 0.65), (1024, 1024, 0.5)]);
+        assert!(jpeg.len() <= LARGE_ARTWORK.bytes);
+    }
+
+    // covers: S272
+    #[test]
+    fn an_image_within_the_small_limits_is_one_encoding_for_both() {
+        let mut tries = Vec::new();
+        let artwork = fit_artwork(200, 100, encoder(&mut tries, 0.1)).expect("it fits");
+        assert_eq!(tries, [(200, 100, 0.65)], "a small image isn't scaled up");
+        assert!(Arc::ptr_eq(&artwork.large, &artwork.small));
+    }
+
+    // covers: S272
+    #[test]
+    fn a_larger_picture_gets_a_large_and_a_small_image() {
+        let mut tries = Vec::new();
+        let artwork = fit_artwork(3000, 1500, encoder(&mut tries, 0.1)).expect("it fits");
+        assert_eq!(
+            tries,
+            [(1024, 512, 0.65), (600, 300, 0.65), (720, 360, 0.65)]
+        );
+        assert!(artwork.large.len() > artwork.small.len());
+        assert!(artwork.small.len() <= SMALL_ARTWORK.bytes);
+    }
+
+    // covers: C53
+    #[test]
+    fn a_cast_device_gets_a_cover_of_up_to_720_px_and_256_kib() {
+        let mut tries = Vec::new();
+        let mut playing = track("Spotify.exe", "Song", true, None);
+        playing.artwork = fit_artwork(3000, 1500, encoder(&mut tries, 0.1));
+        let artwork = playing.artwork.clone().expect("it fits");
+        let cast = cast_track(Some(&playing), &Follow::AnyApp, None)
+            .artwork
+            .expect("a cover");
+        assert!(tries.contains(&(720, 360, 0.65)), "{tries:?}");
+        assert!(cast.len() <= 256 * 1024 && cast.len() > artwork.small.len());
+        assert!(tries.contains(&(600, 300, 0.65)));
+        assert!(artwork.small.len() <= SMALL_ARTWORK.bytes);
+    }
+
+    // covers: C53
+    #[test]
+    fn a_cast_cover_takes_the_large_bytes_only_when_they_are_full_size() {
+        let mut tries = Vec::new();
+        let fitted = fit_artwork(700, 700, encoder(&mut tries, 0.1)).expect("it fits");
+        assert_eq!(tries, [(700, 700, 0.65), (600, 600, 0.65)]);
+        assert!(Arc::ptr_eq(&fitted.cast, &fitted.large));
+
+        // Over 128 KiB at 1024 px even at 0.4, so the large image steps
+        // down below 720 px; Cast's 256 KiB still takes 720 px.
+        let mut tries = Vec::new();
+        let fitted = fit_artwork(2000, 2000, encoder(&mut tries, 0.7)).expect("it fits");
+        assert!(tries.contains(&(720, 720, 0.65)), "{tries:?}");
+        assert!(fitted.cast.len() > fitted.large.len());
+        assert!(fitted.cast.len() <= CAST_ARTWORK.bytes);
+    }
+
+    // covers: C53
+    #[test]
+    fn a_failed_cast_encode_falls_back_to_the_small_image() {
+        let fails_at_720 = |width: u32, height: u32, quality: f32| -> Option<Vec<u8>> {
+            (width != 720)
+                .then(|| vec![0; (f64::from(width * height) * f64::from(quality) * 0.1) as usize])
+        };
+        let fitted = fit_artwork(3000, 1500, fails_at_720).expect("it fits");
+        assert!(Arc::ptr_eq(&fitted.cast, &fitted.small));
+        assert!(fitted.large.len() > fitted.small.len());
+    }
+
+    // covers: S217
+    #[test]
+    fn artwork_that_never_fits_or_fails_to_encode_is_none() {
+        let too_big = |_, _, _| Some(vec![0; LARGE_ARTWORK.bytes + 1]);
+        assert_eq!(fit_artwork(500, 500, too_big), None);
+        assert_eq!(fit_artwork(500, 500, |_, _, _| None), None);
+        assert_eq!(fit_artwork(0, 500, |_, _, _| Some(Vec::new())), None);
+    }
+
+    // covers: S217
+    #[test]
+    fn a_tighter_byte_limit_gives_a_smaller_image_of_the_same_shape() {
+        let tight = ArtworkLimits {
+            side: 600,
+            bytes: 6060,
+        };
+        let (small, small_side) = fit_jpeg(
+            2000,
+            1000,
+            SMALL_ARTWORK,
+            &mut encoder(&mut Vec::new(), 1.0),
+        )
+        .expect("fits");
+        let mut tries = Vec::new();
+        let (jpeg, side) =
+            fit_jpeg(2000, 1000, tight, &mut encoder(&mut tries, 1.0)).expect("it fits");
+        assert!(jpeg.len() <= 6060 && jpeg.len() < small.len());
+        assert!(side < small_side && side <= 600);
+        let (width, height, _) = *tries.last().expect("tried");
+        assert_eq!(width.max(height), side);
+        assert!(
+            width.abs_diff(height * 2) <= 1,
+            "2:1 kept: {width}x{height}"
+        );
+    }
+
+    // covers: S217
+    #[test]
+    fn a_small_image_is_never_scaled_up() {
+        let mut tries = Vec::new();
+        let (_, side) =
+            fit_jpeg(50, 50, SMALL_ARTWORK, &mut encoder(&mut tries, 1.0)).expect("it fits");
+        assert_eq!(side, 50);
+        assert_eq!(tries, [(50, 50, JPEG_QUALITIES[0])]);
+    }
+
+    // covers: S217
+    #[test]
+    fn the_side_never_steps_below_64_px() {
+        let mut tries = Vec::new();
+        let never = |width: u32, height: u32, quality: f32| {
+            tries.push((width, height, quality));
+            Some(vec![0; SMALL_ARTWORK.bytes + 1])
+        };
+        assert_eq!(fit_jpeg(2000, 1000, SMALL_ARTWORK, &mut { never }), None);
+        let smallest = tries.iter().map(|t| t.0.max(t.1)).min();
+        assert_eq!(smallest, Some(SMALLEST_SIDE));
+        let last: Vec<f32> = tries.iter().rev().take(3).map(|t| t.2).rev().collect();
+        assert_eq!(last, JPEG_QUALITIES, "each quality at the smallest side");
+    }
+}

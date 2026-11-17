@@ -1,0 +1,83 @@
+[package]
+name = "audiosync-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-or-later"
+description = "Platform-independent audio core of AudioSync: delay ring buffer, drift correction, resampling, equalizer, volume and sync policy, plus the C interface of AudioSync's own AirPlay and Google Cast senders."
+repository = "https://github.com/yassersutojoyo/audiosync"
+publish = false
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+# CI only: adds asc_airplay_panic_probe (src/panic_probe.rs), a C entry that
+# panics inside an AirPlay sender call's guard, so a C program linked with
+# the prelinked release library proves the panic still stops there
+# (scripts/build_core.sh with AUDIOSYNC_CORE_PROBE=1, Tests/panic-probe.c).
+# The app's library never has it.
+ffi-panic-probe = []
+
+[dependencies]
+# AudioSync's own AirPlay sender (airplay/), reached by the macOS app
+# through this crate's C interface (src/ffi/airplay.rs): the app links one
+# Rust static library, so the sender comes in through the core's. Its
+# third-party crates are listed in THIRD_PARTY_NOTICES.md.
+audiosync-airplay = { path = "../airplay" }
+# AudioSync's own Google Cast sender (cast/), reached the same way (src/ffi/cast.rs).
+audiosync-cast = { path = "../cast" }
+# AudioSync's web remote (remote/), reached the same way (src/ffi/remote.rs).
+audiosync-remote = { path = "../remote" }
+# Wipes the pairing store's plaintext from memory (src/airplay_pairings.rs);
+# already in the tree through the AirPlay sender.
+zeroize = "1.8.1"
+
+[target.'cfg(unix)'.dependencies]
+# The current user's ID, to refuse a pairing file another account owns
+# (src/airplay_pairings.rs); already in the tree through the AirPlay sender.
+libc = "0.2.191"
+
+[dev-dependencies]
+criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1.11.0"
+# Reads the shared S290 volume vectors (tests/vectors/); already in the tree
+# through the Cast sender.
+serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "eq"
+harness = false
+
+[lints.clippy]
+# Both lints push std APIs (`as_chunks`, `is_multiple_of`) over the audio
+# code's `chunks_exact(2)` frame loops and `% n == 0` checks; moving those is a
+# change of its own.
+chunks_exact_to_as_chunks = "allow"
+manual_is_multiple_of = "allow"
+
+# Unwinding, so a bug in AudioSync's own AirPlay sender (a panic on one of
+# its threads, or in a call through its C interface) stops at the
+# asc_airplay_* boundary and becomes a failed sender the app restarts,
+# instead of ending the app (src/ffi/airplay.rs, "Panics"). Elsewhere:
+# - every other extern "C" function stops a panic at its boundary too and
+#   returns its failure value (src/ffi.rs, guard); one that slipped past
+#   would abort there, since Rust 1.81 (rust-version is above that);
+# - a panic on a thread the core spawns ends only that thread. The AirPlay
+#   transport's threads catch it and report a lost connection
+#   (airplay/src/transport.rs, spawn); Cast streaming and discovery and
+#   AirPlay pairing catch it too and report that worker's own failure
+#   (cast/src/worker.rs, airplay/src/homekit.rs), and a new thread should
+#   do the same.
+[profile.release]
+panic = "unwind"
+
+# The drift simulation plays two hours of audio per direction through the
+# ring; opt-level 1 runs it in about a second instead of half a minute and
+# keeps debug assertions and overflow checks on.
+[profile.test]
+opt-level = 1

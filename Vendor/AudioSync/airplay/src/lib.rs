@@ -1,0 +1,96 @@
+//! AudioSync's own AirPlay sender.
+//!
+//! Written from `docs/AIRPLAY_SPEC.md`; clause IDs (P1, P2, ...) in comments
+//! and test names refer to that document. Every protocol part is a plain
+//! state machine that takes bytes, events and the time in and gives bytes,
+//! actions and events out, so every step can be tested in-process without a
+//! network. Sockets, threads and the mDNS browser live in a thin layer on
+//! top ([`sender`]), which a host app drives.
+//!
+//! What is here so far:
+//!
+//! - [`discovery`]: DNS-SD records of `_raop._tcp` and `_airplay._tcp`, their
+//!   TXT keys, one merged description per device with its capabilities and
+//!   verdicts, and the choice of protocol path, codec and address.
+//! - [`rtsp`], [`sdp`], [`digest`]: RTSP/1.0 messages, the ANNOUNCE body and
+//!   RFC 2617 digest authentication.
+//! - [`secret`]: the password and PIN the host hands over, wiped from memory
+//!   when dropped and never printed.
+//! - [`session`]: the AirPlay 1 session from OPTIONS to TEARDOWN, with volume,
+//!   metadata and the error classification of section 10.
+//! - [`pairing`]: the Apple TV PIN pairing, the credentials it gives the
+//!   host, the pair-verify on later connections and the key of
+//!   `POST /auth-setup`, with SRP-6a ([`pairing::srp`]) and the AES,
+//!   Ed25519 and X25519 steps ([`pairing::keys`]) built on established
+//!   crypto crates.
+//! - [`stream`]: one audio stream to many speakers: the host's real-time
+//!   input ([`input`]), the format and payloads ([`audio`], [`alac`]), RTP,
+//!   sync, resend and timing packets ([`rtp`]) on the sender clock
+//!   ([`clock`]), the arrival model and send margin ([`rate`]) and the shared
+//!   payload stores ([`store`]), with per-speaker delay.
+//! - [`latency`]: the latency a receiver reports and the stream's Lf the
+//!   host derives from it.
+//! - [`sender`]: what a host app drives. It runs the state machines on the
+//!   crate's own threads with real sockets (TCP for RTSP, UDP for audio,
+//!   control and timing), browses the network with
+//!   [`discovery::mdns::MdnsBrowser`], reconnects lost speakers
+//!   ([`reconnect`]) and reports events and counters.
+//! - [`homekit`]: the HomeKit pairing of the AirPlay 2 path (TLV8, SRP-3072
+//!   with SHA-512, the HKDF and ChaCha20-Poly1305 steps), which only the
+//!   AirPlay 2 session uses.
+//!
+//! - [`dacp`]: remote control from the receiver: the DACP ID and
+//!   Active-Remote values, the `_dacp._tcp` record, and how the command
+//!   server reads and answers a receiver's HTTP commands.
+//! - [`ap2`]: the AirPlay 2 session from `GET /info` to TEARDOWN, with the
+//!   encrypted framing, the event connection and the `/feedback`
+//!   keep-alive, behind the hidden switch (P2), which is off by default
+//!   ([`sender::SenderConfig::airplay2`]). Its audio packets come later.
+
+pub mod alac;
+pub mod ap2;
+pub mod audio;
+pub mod clock;
+pub mod connects;
+pub mod dacp;
+pub mod digest;
+pub mod discovery;
+pub mod error;
+pub mod homekit;
+pub mod ids;
+pub mod input;
+pub mod latency;
+pub mod metadata;
+pub mod pairing;
+pub mod ptp;
+pub mod rate;
+pub mod reconnect;
+pub mod rtp;
+pub mod rtsp;
+pub mod sdp;
+pub mod secret;
+pub mod sender;
+pub mod session;
+pub mod store;
+pub mod stream;
+pub mod targets;
+mod transport;
+pub mod volume;
+
+/// The crate version, which the sender names itself with (P5).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The `User-Agent` value legacy AirPlay requests carry: `AudioSync/<version>` (P5,
+/// P22). The sender is this crate, so the version is the crate's.
+pub fn user_agent() -> String {
+    format!("AudioSync/{VERSION}")
+}
+
+#[cfg(test)]
+mod test_hooks {
+    thread_local! {
+        /// Makes `transport::spawn` on this thread fail, as when the system
+        /// has no thread to give.
+        pub(crate) static SPAWN_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+}

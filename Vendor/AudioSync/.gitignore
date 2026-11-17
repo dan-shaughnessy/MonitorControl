@@ -1,0 +1,45 @@
+# SwiftPM output
+.build/
+Package.resolved
+
+# The built app (./build.sh makes it)
+*.app
+
+# Release files (./make-dmg.sh and the release steps make them)
+*.dmg
+*.zip
+SHA256SUMS.txt
+appcast.xml
+dist/
+
+# Icon set folders (makeicon.sh builds its own in a temporary folder)
+*.iconset
+
+# Python bytecode (e.g. from CI's py_compile step run locally)
+__pycache__/
+
+# macOS
+.DS_Store
+
+# Editor and IDE folders
+*.xcodeproj
+.swiftpm/
+.vscode/
+
+# The debug log, when written inside the repository
+audiosync-debug.log
+
+# Credentials: this repository is public, and an accidental commit cannot be
+# undone.
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.der
+# The public Cast root certificates the sender trusts (CAST_SPEC C126).
+!cast/certs/*.der
+*_priv*
+.env
+.env.*
+credentials*
