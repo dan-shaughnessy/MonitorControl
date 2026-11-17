@@ -1,0 +1,5 @@
+# Clauses of docs/CAST_SPEC.md that only the host applies and that only host
+# tests this check doesn't read (core/, the Mac app) cover; each line names them.
+# A `// covers:` line in cast/src, cast/tests or desktop/src counts instead.
+# One per line: the clause ID, a space, the reason. tests/spec_coverage.rs
+# fails if a clause listed here gains a `// covers:` test.

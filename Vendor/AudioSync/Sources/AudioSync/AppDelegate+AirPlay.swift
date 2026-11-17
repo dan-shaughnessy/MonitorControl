@@ -1,0 +1,338 @@
+import AppKit
+
+// The AirPlay speaker list, the PIN or password prompt, Local Network access,
+// sleep and wake, and the track info AirPlay receivers show.
+
+extension AppDelegate {
+
+    // MARK: - The speaker list
+
+    /// At launch, after a wake, on Refresh Devices, when something falls due
+    /// (`scheduleDueReconcile`) and from the 30 s safety net (S101):
+    /// AudioSync's own sender starts (again after a failed start), a denied
+    /// Local Network answer is asked again, and the sender's speakers follow
+    /// the switches (`reconcileNativeAirPlay`). Nothing happens while the Mac
+    /// sleeps, or before the Local Network explanation got a Continue.
+    func reconcileAirPlaySpeakers(origin: StartOrigin = .automatic) {
+        guard !macAsleep else { return }
+        // The first discovery raises the Local Network prompt.
+        guard permissionAllows(.localNetwork, state: .unknown, origin: origin) else { return }
+        localNetworkProbe.recheckIfDenied()
+        reconcileNativeAirPlay()
+        reconcileCast()
+    }
+
+    // MARK: - PIN or password prompt
+
+    /// The PIN or password typed for `name`, or nil if the user cancelled.
+    /// Only reached right after the user turned the speaker on themselves
+    /// (see `NativeAirPlayModel`), so activating the app here answers their
+    /// click. `message` says what is asked for and why; `password` asks for a
+    /// password, otherwise for the PIN the receiver shows.
+    func runCodePrompt(name: String, password: Bool, message: String) -> String? {
+        menuBar?.close()   // the panel floats above alerts and would cover this one
+        NSApp.activate(ignoringOtherApps: true)
+        let (prompt, field) = makeCodePrompt(name: name, password: password, message: message)
+        // A password goes exactly as typed; a PIN loses stray spaces.
+        let code = { password ? field.stringValue : field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) }
+        // Pair, and Return with it, waits for a code the receiver can take.
+        let pair = prompt.buttons[0]
+        pair.isEnabled = false
+        let typing = NotificationCenter.default.addObserver(
+            forName: NSControl.textDidChangeNotification, object: field, queue: nil
+        ) { _ in
+            MainActor.assumeIsolated {
+                pair.isEnabled = password ? !code().isEmpty : NativeAirPlayModel.isPin(code())
+            }
+        }
+        codePromptWindow = prompt.window
+        defer {
+            NotificationCenter.default.removeObserver(typing)
+            codePromptWindow = nil
+            promptWithdrawal.ended()   // a close still pending would hit the next prompt
+            stopWatchingCodePromptKey()
+        }
+        // Closed by `closeCodePrompt`, it returns as cancelled.
+        guard prompt.runModal() == .alertFirstButtonReturn else { return nil }
+        return code()
+    }
+
+    /// The prompt for `name`, with `message` under its title, and the field
+    /// that takes the code. A password is masked; a PIN shows its digits as
+    /// typed, so they can be checked against the ones the receiver shows.
+    /// Pair is the default button, Cancel the other, and typing goes to the
+    /// field.
+    private func makeCodePrompt(name: String, password: Bool, message: String)
+        -> (alert: NSAlert, field: NSTextField) {
+        let frame = NSRect(x: 0, y: 0, width: 240, height: 24)
+        let field: NSTextField = password ? NSSecureTextField(frame: frame) : NSTextField(frame: frame)
+        field.placeholderString = password ? text.pairPasswordPlaceholder : text.pairPINOnlyPlaceholder
+        field.setAccessibilityLabel(password ? text.pairPasswordFieldLabel(name: name)
+                                             : text.pairPINFieldLabel(name: name))
+        let prompt = NSAlert()
+        prompt.messageText = text.pairTitle(name: name)
+        prompt.informativeText = message
+        prompt.accessoryView = field
+        prompt.addButton(withTitle: text.pair)
+        prompt.addButton(withTitle: text.cancel)
+        prompt.window.initialFirstResponder = field
+        return (prompt, field)
+    }
+
+    /// Closes the open PIN or password prompt as if it were cancelled, once
+    /// nothing waits for its answer. Only while it is the frontmost modal
+    /// window: another alert opened over it is never closed in its place.
+    /// Under such an alert the close waits (`PromptWithdrawal`) and runs as
+    /// soon as that alert ends: the prompt becoming key again, the moment it
+    /// could take an Enter, triggers a retry on the next pass of the run
+    /// loop, so the prompt never shows for a PIN that goes nowhere. A retry
+    /// a few times a second stays as the fallback for an end that makes no
+    /// window key (the app inactive). The main queue also runs while a
+    /// modal window is up, so both go on under the other alert.
+    func closeCodePrompt() {
+        closeWithdrawn(promptWithdrawal.withdraw(open: codePromptWindow != nil, frontmost: codePromptIsFrontmost))
+    }
+
+    private var codePromptIsFrontmost: Bool {
+        guard let window = codePromptWindow else { return false }
+        return NSApp.modalWindow === window
+    }
+
+    private func retryWithdrawal() -> PromptWithdrawal.Step {
+        promptWithdrawal.retry(open: codePromptWindow != nil, frontmost: codePromptIsFrontmost)
+    }
+
+    private func closeWithdrawn(_ step: PromptWithdrawal.Step) {
+        switch step {
+        case .close:
+            stopWatchingCodePromptKey()
+            NSApp.abortModal()   // not stopModal: this runs outside the prompt's own event handling
+        case .wait:
+            watchCodePromptKey()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self else { return }
+                self.closeWithdrawn(self.retryWithdrawal())
+            }
+        case .none:
+            stopWatchingCodePromptKey()
+        }
+    }
+
+    /// Retries a waiting close when the prompt becomes key again. The
+    /// notification can come while the other alert's modal session is still
+    /// being torn down, so the retry runs on the next pass of the run loop,
+    /// once that alert's `runModal` has returned. A retry that still has to
+    /// wait leaves the rescheduling to the fallback, so only one timed retry
+    /// chain runs.
+    private func watchCodePromptKey() {
+        guard codePromptKeyObserver == nil, let window = codePromptWindow else { return }
+        codePromptKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: window, queue: nil
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let step = self.retryWithdrawal()
+                if step != .wait { self.closeWithdrawn(step) }
+            }
+        }
+    }
+
+    private func stopWatchingCodePromptKey() {
+        guard let observer = codePromptKeyObserver else { return }
+        NotificationCenter.default.removeObserver(observer)
+        codePromptKeyObserver = nil
+    }
+}
+
+// MARK: - Local Network access
+
+extension AppDelegate {
+    /// Probe Local Network access only while the AirPlay sender runs: its
+    /// discovery raises the system prompt when it starts, and browsing before
+    /// then would raise it out of context.
+    func updateLocalNetworkProbe(senderRunning: Bool) {
+        if senderRunning {
+            if !localNetworkProbe.isRunning { localNetworkProbe.startBrowsing() }
+        } else if localNetworkProbe.isRunning {
+            localNetworkProbe.stopBrowsing()
+        }
+    }
+
+    /// Ask again (the user may have changed the setting), if the probe runs.
+    func recheckLocalNetwork() {
+        if localNetworkProbe.isRunning { localNetworkProbe.startBrowsing() }
+    }
+
+    /// `DiscoveryRestart.afterAllowed` after access turned allowed (S352).
+    func rebrowseIfNothingFound() {
+        let access = localNetworkProbe.access
+        if let native = nativeAirPlay,
+           DiscoveryRestart.due(access: access, found: !native.model.names.isEmpty) {
+            DebugTrace.log("[AudioSync] native AirPlay: nothing found since Local Network access was allowed, browsing afresh")
+            native.rebrowse()
+        }
+        if let cast = castSender,
+           DiscoveryRestart.due(access: access, found: castModel.devices.values.contains(where: { !$0.manual })) {
+            DebugTrace.log("[AudioSync] Cast: nothing found since Local Network access was allowed, browsing afresh")
+            cast.rebrowse()
+        }
+    }
+}
+
+// MARK: - Sleep and wake
+
+extension AppDelegate {
+    /// While the Mac sleeps, `reconcileAirPlaySpeakers` does nothing
+    /// (docs/EDGE_CASES.md, EC3); right after wake it runs at once, and the
+    /// local devices are listed again (S101).
+    func observeSleepAndWake() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            DebugTrace.log("[AudioSync] going to sleep")
+            guard let self else { return }
+            self.macAsleep = true
+            self.nativeAirPlay?.model.asleep = true
+            self.castModel.asleep = true
+            self.engine.macWillSleep()
+            for uid in self.freshLinks.sleeping() {
+                DebugTrace.log("[AudioSync] fresh link: restart of Bluetooth output \(uid) cancelled: the Mac slept")
+            }
+            self.endNativePinSessions(.sleep, streaming: self.engine.isRunning)
+        }
+        center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.wokeFromSleep()
+        }
+        // Should the wake notice go missing: the displays only come on in a full wake.
+        center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.macAsleep else { return }
+            self.wokeFromSleep()
+        }
+    }
+
+    private func wokeFromSleep() {
+        DebugTrace.log("[AudioSync] woke from sleep")
+        macAsleep = false
+        nativeAirPlay?.model.asleep = false
+        castModel.asleep = false
+        engine.macWoke()
+        let now = Date()
+        airplayEmptySince = AirPlaySearch.sinceAfterWake(airplayEmptySince, now: now)
+        castModel.discovery = castModel.discovery.afterWake(now: now)
+        if case .browsing = castModel.discovery {
+            DispatchQueue.main.asyncAfter(deadline: .now() + CastModel.noneFoundAfter + 0.5) { [weak self] in
+                self?.pushModel()
+            }
+        }
+        reconcileAirPlaySpeakers()
+        // Devices may have come or gone during the sleep. Its model update
+        // also arms again what fell due meanwhile (`scheduleDueReconcile`).
+        reconcileLocal(keepListed: true)
+    }
+}
+
+// MARK: - Track info on AirPlay receivers and Cast devices
+
+extension AppDelegate {
+    /// Streaming with an AirPlay speaker on: receivers with a screen show the
+    /// track, so Now Playing polls and its changes go to AudioSync's own
+    /// sender (`NativeAirPlay.setTrack`, `setArtwork`).
+    var sendsTrackInfo: Bool {
+        engine.isRunning && !playableAirPlay.isEmpty
+    }
+
+    /// With every model update: Now Playing polls the players while the window
+    /// or the menu bar panel shows it, while a paired phone may show it or
+    /// while AirPlay receivers or a Cast device show the track, and they get
+    /// everything once sending starts. The senders keep what was set and send
+    /// it to every speaker that starts.
+    func syncTrackInfo() {
+        let sending = sendsTrackInfo
+        let casting = sendsCastTrackInfo
+        let polling = nowPlayingOnScreen || panelOnScreen || sending || casting
+            || webRemote?.showsNowPlaying == true
+        if polling != nowPlaying.isRunning {
+            if polling {
+                updateNowPlayingTarget()
+                nowPlaying.startWatching()
+            } else {
+                nowPlaying.stopWatching()
+                sendPlayback()
+                nativeAirPlay?.clearPause()
+            }
+        }
+        trackInfoModelUpdated(sending: sending, casting: casting)
+    }
+
+    /// Tells the native sender which player a speaker's remote controls and
+    /// whether it plays (S274).
+    func sendPlayback() {
+        let playback = controlledPlayback
+        nativeAirPlay?.setPlayback(app: playback.app, playing: playback.playing)
+    }
+
+    /// The player the now-playing control drives, and whether the reading
+    /// shows it playing; nil without a reading of it.
+    var controlledPlayback: (app: String?, playing: Bool?) {
+        let controlled = nowPlaying.controlledBundleID
+        let reading = nowPlaying.hasReading ? nowPlaying.track : nil
+        return (controlled, reading.flatMap { $0.bundleID == controlled ? $0.isPlaying : nil })
+    }
+
+    /// A transport control from a speaker's remote or the window's buttons
+    /// goes to the player; a play-pause to a player read as playing pauses
+    /// the speakers too, so their buffer drops at once (P213).
+    func sendTransport(_ command: NowPlayingMonitor.Command) {
+        if command == .playPause {
+            let playback = controlledPlayback
+            nativeAirPlay?.togglePause(app: playback.app, playing: playback.playing)
+        }
+        nowPlaying.send(command)
+    }
+
+    /// A reading of the players that started at `startedAt` (P213), with
+    /// the player's state as the pause reads it.
+    func nowPlayingRead(startedAt: Date) {
+        let controlled = nowPlaying.controlledBundleID
+        let reading = nowPlaying.hasReading ? nowPlaying.track : nil
+        let playing = reading.flatMap { $0.bundleID == controlled ? $0.playerState : nil }
+        nativeAirPlay?.readPause(app: controlled, playing: playing, startedAt: startedAt,
+                                 sending: sendsTrackInfo)
+    }
+
+    func receiverShows() -> (info: ReceiverInfo, artwork: NSImage?) {
+        let track = nowPlaying.hasReading ? nowPlaying.track : nil
+        let sourceName = chosenSourceName()
+        let untitled = TrackMetadata.Fields(title: text.receiverUntitled, artist: text.receiverUnnamedSource,
+                                            album: text.receiverAlbum)
+        let info = ReceiverInfo.decide(track: track, source: audioSource, sourceName: sourceName,
+                                       untitled: untitled, lastPlayed: nowPlaying.lastPlayedBundleID)
+        return (info, track?.artwork)
+    }
+
+    /// Runs `sendTrackInfo` again at `date`, when a wait ends.
+    func recheckTrackInfo(at date: Date) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, date.timeIntervalSinceNow) + 0.05) { [weak self] in
+            self?.trackInfoRecheckFired(at: date)
+        }
+    }
+}
+
+extension AppDelegate: TrackInfoHost {
+    var nowPlayingPollingSince: Date? { nowPlaying.startedAt }
+    var nowPlayingHasReading: Bool { nowPlaying.hasReading }
+    var trackInfoIcon: NSImage? { NSApp.applicationIconImage }
+    var castTrackInfoFeed: TrackInfoFeed? {
+        get { castSender?.trackInfo }
+        set { if let newValue { castSender?.trackInfo = newValue } }
+    }
+
+    func showNowPlaying(_ track: NowPlayingMonitor.Track?) {
+        if appModel.nowPlaying != track { appModel.nowPlaying = track }
+    }
+
+    func setSenderTrackInfo(fields: TrackMetadata.Fields?, artwork: NSImage?, sendsPosition: Bool,
+                            position: NowPlayingMonitor.Position?) {
+        nativeAirPlay?.setTrackInfo(fields: fields, artwork: artwork, sendsPosition: sendsPosition,
+                                    position: position)
+    }
+}

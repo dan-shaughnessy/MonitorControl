@@ -77,6 +77,7 @@ final class AutomationController {
   func update(_ newConfig: CompanionConfig) throws {
     try self.store.save(newConfig)
     self.config = newConfig
+    NotificationCenter.default.post(name: Notification.Name("desk.pause"), object: nil)
     self.configError = nil
     if self.started { self.applyCurrentConfig(reason: "settings saved") } else if newConfig.enabled { self.start() }
   }
@@ -86,6 +87,7 @@ final class AutomationController {
     c.enabled = enabled
     try self.store.save(c)
     self.config = c
+    NotificationCenter.default.post(name: Notification.Name("desk.pause"), object: nil)
     self.cancelDecisionTimer()
     self.policy.baseline(self.observed)
     self.syncGeneration()
@@ -228,7 +230,12 @@ final class AutomationController {
       DispatchQueue.main.async {
         let text: String
         switch result {
-        case let .sent(attempts): text = "\(source.title) command sent (attempt \(attempts); monitor does not confirm)"
+        case let .sent(attempts):
+          if self.policy.generation == generation, config.protocolValue != .standard {
+            let owner = source.value == 0x90 ? "resml" : (source.value == 0xD1 ? "personal" : "")
+            if !owner.isEmpty { NotificationCenter.default.post(name: Notification.Name("desk.inputRequested"), object: nil, userInfo: ["source": owner]) }
+          }
+          text = "\(source.title) command sent (attempt \(attempts); monitor does not confirm)"
         case let .failed(attempts): text = "\(source.title) command failed after \(attempts) attempts"
         case .displayUnavailable: text = "\(source.title) not sent: monitor not found"
         case .superseded: text = "\(source.title) cancelled: keyboard state changed"
@@ -268,7 +275,12 @@ final class AutomationController {
     self.decisionTimer = nil
   }
 
+  private var lastDeskGeneration: Int?
   private func syncGeneration() {
+    if self.lastDeskGeneration != self.policy.generation {
+      self.lastDeskGeneration = self.policy.generation
+      NotificationCenter.default.post(name: Notification.Name("desk.cancelPending"), object: nil)
+    }
     self.executor.setCurrentGeneration(self.policy.generation)
   }
 }

@@ -1,0 +1,1009 @@
+//! A fake AirPlay 1 receiver on real sockets, for the transport tests: an
+//! RTSP server (answered by the sans-I/O [`FakeReceiver`]) and UDP audio,
+//! control and timing sockets, all bound to port 0 on a loopback address
+//! and served by threads of their own. It logs everything the sender sends
+//! and can send timing and retransmission requests, close the connection
+//! mid-stream, turn connections away, and probe the sender's timing socket
+//! while SETUP waits for its answer. Also: a host thread that writes
+//! numbered audio in real time, and helpers to read play times out of what
+//! a receiver got.
+
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use audiosync_airplay::audio::read_pcm_payload;
+use audiosync_airplay::clock::{NtpTime, SenderClock};
+use audiosync_airplay::discovery::{
+    Device, DeviceId, DeviceKey, ScopedAddr, ServiceKind, ServiceRecord,
+};
+use audiosync_airplay::input::InputWriter;
+use audiosync_airplay::ptp::{PtpPorts, service_bind_ip};
+use audiosync_airplay::rtp::{
+    HEADER_BYTES, ResendRequest, RtpHeader, SyncPacket, TYPE_RESEND_REPLY, TimingPacket,
+};
+use audiosync_airplay::rtsp::{Message, Method, Parser, Request, TransportPorts};
+use audiosync_airplay::sender::{Sender, SenderEvent, SpeakerEvent, SpeakerState};
+
+use super::{FakeReceiver, PasswordGate, key};
+
+pub const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+/// How often the receiver's RTSP and timing threads look at their stop
+/// flags.
+const POLL: Duration = Duration::from_millis(10);
+
+/// Serializes the network tests of one test binary, so their real-time
+/// threads don't compete for a small CI runner's cores.
+pub fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Two PTP ports below every ephemeral range: a released ephemeral port can go to a
+/// later `[::1]` socket, which on macOS fails the service's `[::]` bind after a family move.
+pub fn free_ptp_ports() -> PtpPorts {
+    const FIRST: u16 = 20_000;
+    const COUNT: u16 = 12_000;
+    static CURSOR: Mutex<Option<u16>> = Mutex::new(None);
+    let mut cursor = CURSOR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Spread over the range so test binaries run side by side rarely meet.
+    let mut offset = cursor.unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        ((nanos ^ std::process::id()) % u32::from(COUNT)) as u16
+    });
+    let mut next_free = || {
+        for _ in 0..COUNT {
+            let port = FIRST + offset;
+            offset = (offset + 1) % COUNT;
+            if port_free(port) {
+                return port;
+            }
+        }
+        panic!("no free port in {FIRST}..{}", FIRST + COUNT);
+    };
+    let event = next_free();
+    let general = next_free();
+    *cursor = Some(offset);
+    PtpPorts { event, general }
+}
+
+/// The IPv4 address the sender's PTP service binds, which the port checks
+/// and holders use too.
+pub fn ptp_bind_v4() -> IpAddr {
+    service_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+/// One family after the other, since a dual-stack IPv6 bind takes the IPv4 port too.
+fn port_free(port: u16) -> bool {
+    if UdpSocket::bind((ptp_bind_v4(), port)).is_err() {
+        return false;
+    }
+    match UdpSocket::bind((service_bind_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)), port)) {
+        Ok(_) => true,
+        Err(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+        ),
+    }
+}
+
+/// How the receiver behaves; changeable while it runs.
+#[derive(Debug, Clone)]
+pub struct Behavior {
+    pub gate: Option<PasswordGate>,
+    /// Status codes by request key, as `FakeReceiver::status`.
+    pub status: HashMap<String, u16>,
+    /// A request key never answered, as `FakeReceiver::silent`.
+    pub silent: Option<String>,
+    /// While SETUP waits for its answer, send a timing request to the port
+    /// it names and wait for the reply.
+    pub probe: bool,
+    /// Send timing requests this often once RECORD was answered.
+    pub timing_interval: Option<Duration>,
+    /// Accept and at once close this many of the next connections.
+    pub reject: usize,
+    /// After answering the first request with this key, stop reading the
+    /// connection (but keep it open), as a receiver that hangs.
+    pub deaf_after: Option<String>,
+    /// An Apple TV that answers pairing and pair-verify (shared across
+    /// connections).
+    pub apple_tv: Option<super::atv::FakeAppleTv>,
+    /// Close the connection right after answering the first request with
+    /// this key.
+    pub close_after: Option<String>,
+    /// Close the connection right after answering the second pair-verify
+    /// step, on this many connections (P58).
+    pub close_after_verify: usize,
+    /// Timing requests carry this sequence number instead of counting up,
+    /// and from the second on fill origin and receive with the previous
+    /// exchange's values, as some receivers do (P90).
+    pub timing_quirks: Option<u16>,
+    /// The `Public` header of the OPTIONS answer, in place of the full
+    /// method list (P27).
+    pub public: Option<String>,
+    /// Requests answered only after this long, by key; read per request,
+    /// so a test may change it mid-session.
+    pub answer_delay: HashMap<String, Duration>,
+}
+
+impl Default for Behavior {
+    fn default() -> Behavior {
+        Behavior {
+            gate: None,
+            status: HashMap::new(),
+            silent: None,
+            probe: true,
+            timing_interval: Some(Duration::from_millis(500)),
+            reject: 0,
+            deaf_after: None,
+            apple_tv: None,
+            close_after: None,
+            close_after_verify: 0,
+            timing_quirks: None,
+            public: None,
+            answer_delay: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioPacket {
+    pub at: Instant,
+    pub from: SocketAddr,
+    pub header: RtpHeader,
+    pub payload: Vec<u8>,
+}
+
+/// What the receiver saw of one SETUP.
+#[derive(Debug, Clone)]
+pub struct SetupSeen {
+    pub peer: SocketAddr,
+    pub control_port: u16,
+    pub timing_port: u16,
+    /// Where the probe's reply came from, if it came within 2 s.
+    pub probe_reply_from: Option<SocketAddr>,
+}
+
+/// One timing exchange the receiver started.
+#[derive(Debug, Clone)]
+pub struct TimingSeen {
+    pub request_transmit: NtpTime,
+    pub reply: TimingPacket,
+    pub from: SocketAddr,
+    /// When the request left and when the reply arrived (P91).
+    pub sent_at: Instant,
+    pub replied_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub struct Log {
+    pub requests: Vec<(Instant, Request)>,
+    /// When each connection was accepted (rejected ones included).
+    pub connections: Vec<Instant>,
+    pub audio: Vec<AudioPacket>,
+    pub syncs: Vec<(Instant, SocketAddr, SyncPacket)>,
+    pub resends: Vec<(Instant, Vec<u8>)>,
+    pub timing: Vec<TimingSeen>,
+    pub setups: Vec<SetupSeen>,
+    /// When the receiver saw a connection closed by the sender.
+    pub closed: Vec<Instant>,
+}
+
+impl Log {
+    pub fn keys(&self) -> Vec<String> {
+        self.requests
+            .iter()
+            .map(|(_, request)| key(request))
+            .collect()
+    }
+
+    pub fn count(&self, wanted: &str) -> usize {
+        self.keys().iter().filter(|key| *key == wanted).count()
+    }
+
+    pub fn last(&self, wanted: &str) -> Option<&Request> {
+        self.requests
+            .iter()
+            .rev()
+            .map(|(_, request)| request)
+            .find(|request| key(request) == wanted)
+    }
+}
+
+/// The sender's sockets of the session in progress, from its SETUP.
+#[derive(Debug, Clone, Copy)]
+struct SenderPorts {
+    control: SocketAddr,
+    timing: SocketAddr,
+    /// Timing requests go out only after RECORD was answered.
+    recording: bool,
+}
+
+struct Shared {
+    ip: IpAddr,
+    log: Mutex<Log>,
+    behavior: Mutex<Behavior>,
+    stop: AtomicBool,
+    /// Set by `close_udp`: the audio and control sockets close.
+    udp_closed: AtomicBool,
+    /// Bumped by `kill`: the connection being served closes.
+    generation: AtomicU64,
+    sender: Mutex<Option<SenderPorts>>,
+    audio_port: u16,
+    control_port: u16,
+    timing_port: u16,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Waits for the sender's bytes in a peek: on Windows a read that times out
+/// as bytes land can drop them (core/NOTES.md, `SO_RCVTIMEO`).
+pub fn read_queued(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    const ERROR_IO_PENDING: i32 = 997;
+    match stream.peek(buf) {
+        Ok(0) => Ok(0),
+        Ok(_) => stream.read(buf),
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(ERROR_IO_PENDING) => {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `read_queued` for a datagram: a peek that times out leaves it queued.
+pub fn recv_queued(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    const ERROR_IO_PENDING: i32 = 997;
+    match socket.peek_from(buf) {
+        Ok(_) => socket.recv_from(buf),
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(ERROR_IO_PENDING) => {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub struct NetReceiver {
+    pub address: SocketAddr,
+    shared: Arc<Shared>,
+    control: Mutex<Option<Arc<UdpSocket>>>,
+    /// The audio and control sockets, which `wake_udp` reaches.
+    udp_addresses: [SocketAddr; 2],
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl NetReceiver {
+    /// A receiver on 127.0.0.1.
+    pub fn start(behavior: Behavior) -> NetReceiver {
+        NetReceiver::start_at(LOOPBACK, behavior).expect("a loopback receiver")
+    }
+
+    /// A receiver on `ip`, every socket on an ephemeral port.
+    pub fn start_at(ip: IpAddr, behavior: Behavior) -> std::io::Result<NetReceiver> {
+        let listener = TcpListener::bind(SocketAddr::new(ip, 0))?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        // Audio and control block without a timeout: on Windows a timed
+        // receive loses a datagram that lands as the timeout expires.
+        let udp = |timeout: Option<Duration>| -> std::io::Result<UdpSocket> {
+            let socket = UdpSocket::bind(SocketAddr::new(ip, 0))?;
+            socket.set_read_timeout(timeout)?;
+            Ok(socket)
+        };
+        let audio = udp(None)?;
+        let control = Arc::new(udp(None)?);
+        let timing = udp(Some(POLL))?;
+        let udp_addresses = [audio.local_addr()?, control.local_addr()?];
+        let shared = Arc::new(Shared {
+            ip,
+            log: Mutex::new(Log::default()),
+            behavior: Mutex::new(behavior),
+            stop: AtomicBool::new(false),
+            udp_closed: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            sender: Mutex::new(None),
+            audio_port: audio.local_addr()?.port(),
+            control_port: control.local_addr()?.port(),
+            timing_port: timing.local_addr()?.port(),
+        });
+        let mut threads = Vec::new();
+        let s = shared.clone();
+        threads.push(thread::spawn(move || accept_loop(s, listener)));
+        let s = shared.clone();
+        threads.push(thread::spawn(move || audio_loop(s, audio)));
+        let (s, socket) = (shared.clone(), control.clone());
+        threads.push(thread::spawn(move || control_loop(s, socket)));
+        let s = shared.clone();
+        threads.push(thread::spawn(move || timing_loop(s, timing)));
+        Ok(NetReceiver {
+            address,
+            shared,
+            control: Mutex::new(Some(control)),
+            udp_addresses,
+            threads,
+        })
+    }
+
+    /// The RAOP record of this receiver as discovery would resolve it, with
+    /// these TXT strings.
+    pub fn record(&self, id: u8, txt: &[&str]) -> ServiceRecord {
+        let device_id = DeviceId([0x02, 0x00, 0x5E, 0x00, 0x53, id]);
+        ServiceRecord {
+            kind: ServiceKind::Raop,
+            instance: format!("{device_id}@Speaker {id}"),
+            host: format!("speaker-{id}.local"),
+            port: self.address.port(),
+            txt: txt.iter().map(|s| s.as_bytes().to_vec()).collect(),
+            addresses: vec![ScopedAddr::new(self.shared.ip)],
+        }
+    }
+
+    /// A device whose RAOP service is this receiver, with these TXT strings.
+    pub fn device(&self, id: u8, txt: &[&str]) -> Device {
+        let device_id = DeviceId([0x02, 0x00, 0x5E, 0x00, 0x53, id]);
+        let record = self.record(id, txt);
+        Device::from_records(DeviceKey::Id(device_id), Some(&record), None).expect("device")
+    }
+
+    pub fn log(&self) -> MutexGuard<'_, Log> {
+        lock(&self.shared.log)
+    }
+
+    pub fn behavior(&self) -> MutexGuard<'_, Behavior> {
+        lock(&self.shared.behavior)
+    }
+
+    /// Closes the connection being served, as a receiver that goes away
+    /// mid-stream; timing requests stop until the next session.
+    pub fn kill(&self) {
+        *lock(&self.shared.sender) = None;
+        self.shared.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Asks the sender to resend `count` packets from `first` (P86).
+    pub fn request_resend(&self, first: u16, count: u16) {
+        let Some(ports) = *lock(&self.shared.sender) else {
+            return;
+        };
+        let request = ResendRequest {
+            seq: 1,
+            first,
+            count,
+        };
+        if let Some(control) = lock(&self.control).as_ref() {
+            let _ = control.send_to(&request.encode(), ports.control);
+        }
+    }
+
+    /// Closes the audio and control sockets while the RTSP connection and
+    /// the timing exchange go on, so the sender's datagrams meet closed
+    /// ports.
+    pub fn close_udp(&self) {
+        lock(&self.control).take();
+        self.shared.udp_closed.store(true, Ordering::SeqCst);
+        self.wake_udp();
+    }
+
+    /// Sends an empty datagram to the audio and control sockets, so their
+    /// blocked receives return and the threads see the flags.
+    fn wake_udp(&self) {
+        let Ok(socket) = UdpSocket::bind(SocketAddr::new(self.shared.ip, 0)) else {
+            return;
+        };
+        for address in self.udp_addresses {
+            let _ = socket.send_to(&[], address);
+        }
+    }
+}
+
+impl Drop for NetReceiver {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        self.wake_udp();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
+    let mut connections = Vec::new();
+    while !shared.stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                lock(&shared.log).connections.push(Instant::now());
+                let reject = {
+                    let mut behavior = lock(&shared.behavior);
+                    let reject = behavior.reject > 0;
+                    behavior.reject = behavior.reject.saturating_sub(1);
+                    reject
+                };
+                if reject {
+                    drop(stream);
+                    continue;
+                }
+                let s = shared.clone();
+                connections.push(thread::spawn(move || serve(s, stream, peer)));
+            }
+            Err(_) => thread::sleep(POLL),
+        }
+    }
+    for connection in connections {
+        let _ = connection.join();
+    }
+}
+
+/// Serves one RTSP connection until the sender closes it, `kill` or stop.
+fn serve(shared: Arc<Shared>, mut stream: TcpStream, peer: SocketAddr) {
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(POLL));
+    let mut fake = FakeReceiver::new();
+    {
+        let behavior = lock(&shared.behavior);
+        fake.gate = behavior.gate.clone();
+        fake.status = behavior.status.clone();
+        fake.silent = behavior.silent.clone();
+        fake.apple_tv = behavior.apple_tv.clone();
+        if let Some(public) = &behavior.public {
+            fake.public = Some(public.clone());
+        }
+    }
+    fake.transport = format!(
+        "RTP/AVP/UDP;unicast;mode=record;server_port={};control_port={};timing_port={}",
+        shared.audio_port, shared.control_port, shared.timing_port
+    );
+    let deaf_after = lock(&shared.behavior).deaf_after.clone();
+    let close_after = lock(&shared.behavior).close_after.clone();
+    let mut deaf = false;
+    let mut parser = Parser::new();
+    let mut buf = [0u8; 8192];
+    let closed = |shared: &Shared| lock(&shared.log).closed.push(Instant::now());
+    loop {
+        if shared.stop.load(Ordering::SeqCst)
+            || shared.generation.load(Ordering::SeqCst) != generation
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        if deaf {
+            thread::sleep(POLL);
+            continue;
+        }
+        match read_queued(&mut stream, &mut buf) {
+            Ok(0) => return closed(&shared),
+            Ok(len) => {
+                parser.push(&buf[..len]);
+                while let Ok(Some(message)) = parser.next_message() {
+                    let Message::Request(request) = message else {
+                        continue;
+                    };
+                    lock(&shared.log)
+                        .requests
+                        .push((Instant::now(), request.clone()));
+                    if request.method == Method::Setup {
+                        on_setup(&shared, &request, peer);
+                    }
+                    let answer = fake.feed(&request.encode());
+                    let delay = lock(&shared.behavior)
+                        .answer_delay
+                        .get(&key(&request))
+                        .copied();
+                    if let Some(delay) = delay {
+                        thread::sleep(delay);
+                    }
+                    if !answer.is_empty() && stream.write_all(&answer).is_err() {
+                        return closed(&shared);
+                    }
+                    if close_after.as_deref() == Some(key(&request).as_str()) {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return closed(&shared);
+                    }
+                    let second_verify =
+                        request.uri == "/pair-verify" && request.body.starts_with(&[0, 0, 0, 0]);
+                    if second_verify {
+                        let mut behavior = lock(&shared.behavior);
+                        if behavior.close_after_verify > 0 {
+                            behavior.close_after_verify -= 1;
+                            drop(behavior);
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            return closed(&shared);
+                        }
+                    }
+                    if deaf_after.as_deref() == Some(key(&request).as_str()) {
+                        deaf = true;
+                        break;
+                    }
+                    match request.method {
+                        Method::Record => {
+                            if let Some(ports) = lock(&shared.sender).as_mut() {
+                                ports.recording = true;
+                            }
+                        }
+                        Method::Teardown => *lock(&shared.sender) = None,
+                        _ => {}
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return closed(&shared),
+        }
+    }
+}
+
+/// Notes the sender's ports and, when asked, checks that its timing socket
+/// answers before SETUP is answered (P31).
+fn on_setup(shared: &Shared, request: &Request, peer: SocketAddr) {
+    let ports = request
+        .headers
+        .get("Transport")
+        .map(TransportPorts::parse)
+        .unwrap_or_default();
+    let control_port = ports.control_port.unwrap_or(0);
+    let timing_port = ports.timing_port.unwrap_or(0);
+    let timing = SocketAddr::new(peer.ip(), timing_port);
+    let probe = lock(&shared.behavior).probe;
+    let probe_reply_from = probe.then(|| probe_timing(shared.ip, timing)).flatten();
+    lock(&shared.log).setups.push(SetupSeen {
+        peer,
+        control_port,
+        timing_port,
+        probe_reply_from,
+    });
+    *lock(&shared.sender) = Some(SenderPorts {
+        control: SocketAddr::new(peer.ip(), control_port),
+        timing,
+        recording: false,
+    });
+}
+
+/// Sends a timing request from a socket of its own and waits up to 2 s for
+/// the reply.
+fn probe_timing(ip: IpAddr, to: SocketAddr) -> Option<SocketAddr> {
+    let socket = UdpSocket::bind(SocketAddr::new(ip, 0)).ok()?;
+    socket.set_read_timeout(Some(POLL)).ok()?;
+    let request = TimingPacket {
+        reply: false,
+        seq: 7,
+        origin: NtpTime(0),
+        receive: NtpTime(0),
+        transmit: NtpTime(0x1234_5678_9ABC_DEF0),
+    };
+    socket.send_to(&request.encode(), to).ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buf = [0u8; 64];
+    while Instant::now() < deadline {
+        if let Ok((len, from)) = recv_queued(&socket, &mut buf) {
+            let reply = TimingPacket::parse(&buf[..len])?;
+            if reply.reply && reply.seq == 7 {
+                return Some(from);
+            }
+        }
+    }
+    None
+}
+
+fn audio_loop(shared: Arc<Shared>, socket: UdpSocket) {
+    let mut buf = [0u8; 2048];
+    while !shared.stop.load(Ordering::SeqCst) && !shared.udp_closed.load(Ordering::SeqCst) {
+        let Ok((len, from)) = socket.recv_from(&mut buf) else {
+            continue;
+        };
+        let Some(header) = RtpHeader::parse(&buf[..len]) else {
+            continue;
+        };
+        lock(&shared.log).audio.push(AudioPacket {
+            at: Instant::now(),
+            from,
+            header,
+            payload: buf[HEADER_BYTES..len].to_vec(),
+        });
+    }
+}
+
+fn control_loop(shared: Arc<Shared>, socket: Arc<UdpSocket>) {
+    let mut buf = [0u8; 2048];
+    while !shared.stop.load(Ordering::SeqCst) && !shared.udp_closed.load(Ordering::SeqCst) {
+        let Ok((len, from)) = socket.recv_from(&mut buf) else {
+            continue;
+        };
+        let at = Instant::now();
+        if let Some(sync) = SyncPacket::parse(&buf[..len]) {
+            lock(&shared.log).syncs.push((at, from, sync));
+        } else if len > 1 && buf[1] == TYPE_RESEND_REPLY {
+            lock(&shared.log).resends.push((at, buf[..len].to_vec()));
+        }
+    }
+}
+
+/// Sends timing requests to the sender while a session records, and logs
+/// the replies (P90, P91).
+fn timing_loop(shared: Arc<Shared>, socket: UdpSocket) {
+    let mut buf = [0u8; 64];
+    let mut seq: u16 = 0;
+    let mut last_sent: Option<Instant> = None;
+    // (sequence number, transmit time, when it left) of each request.
+    let mut pending: Vec<(u16, NtpTime, Instant)> = Vec::new();
+    let mut previous: Option<(NtpTime, NtpTime)> = None;
+    while !shared.stop.load(Ordering::SeqCst) {
+        let (interval, quirks) = {
+            let behavior = lock(&shared.behavior);
+            (behavior.timing_interval, behavior.timing_quirks)
+        };
+        let ports = *lock(&shared.sender);
+        if let (Some(interval), Some(ports)) = (interval, ports) {
+            let due = last_sent.is_none_or(|at| at.elapsed() >= interval);
+            if ports.recording && due {
+                seq = seq.wrapping_add(1);
+                let transmit = NtpTime(0x0102_0304_0000_0000 + u64::from(seq));
+                // Some receivers fill origin and receive with the previous
+                // exchange and keep the sequence field fixed (P90).
+                let (origin, receive) = match (quirks, previous) {
+                    (Some(_), Some(previous)) => previous,
+                    _ => (NtpTime(0), NtpTime(0)),
+                };
+                let request = TimingPacket {
+                    reply: false,
+                    seq: quirks.unwrap_or(seq),
+                    origin,
+                    receive,
+                    transmit,
+                };
+                let mut bytes = request.encode();
+                if quirks.is_some() {
+                    bytes[4..8].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+                }
+                let sent_at = Instant::now();
+                if socket.send_to(&bytes, ports.timing).is_ok() {
+                    pending.push((request.seq, transmit, sent_at));
+                }
+                last_sent = Some(sent_at);
+            }
+        }
+        let Ok((len, from)) = socket.recv_from(&mut buf) else {
+            continue;
+        };
+        let replied_at = Instant::now();
+        let Some(reply) = TimingPacket::parse(&buf[..len]) else {
+            continue;
+        };
+        // A fixed sequence field can't tell requests apart; the copied
+        // origin can.
+        let found = pending.iter().position(|&(seq, transmit, _)| {
+            if quirks.is_some() {
+                reply.origin == transmit
+            } else {
+                reply.seq == seq
+            }
+        });
+        if let Some(index) = found {
+            let (_, request_transmit, sent_at) = pending.remove(index);
+            previous = Some((
+                reply.transmit,
+                NtpTime(0x0A0B_0C0D_0000_0000 + u64::from(seq)),
+            ));
+            lock(&shared.log).timing.push(TimingSeen {
+                request_transmit,
+                reply,
+                from,
+                sent_at,
+                replied_at,
+            });
+        }
+    }
+}
+
+/// Polls `condition` every 10 ms until it holds or `timeout` passes.
+pub fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(POLL);
+    }
+}
+
+/// A probe wake later than this means the process went unscheduled; a
+/// coarse timer oversleeps 1 ms by up to 15.6 ms (Windows).
+const STALL: Duration = Duration::from_millis(20);
+
+/// Wakes every millisecond until stopped and returns when it woke, so a gap
+/// the whole process spent unscheduled on a loaded host can be told from a
+/// stall the sender caused, which leaves the probe on time.
+pub fn scheduling_probe(stop: Arc<AtomicBool>) -> JoinHandle<Vec<Instant>> {
+    thread::spawn(move || {
+        let mut wakes = vec![Instant::now()];
+        while !stop.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+            wakes.push(Instant::now());
+        }
+        wakes
+    })
+}
+
+/// How much of `from..to` fell in probe waits longer than `STALL`.
+pub fn unscheduled(wakes: &[Instant], from: Instant, to: Instant) -> Duration {
+    wakes
+        .windows(2)
+        .filter(|wait| wait[1].duration_since(wait[0]) > STALL)
+        .map(|wait| wait[1].min(to).saturating_duration_since(wait[0].max(from)))
+        .sum()
+}
+
+/// The most of any `width` starting in `from..to` that fell in probe waits
+/// longer than `STALL`.
+pub fn busiest(wakes: &[Instant], from: Instant, to: Instant, width: Duration) -> Duration {
+    wakes
+        .windows(2)
+        .filter(|wait| wait[1].duration_since(wait[0]) > STALL && (from..to).contains(&wait[0]))
+        .map(|wait| unscheduled(wakes, wait[0], wait[0] + width))
+        .chain([unscheduled(wakes, from, from + width)])
+        .max()
+        .unwrap_or_default()
+}
+
+/// Fails on `what`, which took from `from` to `to`: as inconclusive when the
+/// probe saw the process unscheduled for over half of that time.
+pub fn fail_judged(
+    stop: &AtomicBool,
+    probe: JoinHandle<Vec<Instant>>,
+    from: Instant,
+    to: Instant,
+    what: &str,
+) -> ! {
+    stop.store(true, Ordering::SeqCst);
+    let wakes = probe.join().expect("the probe");
+    let span = to.saturating_duration_since(from);
+    let starved = unscheduled(&wakes, from, to);
+    assert!(
+        starved * 2 <= span,
+        "inconclusive: {what}, the process went unscheduled for {starved:?} of {span:?}"
+    );
+    panic!("{what}, {starved:?} of {span:?} unscheduled");
+}
+
+/// Every event a sender reported, kept for the test to search.
+#[derive(Default)]
+pub struct Events {
+    pub seen: Vec<(Instant, SenderEvent)>,
+}
+
+impl Events {
+    pub fn drain(&mut self, sender: &Sender) {
+        while let Some(event) = sender.poll_event() {
+            self.seen.push((Instant::now(), event));
+        }
+    }
+
+    /// Waits until an event matching `wanted` has been seen, returning it.
+    pub fn wait_for(
+        &mut self,
+        sender: &Sender,
+        timeout: Duration,
+        wanted: impl Fn(&SenderEvent) -> bool,
+    ) -> Option<SenderEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain(sender);
+            if let Some((_, event)) = self.seen.iter().find(|(_, event)| wanted(event)) {
+                return Some(event.clone());
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(POLL);
+        }
+    }
+
+    /// Waits for the `nth` (from 1) event of a speaker in this state.
+    pub fn wait_state(
+        &mut self,
+        sender: &Sender,
+        key: &DeviceKey,
+        nth: usize,
+        timeout: Duration,
+        state: impl Fn(&SpeakerState) -> bool,
+    ) -> Option<Instant> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain(sender);
+            let found = self
+                .seen
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(event, SenderEvent::Speaker { key: k, event: SpeakerEvent::State(s) }
+                        if k == key && state(s))
+                })
+                .nth(nth - 1)
+                .map(|(at, _)| *at);
+            if found.is_some() {
+                return found;
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(POLL);
+        }
+    }
+
+    /// The speaker events of one speaker, in order.
+    pub fn of(&self, key: &DeviceKey) -> Vec<SpeakerEvent> {
+        self.seen
+            .iter()
+            .filter_map(|(_, event)| match event {
+                SenderEvent::Speaker { key: k, event } if k == key => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Frames the host writes per block: 10 ms.
+pub const BLOCK_FRAMES: usize = 441;
+/// Host frame numbers repeat after this many frames per channel step.
+const FRAME_SPAN: u64 = 30_000;
+
+/// The samples of host frame `f`: never silent, and the frame number can be
+/// read back from them (see [`host_frame_of`]).
+pub fn host_samples(f: u64) -> [i16; 2] {
+    [(f % FRAME_SPAN) as i16 + 1, (f / FRAME_SPAN) as i16 + 1]
+}
+
+/// The host frame a sample pair came from, or `None` for silence.
+pub fn host_frame_of(frame: [i16; 2]) -> Option<u64> {
+    let [left, right] = frame;
+    (left > 0 && right > 0).then(|| (right as u64 - 1) * FRAME_SPAN + (left as u64 - 1))
+}
+
+/// A capture thread: numbered audio in 10 ms blocks at real-time pace,
+/// stamped with the arrival time as a host would (P6, P73).
+pub struct HostAudio {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<InputWriter>>,
+    /// When the capture wrote its first block and its latest.
+    writes: Arc<Mutex<Option<(Instant, Instant)>>>,
+}
+
+impl HostAudio {
+    pub fn start(mut writer: InputWriter) -> HostAudio {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let writes = Arc::new(Mutex::new(None));
+        let stamps = writes.clone();
+        let thread = thread::spawn(move || {
+            let mut written: u64 = 0;
+            let start = Instant::now();
+            let mut block = vec![0i16; BLOCK_FRAMES * 2];
+            while !flag.load(Ordering::SeqCst) {
+                for (index, pair) in block.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    pair.copy_from_slice(&host_samples(written + index as u64));
+                }
+                let now = Instant::now();
+                writer.write_i16(&block, now);
+                stamps
+                    .lock()
+                    .expect("write times")
+                    .get_or_insert((now, now))
+                    .1 = now;
+                written += BLOCK_FRAMES as u64;
+                let next = start + Duration::from_secs_f64(written as f64 / 44_100.0);
+                if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                    thread::sleep(wait);
+                }
+            }
+            writer
+        });
+        HostAudio {
+            stop,
+            thread: Some(thread),
+            writes,
+        }
+    }
+
+    /// When the capture wrote its first block and its latest, once it wrote.
+    pub fn writes(&self) -> Option<(Instant, Instant)> {
+        *self.writes.lock().expect("write times")
+    }
+
+    /// Stops the capture and gives its writer back, for the next capture
+    /// of a host that switches sources.
+    pub fn stop(&mut self) -> InputWriter {
+        self.stop.store(true, Ordering::SeqCst);
+        self.thread
+            .take()
+            .expect("a running capture")
+            .join()
+            .expect("the capture thread ends")
+    }
+}
+
+impl Drop for HostAudio {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// When each host frame that starts a PCM packet is due to be heard on a
+/// receiver, in sender-clock seconds, from the sync packets of the same
+/// session (P95, P97). Packets of silence are skipped.
+///
+/// A packet's sync is the last one of its session at or before it in RTP
+/// order (P94), not the last one logged before it: the receiver logs syncs
+/// and audio on two threads, so a session's first sync can be logged after
+/// the packet it precedes.
+pub fn play_times(log: &Log, clock: &SenderClock) -> BTreeMap<u64, f64> {
+    // A sync names the timestamp of the packet it precedes, which ties it
+    // to that packet's session (SSRC).
+    let mut by_timestamp: HashMap<u32, u32> = HashMap::new();
+    for packet in &log.audio {
+        by_timestamp.insert(packet.header.timestamp, packet.header.ssrc);
+    }
+    let syncs: Vec<(u32, SyncPacket)> = log
+        .syncs
+        .iter()
+        .filter_map(|(_, _, sync)| Some((*by_timestamp.get(&sync.next_rtp)?, *sync)))
+        .collect();
+    let mut times = BTreeMap::new();
+    for packet in &log.audio {
+        // How far the packet lies after a sync's packet, modulo 2^32; half
+        // the range or more means before it.
+        let after = |sync: &SyncPacket| packet.header.timestamp.wrapping_sub(sync.next_rtp);
+        let Some((_, sync)) = syncs
+            .iter()
+            .filter(|(ssrc, sync)| *ssrc == packet.header.ssrc && after(sync) < 1 << 31)
+            .min_by_key(|(_, sync)| after(sync))
+        else {
+            continue;
+        };
+        let mut frames = [[0i16; 2]; 352];
+        if packet.payload.len() != 1408 {
+            continue;
+        }
+        read_pcm_payload(&packet.payload, &mut frames);
+        let Some(frame) = host_frame_of(frames[0]) else {
+            continue;
+        };
+        let offset = packet.header.timestamp.wrapping_sub(sync.rtp_heard) as i32;
+        let heard = clock.seconds_of(sync.time) + f64::from(offset) / 44_100.0;
+        times.insert(frame, heard);
+    }
+    times
+}
+
+/// The largest |a(f) − b(f) − expected| over host frames both receivers
+/// got, and how many there were.
+pub fn step_error(a: &BTreeMap<u64, f64>, b: &BTreeMap<u64, f64>, expected: f64) -> (f64, usize) {
+    let mut worst: f64 = 0.0;
+    let mut count = 0;
+    for (frame, time_a) in a {
+        if let Some(time_b) = b.get(frame) {
+            worst = worst.max((time_a - time_b - expected).abs());
+            count += 1;
+        }
+    }
+    (worst, count)
+}

@@ -1,0 +1,2251 @@
+//! The server: its listeners, one thread per connection, the routes, and
+//! the event stream that carries each new snapshot to the open pages.
+
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime};
+
+use serde_json::json;
+use socket2::{Domain, Protocol, Socket, Type};
+
+use crate::auth::{
+    self, DeviceFile, Limits, LoadProblem, MAX_DEVICES, PairOutcome, Pairing, Snapshot, TokenStore,
+};
+use crate::http::{self, Request, Response};
+use crate::net;
+use crate::page::{self, PageError};
+use crate::state::{
+    self, BodyError, Command, RangeError, SourceKind, State, StateError, ZoneProblem,
+};
+use crate::text::{self, ApiError};
+
+/// The port the remote listens on unless the user picks another. Unassigned
+/// in the IANA service name and port number registry (range 7649-7662).
+pub const DEFAULT_PORT: u16 = 7655;
+/// The device token cookie's name before it took the port and the install ID;
+/// still read, with `_<port>` too, so a device paired then moves to the
+/// current name without pairing again.
+pub const TOKEN_COOKIE: &str = "as_token";
+// 400 days, the longest a browser keeps a cookie; the server forgets the device sooner if asked.
+const COOKIE_MAX_AGE: u64 = 400 * 24 * 60 * 60;
+const ACCEPT_POLL: Duration = Duration::from_millis(20);
+/// Connections served at once, event streams included.
+const MAX_CONNECTIONS: usize = 32;
+/// Connections one peer may hold, so one device can't take every slot.
+const MAX_CONNECTIONS_PER_PEER: usize = 8;
+/// Slots that connections not yet known to come from a paired device can't fill.
+const RESERVED_FOR_PAIRED: usize = 8;
+/// Reserved slots one peer may wait in at once.
+const RESERVED_PER_PEER: usize = 2;
+/// How long a connection in a reserved slot has to send its request; a
+/// browser on the same network sends it at once.
+const RESERVED_REQUEST: Duration = Duration::from_secs(1);
+/// Event streams one paired device may hold; a new one ends the oldest live one.
+const MAX_STREAMS_PER_DEVICE: usize = 2;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a probe waits to tell a live event stream from a closed one.
+const PROBE: Duration = Duration::from_millis(1);
+/// How long a refused connection is drained before it is closed.
+const REFUSED_LINGER: Duration = Duration::from_secs(1);
+/// Refused connections drained at once; the oldest is closed for a new one.
+const MAX_REFUSED: usize = 16;
+/// Snapshots kept so a stream that fell a little behind still gets each one.
+const HISTORY: usize = 32;
+/// Server events kept for a host that doesn't poll.
+pub const MAX_SERVER_EVENTS: usize = 64;
+/// How often one refused address gets a line in the log.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Refused addresses remembered at once for [`REFUSAL_LOG_INTERVAL`].
+const MAX_REFUSALS_LOGGED: usize = 64;
+
+/// The time limits; the defaults are the product's, tests shorten them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timing {
+    /// How long a pairing code works.
+    pub code_lifetime: Duration,
+    /// The window in which one peer may send five wrong codes.
+    pub wrong_code_window: Duration,
+    /// The longest an event stream stays silent; a `ping` event fills it.
+    pub heartbeat: Duration,
+    /// How long a client has to send its whole request; a slower one is closed unanswered.
+    pub request: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Timing {
+        let limits = Limits::default();
+        Timing {
+            code_lifetime: limits.code_lifetime,
+            wrong_code_window: limits.window,
+            heartbeat: Duration::from_secs(15),
+            request: http::REQUEST_TIMEOUT,
+        }
+    }
+}
+
+/// What the server needs from the app.
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// 0 lets the system pick one (tests).
+    pub port: u16,
+    /// The addresses to listen on; one that can't be bound is skipped as
+    /// long as another one is.
+    pub listen: Vec<IpAddr>,
+    /// The computer's name, so `<local_name>.local:<port>` is an accepted `Host`.
+    pub local_name: Option<String>,
+    /// The paired-device file; none keeps the devices in memory only.
+    pub devices_path: Option<PathBuf>,
+    pub timing: Timing,
+    pub capacity: Capacity,
+    /// Reports each new pairing code as [`ServerEvent::PairingCode`], for a
+    /// debug log only: whoever reads that log can pair while the code works.
+    pub log_pairing_codes: bool,
+}
+
+/// How many connections the server holds; the defaults are the product's,
+/// tests shrink them. A peer is one address ([`net::peer_group`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    /// Connections at once.
+    pub connections: usize,
+    /// Connections one peer may hold.
+    pub per_peer: usize,
+    /// Of `connections`, the slots kept for requests that carry a paired
+    /// device's token: a connection let in while the others hold the rest
+    /// gets a short time to send its request and is answered 503 without one.
+    pub reserved: usize,
+    /// Reserved slots one peer may wait in at once.
+    pub reserved_per_peer: usize,
+}
+
+impl Default for Capacity {
+    fn default() -> Capacity {
+        Capacity {
+            connections: MAX_CONNECTIONS,
+            per_peer: MAX_CONNECTIONS_PER_PEER,
+            reserved: RESERVED_FOR_PAIRED,
+            reserved_per_peer: RESERVED_PER_PEER,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            port: DEFAULT_PORT,
+            listen: vec![
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ],
+            local_name: None,
+            devices_path: None,
+            timing: Timing::default(),
+            capacity: Capacity::default(),
+            log_pairing_codes: false,
+        }
+    }
+}
+
+impl Config {
+    /// Reads `{"port"?, "local_name"?, "devices_path"?, "listen"?,
+    /// "log_pairing_codes"?}`, the defaults filling in what is missing;
+    /// `listen` is a list of IP literals. None when a field has the wrong
+    /// type or value.
+    pub fn from_json(text: &str) -> Option<Config> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let object = value.as_object()?;
+        let mut config = Config::default();
+        if let Some(port) = object.get("port") {
+            config.port = u16::try_from(port.as_u64()?).ok()?;
+        }
+        if let Some(name) = object.get("local_name") {
+            config.local_name = Some(name.as_str()?.to_owned());
+        }
+        if let Some(path) = object.get("devices_path") {
+            config.devices_path =
+                Some(PathBuf::from(path.as_str()?)).filter(|path| !path.as_os_str().is_empty());
+        }
+        if let Some(listen) = object.get("listen") {
+            config.listen = listen
+                .as_array()?
+                .iter()
+                .map(|address| address.as_str()?.parse().ok())
+                .collect::<Option<_>>()?;
+        }
+        if let Some(log) = object.get("log_pairing_codes") {
+            config.log_pairing_codes = log.as_bool()?;
+        }
+        Some(config)
+    }
+}
+
+/// Why the server didn't start, or a code couldn't be made.
+#[derive(Debug)]
+pub enum RemoteError {
+    /// No address could be listened on; [`RemoteError::port_in_use`] tells a busy port.
+    Bind(io::Error),
+    /// No randomness for a code or a token.
+    Random,
+    /// The built-in page is malformed (a build mistake the tests catch).
+    Page(PageError),
+}
+
+impl RemoteError {
+    pub fn port_in_use(&self) -> bool {
+        matches!(self, RemoteError::Bind(error) if error.kind() == io::ErrorKind::AddrInUse)
+    }
+}
+
+impl fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RemoteError::Bind(error) => write!(f, "could not open the remote's port: {error}"),
+            RemoteError::Random => f.write_str("no randomness for a pairing code or token"),
+            RemoteError::Page(PageError(tag)) => {
+                write!(f, "the remote page needs exactly one plain <{tag}>")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoteError {}
+
+/// What the server reports for the debug log: who paired, failed or was
+/// refused, never a token, and a pairing code only with
+/// [`Config::log_pairing_codes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerEvent {
+    Paired {
+        from: IpAddr,
+    },
+    /// `why` is never [`PairOutcome::Paired`].
+    PairFailed {
+        from: IpAddr,
+        why: PairOutcome,
+    },
+    Unpaired {
+        from: IpAddr,
+    },
+    /// A pairing beyond [`MAX_DEVICES`] forgot the device that paired first.
+    OldestForgotten,
+    /// A token its device had replaced came back after the grace, so the device was unpaired.
+    TokenReused {
+        from: IpAddr,
+    },
+    /// A request with a foreign `Host` or `Origin` (403).
+    Refused {
+        from: IpAddr,
+        status: u16,
+    },
+    /// A peer that is not loopback, on a subnet of this machine's interfaces
+    /// or a tailnet peer (see [`net::admits_peer`]), closed at accept.
+    NotPrivate {
+        from: IpAddr,
+    },
+    /// All connections were taken (503).
+    Busy {
+        from: IpAddr,
+    },
+    /// The peer already held its share of the connections (503).
+    PeerBusy {
+        from: IpAddr,
+    },
+    /// The paired-device file couldn't be written; the devices work until the app quits.
+    DevicesNotSaved(String),
+    /// The paired-device file couldn't be read at start; no device is paired.
+    DevicesNotRead(String),
+    /// Some devices in the paired-device file didn't read and pair again;
+    /// the first save copies the file aside before writing over it.
+    DevicesPartlyRead {
+        skipped: usize,
+    },
+    /// Accepting a connection failed.
+    AcceptFailed(String),
+    /// A connection's thread panicked; only that connection ended.
+    ConnectionPanicked,
+    /// A new pairing code: at start, on a rotation and after a pairing used
+    /// the last one. Only with [`Config::log_pairing_codes`].
+    PairingCode(String),
+}
+
+impl fmt::Display for ServerEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerEvent::Paired { from } => write!(f, "remote: a device at {from} paired"),
+            ServerEvent::PairFailed { from, why } => {
+                let why = match why {
+                    PairOutcome::Wrong | PairOutcome::Paired => "wrong code",
+                    PairOutcome::Expired => "no code in force",
+                    PairOutcome::Limited => "too many wrong codes this minute",
+                    PairOutcome::Blocked => "too many wrong codes until the code is renewed",
+                    PairOutcome::Locked => "pairing locked until the code is renewed",
+                };
+                write!(f, "remote: pairing from {from} failed: {why}")
+            }
+            ServerEvent::Unpaired { from } => write!(f, "remote: the device at {from} unpaired"),
+            ServerEvent::OldestForgotten => write!(
+                f,
+                "remote: pairing more than {MAX_DEVICES} devices forgot the one that paired first"
+            ),
+            ServerEvent::TokenReused { from } => write!(
+                f,
+                "remote: a replaced token came back from {from}; its device is unpaired"
+            ),
+            ServerEvent::Refused { from, status } => {
+                write!(f, "remote: refused a request from {from} ({status})")
+            }
+            ServerEvent::NotPrivate { from } => {
+                write!(
+                    f,
+                    "remote: closed a connection from {from}, not a private or on-link address"
+                )
+            }
+            ServerEvent::Busy { from } => {
+                write!(f, "remote: turned {from} away, all connections in use")
+            }
+            ServerEvent::PeerBusy { from } => {
+                write!(
+                    f,
+                    "remote: turned {from} away, it has too many connections open"
+                )
+            }
+            ServerEvent::DevicesNotSaved(error) => {
+                write!(f, "remote: the paired devices were not saved: {error}")
+            }
+            ServerEvent::DevicesNotRead(error) => {
+                write!(
+                    f,
+                    "remote: the paired devices were not read, starting with none: {error}"
+                )
+            }
+            ServerEvent::DevicesPartlyRead { skipped } => write!(
+                f,
+                "remote: {skipped} paired devices didn't read and pair again; \
+                 the file is copied aside before it is written again, \
+                 and isn't written while that copy fails"
+            ),
+            ServerEvent::AcceptFailed(error) => write!(f, "remote: accepting failed: {error}"),
+            ServerEvent::ConnectionPanicked => f.write_str("remote: a connection ended in a panic"),
+            ServerEvent::PairingCode(code) => {
+                write!(f, "remote: pairing code {code} (debug only)")
+            }
+        }
+    }
+}
+
+type CommandSink = Box<dyn Fn(&Command) + Send + Sync>;
+
+#[derive(Default)]
+struct Published {
+    revision: u64,
+    current: Option<State>,
+    history: VecDeque<(u64, Arc<str>)>,
+    /// A command reached the app since the last snapshot.
+    commanded: bool,
+}
+
+impl Published {
+    /// The snapshots a stream that sent revision `sent` still needs: each
+    /// newer one in order, or only the latest for a new stream or one that
+    /// fell behind the history.
+    fn since(&self, sent: u64) -> Vec<(u64, Arc<str>)> {
+        let (Some(oldest), Some(latest)) = (self.history.front(), self.history.back()) else {
+            return Vec::new();
+        };
+        if latest.0 <= sent {
+            return Vec::new();
+        }
+        if sent == 0 || oldest.0 > sent + 1 {
+            return vec![latest.clone()];
+        }
+        self.history
+            .iter()
+            .filter(|(revision, _)| *revision > sent)
+            .cloned()
+            .collect()
+    }
+}
+
+struct Shared {
+    stopped: AtomicBool,
+    local_name: Mutex<Option<String>>,
+    content_security_policy: String,
+    heartbeat: Duration,
+    request_timeout: Duration,
+    capacity: Capacity,
+    log_pairing_codes: bool,
+    /// [`TokenStore::install`], read once at start.
+    install: String,
+    pairing: Mutex<Pairing>,
+    devices: Mutex<TokenStore>,
+    device_file: DeviceFile,
+    published: Mutex<Published>,
+    changed: Condvar,
+    sink: Mutex<Option<CommandSink>>,
+    events: Mutex<VecDeque<ServerEvent>>,
+    connections: Mutex<Vec<Connection>>,
+    /// The open event streams, oldest first, with the device each belongs to.
+    streams: Mutex<Vec<(u64, u64, Arc<TcpStream>)>>,
+    next_stream: AtomicU64,
+}
+
+struct Connection {
+    slot: Slot,
+    /// Set once the request carried a paired device's token.
+    paired: Arc<AtomicBool>,
+    stream: TcpStream,
+    thread: JoinHandle<()>,
+}
+
+/// What admission needs to know of a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slot {
+    peer: IpAddr,
+    reserved: bool,
+    paired: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Open,
+    /// Let in only to show a paired device's token (see [`Capacity::reserved`]).
+    Reserved,
+    /// Let in as [`Admission::Reserved`] once the held connection at this index is closed.
+    Replace(usize),
+    Busy,
+    PeerBusy,
+}
+
+/// Whether a connection from `peer` is let in beside `held`, oldest first.
+/// Connections that haven't shown a paired device's token share all but the
+/// reserved slots, so slow unpaired clients can't keep a paired phone out.
+fn admission(held: &[Slot], peer: IpAddr, capacity: Capacity) -> Admission {
+    let full = held.len() >= capacity.connections;
+    if held.iter().filter(|slot| slot.peer == peer).count() >= capacity.per_peer {
+        return if full {
+            Admission::Busy
+        } else {
+            Admission::PeerBusy
+        };
+    }
+    let unpaired = held.iter().filter(|slot| !slot.paired).count();
+    if !full && unpaired < capacity.connections.saturating_sub(capacity.reserved) {
+        return Admission::Open;
+    }
+    let waiting = held
+        .iter()
+        .filter(|slot| slot.peer == peer && slot.reserved && !slot.paired)
+        .count();
+    if waiting >= capacity.reserved_per_peer {
+        return Admission::Busy;
+    }
+    if !full {
+        return Admission::Reserved;
+    }
+    // A host with many addresses is many peers; the oldest waiter makes room
+    // so such a host can't keep every reserved slot.
+    held.iter()
+        .position(|slot| slot.reserved && !slot.paired)
+        .map_or(Admission::Busy, Admission::Replace)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Shared {
+    fn report(&self, event: ServerEvent) {
+        let mut events = lock(&self.events);
+        if events.len() >= MAX_SERVER_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    /// Wakes every event stream to look at the state, the devices and the stop flag again.
+    fn wake_streams(&self) {
+        // Taking the lock first means no stream is between its check and its wait.
+        drop(lock(&self.published));
+        self.changed.notify_all();
+    }
+
+    /// Writes a change to the paired devices; called with no lock held.
+    fn save(&self, snapshot: Snapshot) {
+        if let Err(problem) = self.device_file.save(snapshot) {
+            self.report(ServerEvent::DevicesNotSaved(problem.to_string()));
+        }
+    }
+
+    /// Registers a new event stream for `device`, dropping the device's
+    /// streams their page closed, then ending its oldest beyond
+    /// [`MAX_STREAMS_PER_DEVICE`].
+    fn open_stream(&self, device: u64, probe: TcpStream) -> u64 {
+        let id = self.next_stream.fetch_add(1, Ordering::SeqCst);
+        let probes: Vec<(u64, Arc<TcpStream>)> = lock(&self.streams)
+            .iter()
+            .filter(|(_, owner, _)| *owner == device)
+            .map(|(id, _, probe)| (*id, Arc::clone(probe)))
+            .collect();
+        // A closed page's stream lingers until a write fails; evicting a live one would mark its page replaced.
+        let gone: Vec<u64> = probes
+            .iter()
+            .filter(|(_, probe)| closed(probe))
+            .map(|(id, _)| *id)
+            .collect();
+        let ended = {
+            let mut streams = lock(&self.streams);
+            let before = streams.len();
+            streams.retain(|(id, _, _)| !gone.contains(id));
+            streams.push((id, device, Arc::new(probe)));
+            let mine: Vec<u64> = streams
+                .iter()
+                .filter(|(_, owner, _)| *owner == device)
+                .map(|(id, _, _)| *id)
+                .collect();
+            let excess = mine.len().saturating_sub(MAX_STREAMS_PER_DEVICE);
+            streams.retain(|(id, _, _)| !mine[..excess].contains(id));
+            streams.len() <= before
+        };
+        if ended {
+            self.wake_streams();
+        }
+        id
+    }
+
+    fn stream_open(&self, id: u64) -> bool {
+        lock(&self.streams).iter().any(|(open, _, _)| *open == id)
+    }
+
+    fn close_stream(&self, id: u64) {
+        lock(&self.streams).retain(|(open, _, _)| *open != id);
+    }
+
+    /// Marks the connection that owns `paired` as paired; false when it was
+    /// already closed to make room, so its request is not acted on.
+    fn mark_paired(&self, paired: &Arc<AtomicBool>) -> bool {
+        // Under the lock admit decides and closes under, so it never closes a connection marked here.
+        let connections = lock(&self.connections);
+        let listed = connections
+            .iter()
+            .any(|connection| Arc::ptr_eq(&connection.paired, paired));
+        if listed {
+            paired.store(true, Ordering::SeqCst);
+        }
+        listed
+    }
+
+    /// The last published snapshot says a microphone run is in progress.
+    fn calibrating(&self) -> bool {
+        lock(&self.published)
+            .current
+            .as_ref()
+            .is_some_and(|state| state.calibrating)
+    }
+
+    /// The paired device's token and ID, and the older cookie name it came
+    /// under, if any; none when it is unknown or sent from another address
+    /// than its device paired from.
+    fn paired(
+        &self,
+        request: &Request,
+        from: IpAddr,
+        port: u16,
+    ) -> Option<(String, u64, Option<String>)> {
+        let names = [
+            token_cookie_name(port, &self.install),
+            format!("{TOKEN_COOKIE}_{port}"),
+            TOKEN_COOKIE.to_owned(),
+        ];
+        let (index, token) = names
+            .iter()
+            .enumerate()
+            .find_map(|(index, name)| Some((index, request.cookie(name)?)))?;
+        let old_name = (index > 0).then(|| names[index].clone());
+        let (device, snapshot) = lock(&self.devices).check(token, from, SystemTime::now());
+        if device.is_none() && snapshot.is_some() {
+            self.wake_streams();
+        }
+        if snapshot.as_ref().is_some_and(Snapshot::token_reused) {
+            self.report(ServerEvent::TokenReused { from });
+        }
+        if let Some(snapshot) = snapshot {
+            self.save(snapshot);
+        }
+        device.map(|device| (token.to_owned(), device, old_name))
+    }
+
+    /// A new token in place of `token` once it is due ([`auth::ROTATE_AFTER`]).
+    fn rotate(&self, token: &str) -> Option<String> {
+        let rotated = lock(&self.devices).rotate(token, SystemTime::now());
+        let (fresh, snapshot) = rotated.ok().flatten()?;
+        self.save(snapshot);
+        Some(fresh)
+    }
+
+    /// Hands `command` to the app; false once the server is stopping.
+    fn deliver(&self, command: &Command) -> bool {
+        match lock(&self.sink).as_ref() {
+            Some(sink) => {
+                // Before the sink: the app may publish from its own thread before sink returns.
+                lock(&self.published).commanded = true;
+                sink(command);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The running remote.
+pub struct RemoteServer {
+    shared: Arc<Shared>,
+    port: u16,
+    accept: Option<JoinHandle<()>>,
+}
+
+impl fmt::Debug for RemoteServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteServer")
+            .field("port", &self.port)
+            .finish()
+    }
+}
+
+fn bind(address: SocketAddr) -> io::Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if address.is_ipv6() {
+        // Each family on its own socket, so another app on either one is seen on every OS.
+        socket.set_only_v6(true)?;
+    }
+    // As std's bind does: a restart may reuse a port in TIME_WAIT; on Windows it would allow theft.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
+fn bind_all(config: &Config) -> Result<(Vec<TcpListener>, u16), RemoteError> {
+    let mut listeners = Vec::new();
+    let mut port = config.port;
+    let mut first_error = None;
+    for address in &config.listen {
+        match bind((*address, port).into()) {
+            Ok(listener) => {
+                let bound = listener.local_addr().map_err(RemoteError::Bind)?;
+                listener.set_nonblocking(true).map_err(RemoteError::Bind)?;
+                port = bound.port();
+                listeners.push(listener);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                return Err(RemoteError::Bind(error));
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if listeners.is_empty() {
+        let error = first_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "no address to listen on")
+        });
+        return Err(RemoteError::Bind(error));
+    }
+    Ok((listeners, port))
+}
+
+fn own_name(name: Option<&str>) -> Option<String> {
+    name.map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+impl RemoteServer {
+    /// Opens the listeners and makes the first pairing code. `on_command`
+    /// runs on a connection thread for each accepted change, one call at a
+    /// time; it must not wait for the thread that calls [`RemoteServer::stop`].
+    pub fn start(
+        config: Config,
+        on_command: impl Fn(&Command) + Send + Sync + 'static,
+    ) -> Result<RemoteServer, RemoteError> {
+        let content_security_policy =
+            page::content_security_policy(page::PAGE).map_err(RemoteError::Page)?;
+        let limits = Limits {
+            code_lifetime: config.timing.code_lifetime,
+            window: config.timing.wrong_code_window,
+        };
+        let now = Instant::now();
+        let pairing = Pairing::new(limits, now).map_err(|_| RemoteError::Random)?;
+        let first_code = config
+            .log_pairing_codes
+            .then(|| pairing.current(now).map(str::to_owned))
+            .flatten();
+        let (devices, problem) = TokenStore::open(config.devices_path.clone());
+        let install = devices.install().to_owned();
+        let (listeners, port) = bind_all(&config)?;
+        let shared = Arc::new(Shared {
+            stopped: AtomicBool::new(false),
+            local_name: Mutex::new(own_name(config.local_name.as_deref())),
+            content_security_policy,
+            heartbeat: config.timing.heartbeat,
+            request_timeout: config.timing.request,
+            capacity: config.capacity,
+            log_pairing_codes: config.log_pairing_codes,
+            install,
+            pairing: Mutex::new(pairing),
+            devices: Mutex::new(devices),
+            device_file: DeviceFile::default(),
+            published: Mutex::new(Published::default()),
+            changed: Condvar::new(),
+            sink: Mutex::new(Some(Box::new(on_command))),
+            events: Mutex::new(VecDeque::new()),
+            connections: Mutex::new(Vec::new()),
+            streams: Mutex::new(Vec::new()),
+            next_stream: AtomicU64::new(0),
+        });
+        match problem {
+            Some(LoadProblem::Unreadable(error)) => {
+                shared.report(ServerEvent::DevicesNotRead(error.to_string()));
+            }
+            Some(LoadProblem::NotInFormat) => {
+                shared.report(ServerEvent::DevicesNotRead(
+                    "not in the expected format".to_owned(),
+                ));
+            }
+            Some(LoadProblem::Skipped { skipped }) => {
+                shared.report(ServerEvent::DevicesPartlyRead { skipped });
+            }
+            None => {}
+        }
+        if let Some(code) = first_code {
+            shared.report(ServerEvent::PairingCode(code));
+        }
+        let rewrite = lock(&shared.devices).take_rewrite();
+        if let Some(snapshot) = rewrite {
+            shared.save(snapshot);
+        }
+        let accept = {
+            let shared = Arc::clone(&shared);
+            thread::Builder::new()
+                .name("remote-accept".to_owned())
+                .spawn(move || {
+                    let ended = panic::catch_unwind(AssertUnwindSafe(|| {
+                        accept_loop(&listeners, &shared);
+                    }));
+                    if ended.is_err() {
+                        shared.stopped.store(true, Ordering::SeqCst);
+                        shared.report(ServerEvent::AcceptFailed("a panic".to_owned()));
+                    }
+                })
+                .map_err(RemoteError::Bind)?
+        };
+        Ok(RemoteServer {
+            shared,
+            port,
+            accept: Some(accept),
+        })
+    }
+
+    /// The port it listens on.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The name of the cookie that carries a device token.
+    pub fn token_cookie(&self) -> String {
+        token_cookie_name(self.port, &self.shared.install)
+    }
+
+    /// Makes `state` the current snapshot and streams it to the open pages;
+    /// returns its revision. A snapshot equal to the current one keeps the
+    /// current revision and sends nothing, unless a command reached the app
+    /// since the last one: a page shows what it sent until a snapshot comes.
+    pub fn publish(&self, mut state: State) -> u64 {
+        // A phone, or whoever holds its token, never turns a microphone on.
+        state
+            .sources
+            .retain(|source| source.kind != SourceKind::Input);
+        if !state
+            .sources
+            .iter()
+            .any(|source| state.source_id.as_ref() == Some(&source.id))
+        {
+            state.source_id = None;
+        }
+        let mut published = lock(&self.shared.published);
+        if !published.commanded && published.current.as_ref() == Some(&state) {
+            return published.revision;
+        }
+        published.commanded = false;
+        published.revision += 1;
+        let revision = published.revision;
+        published
+            .history
+            .push_back((revision, Arc::from(state.to_json(revision))));
+        if published.history.len() > HISTORY {
+            published.history.pop_front();
+        }
+        published.current = Some(state);
+        drop(published);
+        self.shared.changed.notify_all();
+        revision
+    }
+
+    /// [`RemoteServer::publish`] for a snapshot in JSON ([`State::from_json`]).
+    pub fn publish_json(&self, text: &str) -> Result<u64, StateError> {
+        State::from_json(text).map(|state| self.publish(state))
+    }
+
+    /// The pairing code that works now, if any.
+    pub fn pairing_code(&self) -> Option<String> {
+        lock(&self.shared.pairing)
+            .current(Instant::now())
+            .map(str::to_owned)
+    }
+
+    /// A new pairing code, for when the user opens the setting: the old one
+    /// stops working and a lockout ends.
+    pub fn rotate_code(&self) -> Result<String, RemoteError> {
+        let code = lock(&self.shared.pairing)
+            .rotate(Instant::now())
+            .map_err(|_| RemoteError::Random)?;
+        if self.shared.log_pairing_codes {
+            self.shared.report(ServerEvent::PairingCode(code.clone()));
+        }
+        Ok(code)
+    }
+
+    /// Makes `<name>.local` the accepted `Host` name in place of the one
+    /// before (none: only the address), for when the computer is renamed.
+    /// The pairing code, its age and the wrong-code counts stay as they are.
+    pub fn set_local_name(&self, name: Option<&str>) {
+        *lock(&self.shared.local_name) = own_name(name);
+    }
+
+    /// Whether too many wrong codes locked pairing until the next rotation.
+    pub fn pairing_locked(&self) -> bool {
+        lock(&self.shared.pairing).locked()
+    }
+
+    pub fn device_count(&self) -> usize {
+        lock(&self.shared.devices).count_at(SystemTime::now())
+    }
+
+    /// Forgets every paired device; their next request gets 401 and their
+    /// event streams end. In memory even when the file can't be written.
+    pub fn forget_all(&self) -> io::Result<()> {
+        let snapshot = lock(&self.shared.devices).clear();
+        self.shared.wake_streams();
+        self.shared.device_file.save(snapshot)
+    }
+
+    /// The oldest event not taken yet.
+    pub fn poll_event(&self) -> Option<ServerEvent> {
+        lock(&self.shared.events).pop_front()
+    }
+
+    /// Closes the listeners and every connection. Once it returns, the
+    /// command callback is never called again.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    /// [`RemoteServer::stop`] for an owner that keeps the server.
+    pub fn stop_in_place(&mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        self.shared.stopped.store(true, Ordering::SeqCst);
+        // Waits for a callback in progress.
+        drop(lock(&self.shared.sink).take());
+        self.shared.wake_streams();
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+        // Not joined: a send blocked on a peer that stopped reading may not
+        // return when its socket is shut (WinSock); it ends within its write timeout.
+        for connection in std::mem::take(&mut *lock(&self.shared.connections)) {
+            let _ = connection.stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for RemoteServer {
+    fn drop(&mut self) {
+        if self.accept.is_some() {
+            self.shutdown();
+        }
+    }
+}
+
+/// How long the accept loop reuses its list of this machine's interfaces.
+const NETS_REFRESH: Duration = Duration::from_secs(1);
+
+fn accept_loop(listeners: &[TcpListener], shared: &Arc<Shared>) {
+    let mut refused = VecDeque::new();
+    let mut reported = HashMap::new();
+    let mut nets = (Instant::now(), net::local_nets());
+    while !shared.stopped.load(Ordering::SeqCst) {
+        drain_refused(&mut refused);
+        let mut idle = true;
+        for listener in listeners {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    idle = false;
+                    // Listing the interfaces is slow on Windows; a flood must not stall accept.
+                    if nets.0.elapsed() >= NETS_REFRESH {
+                        nets = (Instant::now(), net::local_nets());
+                    }
+                    if let Some(stream) = admit(stream, peer, shared, &mut reported, &nets.1) {
+                        if refused.len() >= MAX_REFUSED {
+                            refused.pop_front();
+                        }
+                        refused.push_back((stream, Instant::now() + REFUSED_LINGER));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => idle = false,
+                Err(error) => shared.report(ServerEvent::AcceptFailed(error.to_string())),
+            }
+        }
+        if idle {
+            thread::sleep(ACCEPT_POLL);
+        }
+    }
+}
+
+/// Reads and drops what refused clients still send; closes each once the
+/// client closed its side or its time is up.
+fn drain_refused(refused: &mut VecDeque<(TcpStream, Instant)>) {
+    let now = Instant::now();
+    let mut buffer = [0u8; 1024];
+    refused.retain_mut(|(stream, until)| {
+        if now >= *until {
+            return false;
+        }
+        for _ in 0..8 {
+            match stream.read(&mut buffer) {
+                Ok(0) => return false,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return true,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        true
+    });
+}
+
+/// Whether a refusal of `peer` is reported: once per address per
+/// [`REFUSAL_LOG_INTERVAL`], for at most [`MAX_REFUSALS_LOGGED`] addresses at
+/// once, so a scan from the internet neither floods the log nor grows the map.
+fn note_refusal(reported: &mut HashMap<IpAddr, Instant>, peer: IpAddr, now: Instant) -> bool {
+    reported.retain(|_, at| now.duration_since(*at) < REFUSAL_LOG_INTERVAL);
+    if reported.contains_key(&peer) || reported.len() >= MAX_REFUSALS_LOGGED {
+        return false;
+    }
+    reported.insert(peer, now);
+    true
+}
+
+/// Starts serving a connection, or answers 503 and hands the connection
+/// back to linger: closing with an unread request would reset it, and a
+/// reset can discard the answer before the client reads it.
+fn admit(
+    stream: TcpStream,
+    peer: SocketAddr,
+    shared: &Arc<Shared>,
+    reported: &mut HashMap<IpAddr, Instant>,
+    nets: &[net::LocalNet],
+) -> Option<TcpStream> {
+    let from = peer.ip().to_canonical();
+    let admitted = stream
+        .local_addr()
+        .is_ok_and(|local| net::admits_peer(from, local.ip(), nets));
+    if !admitted {
+        if note_refusal(reported, from, Instant::now()) {
+            shared.report(ServerEvent::NotPrivate { from });
+        }
+        let _ = stream.shutdown(Shutdown::Both);
+        return None;
+    }
+    // Accepted sockets inherit the listener's non-blocking mode on WinSock and BSD.
+    let _ = stream.set_nonblocking(false);
+    let peer = net::peer_group(from);
+    // Held through the push, so serve marks a connection paired only while it is listed.
+    let mut connections = lock(&shared.connections);
+    connections.retain(|connection| !connection.thread.is_finished());
+    let held: Vec<Slot> = connections
+        .iter()
+        .map(|connection| Slot {
+            paired: connection.paired.load(Ordering::SeqCst),
+            ..connection.slot
+        })
+        .collect();
+    let admitted = admission(&held, peer, shared.capacity);
+    if let Admission::Replace(oldest) = admitted {
+        let _ = connections.remove(oldest).stream.shutdown(Shutdown::Both);
+    }
+    let refused = match admitted {
+        Admission::Open | Admission::Reserved | Admission::Replace(_) => None,
+        Admission::Busy => Some(ServerEvent::Busy { from }),
+        Admission::PeerBusy => Some(ServerEvent::PeerBusy { from }),
+    };
+    if let Some(event) = refused {
+        drop(connections);
+        shared.report(event);
+        let mut stream = stream;
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+        let _ = http::write_response(
+            &mut stream,
+            &Response::error(&text::busy()),
+            &shared.content_security_policy,
+        );
+        let _ = stream.shutdown(Shutdown::Write);
+        return stream.set_nonblocking(true).is_ok().then_some(stream);
+    }
+    let Ok(handle) = stream.try_clone() else {
+        return None;
+    };
+    let slot = Slot {
+        peer,
+        reserved: matches!(admitted, Admission::Reserved | Admission::Replace(_)),
+        paired: false,
+    };
+    let paired = Arc::new(AtomicBool::new(false));
+    let connection = Arc::clone(shared);
+    let marks = Arc::clone(&paired);
+    let spawned = thread::Builder::new()
+        .name("remote-http".to_owned())
+        .spawn(move || {
+            let closer = stream.try_clone();
+            let served = panic::catch_unwind(AssertUnwindSafe(|| {
+                serve(stream, from, slot.reserved, &marks, &connection);
+            }));
+            if served.is_err() {
+                connection.report(ServerEvent::ConnectionPanicked);
+            }
+            // The clone kept for the teardown would hold the connection open.
+            if let Ok(closer) = closer {
+                let _ = closer.shutdown(Shutdown::Both);
+            }
+        });
+    if let Ok(thread) = spawned {
+        connections.push(Connection {
+            slot,
+            paired,
+            stream: handle,
+            thread,
+        });
+    }
+    None
+}
+
+/// What a request gets: one response, or the event stream.
+enum Answer {
+    Response(Response),
+    Events { device: u64, cookies: Vec<String> },
+}
+
+impl From<Response> for Answer {
+    fn from(response: Response) -> Answer {
+        Answer::Response(response)
+    }
+}
+
+fn error(error: ApiError) -> Answer {
+    Answer::Response(Response::error(&error))
+}
+
+/// Answers one request. In a reserved slot only a request with a paired
+/// device's token is served; `paired` is set once one shows it.
+fn serve(
+    mut stream: TcpStream,
+    from: IpAddr,
+    reserved: bool,
+    paired: &Arc<AtomicBool>,
+    shared: &Shared,
+) {
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let _ = stream.set_nodelay(true);
+    let Ok(local) = stream.local_addr() else {
+        return;
+    };
+    let csp = shared.content_security_policy.as_str();
+    let timeout = if reserved {
+        shared.request_timeout.min(RESERVED_REQUEST)
+    } else {
+        shared.request_timeout
+    };
+    let request = match http::read_request(&mut stream, timeout) {
+        Ok(request) => request,
+        Err(problem) => {
+            let answer = match problem.status() {
+                Some(413) => text::too_large(),
+                Some(_) => text::bad_request(),
+                None => return,
+            };
+            let mut response = Response::error(&answer);
+            response.status = problem.status().unwrap_or(400);
+            let _ = http::write_response(&mut stream, &response, csp);
+            drain_before_close(&mut stream);
+            return;
+        }
+    };
+    if shared.stopped.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(host) = allowed_host(&request, from, local, shared) else {
+        let _ = http::write_response(&mut stream, &Response::error(&text::bad_host()), csp);
+        return;
+    };
+    if shared.paired(&request, from, local.port()).is_some() {
+        if !shared.mark_paired(paired) {
+            return;
+        }
+    } else if reserved {
+        shared.report(ServerEvent::Busy { from });
+        let _ = http::write_response(&mut stream, &Response::error(&text::busy()), csp);
+        return;
+    }
+    match route(&request, host, from, local, shared) {
+        Answer::Response(response) => {
+            let _ = http::write_response(&mut stream, &response, csp);
+        }
+        Answer::Events { device, cookies } => stream_events(stream, device, &cookies, shared),
+    }
+}
+
+/// Reads and drops what the client still sends after an early answer:
+/// closing with unread data would reset the connection, and a reset can
+/// discard the answer before the client reads it.
+fn drain_before_close(stream: &mut TcpStream) {
+    const LIMIT: usize = 64 * 1024;
+    let _ = stream.shutdown(Shutdown::Write);
+    let until = Instant::now() + Duration::from_secs(1);
+    let mut buffer = [0u8; 4096];
+    let mut drained = 0;
+    while drained < LIMIT {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(count) => drained += count,
+        }
+    }
+}
+
+fn method_not_allowed(allow: &'static str) -> Answer {
+    Response::error(&text::method_not_allowed())
+        .with("Allow", allow)
+        .into()
+}
+
+enum ApiRoute {
+    State,
+    Events,
+    Master,
+    Unpair,
+    Speaker(Option<String>),
+    Zone(Option<String>),
+    Preset(Option<String>),
+    Source,
+    Mix,
+}
+
+impl ApiRoute {
+    /// A change to the speakers, the volumes or the source, which waits out a
+    /// microphone run (S258).
+    fn writes(&self) -> bool {
+        matches!(
+            self,
+            ApiRoute::Master
+                | ApiRoute::Speaker(_)
+                | ApiRoute::Zone(_)
+                | ApiRoute::Preset(_)
+                | ApiRoute::Source
+                | ApiRoute::Mix
+        )
+    }
+}
+
+/// The request's one `Host` when it names this server; reports a refusal otherwise.
+fn allowed_host<'a>(
+    request: &'a Request,
+    from: IpAddr,
+    local: SocketAddr,
+    shared: &Shared,
+) -> Option<&'a str> {
+    let host = request.header("host").filter(|host| {
+        request.header_count("host") == 1
+            && net::host_allowed(host, local, lock(&shared.local_name).as_deref())
+    });
+    if host.is_none() {
+        shared.report(ServerEvent::Refused { from, status: 403 });
+    }
+    host
+}
+
+fn route(
+    request: &Request,
+    host: &str,
+    from: IpAddr,
+    local: SocketAddr,
+    shared: &Shared,
+) -> Answer {
+    let path = request.path.as_str();
+    if !path.starts_with("/api/") {
+        return static_route(request, path);
+    }
+    if request.method == "POST"
+        && !(request
+            .header("origin")
+            .is_some_and(|origin| net::origin_matches(origin, host))
+            && request.content_type_is("application/json"))
+    {
+        shared.report(ServerEvent::Refused { from, status: 403 });
+        return error(text::bad_origin());
+    }
+    if path == "/api/pair" {
+        return match request.method.as_str() {
+            "POST" => pair(request, from, local.port(), shared),
+            _ => method_not_allowed("POST"),
+        };
+    }
+    let api = match path {
+        "/api/state" => ApiRoute::State,
+        "/api/events" => ApiRoute::Events,
+        "/api/master" => ApiRoute::Master,
+        "/api/unpair" => ApiRoute::Unpair,
+        "/api/source" => ApiRoute::Source,
+        "/api/mix" => ApiRoute::Mix,
+        _ => {
+            if let Some(id) = path.strip_prefix("/api/speakers/") {
+                ApiRoute::Speaker(percent_decode(id))
+            } else if let Some(id) = path.strip_prefix("/api/zones/") {
+                ApiRoute::Zone(percent_decode(id))
+            } else if let Some(id) = path.strip_prefix("/api/presets/") {
+                ApiRoute::Preset(percent_decode(id))
+            } else {
+                return error(text::not_found());
+            }
+        }
+    };
+    let (method, allow) = match api {
+        ApiRoute::State | ApiRoute::Events => ("GET", "GET"),
+        _ => ("POST", "POST"),
+    };
+    if request.method != method {
+        return method_not_allowed(allow);
+    }
+    let Some((token, device, old_name)) = shared.paired(request, from, local.port()) else {
+        return error(text::not_paired());
+    };
+    if api.writes() && shared.calibrating() {
+        return error(text::calibrating());
+    }
+    let name = token_cookie_name(local.port(), &shared.install);
+    let mut cookies = Vec::new();
+    if let Some(old_name) = &old_name {
+        cookies.push(token_cookie(old_name, "", 0));
+    }
+    if !matches!(api, ApiRoute::Unpair) {
+        let renewed = shared.rotate(&token);
+        if old_name.is_some() || renewed.is_some() {
+            let value = renewed.as_deref().unwrap_or(&token);
+            cookies.push(token_cookie(&name, value, COOKIE_MAX_AGE));
+        }
+    }
+    let answer = match api {
+        ApiRoute::State => match lock(&shared.published).history.back() {
+            Some((_, json)) => Response::json(200, json.to_string()).into(),
+            None => error(text::not_ready()),
+        },
+        ApiRoute::Events => return Answer::Events { device, cookies },
+        ApiRoute::Master => master(request, shared),
+        ApiRoute::Unpair => unpair(&token, from, &name, shared),
+        ApiRoute::Speaker(id) => speaker(request, id, shared),
+        ApiRoute::Zone(id) => zone(request, id, shared),
+        ApiRoute::Preset(id) => preset(request, id, shared),
+        ApiRoute::Source => source(request, shared),
+        ApiRoute::Mix => mix(request, shared),
+    };
+    match answer {
+        Answer::Response(response) => cookies
+            .into_iter()
+            .fold(response, |response, cookie| {
+                response.with("Set-Cookie", cookie)
+            })
+            .into(),
+        answer => answer,
+    }
+}
+
+fn static_route(request: &Request, path: &str) -> Answer {
+    let found = match path {
+        "/" => Some(("text/html; charset=utf-8", page::PAGE.as_bytes())),
+        "/manifest.webmanifest" => Some(("application/manifest+json", page::MANIFEST.as_bytes())),
+        "/icon-180.png" => Some(("image/png", page::ICON_180)),
+        "/icon-512.png" => Some(("image/png", page::ICON_512)),
+        _ => None,
+    };
+    let Some((content_type, body)) = found else {
+        return error(text::not_found());
+    };
+    if request.method != "GET" {
+        return method_not_allowed("GET");
+    }
+    Response::new(200, content_type, body)
+        .with("Cache-Control", "no-cache")
+        .into()
+}
+
+/// A path segment with its `%XX` escapes decoded (RFC 3986 §2.1); none
+/// when an escape is broken or the result isn't UTF-8.
+pub(crate) fn percent_decode(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let pair = segment.get(index + 1..index + 3)?;
+            // from_str_radix would also take "+F".
+            if !pair.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            out.push(u8::from_str_radix(pair, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok().filter(|id| !id.is_empty())
+}
+
+/// The cookie that carries the device token. Browsers send a cookie to every
+/// port of its host (RFC 6265 §8.5), and a phone on another network may meet
+/// another AudioSync at the same address, so the name carries both the port
+/// and this install's ID.
+fn token_cookie_name(port: u16, install: &str) -> String {
+    format!("{TOKEN_COOKIE}_{port}_{install}")
+}
+
+fn token_cookie(name: &str, value: &str, max_age: u64) -> String {
+    format!("{name}={value}; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Strict")
+}
+
+fn pair(request: &Request, from: IpAddr, port: u16, shared: &Shared) -> Answer {
+    let Ok(code) = state::pairing_code_from_body(&request.body) else {
+        return error(text::bad_json());
+    };
+    // Made first, so a right code is never used up without a token to show for it.
+    let Ok(token) = auth::random_token() else {
+        return error(text::not_ready());
+    };
+    let (outcome, next_code) = {
+        let mut pairing = lock(&shared.pairing);
+        let now = Instant::now();
+        let outcome = pairing.attempt(from, &code, now);
+        let next_code = (shared.log_pairing_codes && outcome == PairOutcome::Paired)
+            .then(|| pairing.current(now).map(str::to_owned))
+            .flatten();
+        (outcome, next_code)
+    };
+    let failure = match outcome {
+        PairOutcome::Paired => None,
+        PairOutcome::Wrong => Some(text::wrong_code()),
+        PairOutcome::Expired => Some(text::code_expired()),
+        PairOutcome::Limited => Some(text::too_many_tries()),
+        PairOutcome::Blocked => Some(text::pairing_locked()),
+        PairOutcome::Locked => Some(text::pairing_locked()),
+    };
+    if let Some(failure) = failure {
+        shared.report(ServerEvent::PairFailed { from, why: outcome });
+        return error(failure);
+    }
+    let snapshot = lock(&shared.devices).add(&token, from, SystemTime::now());
+    let forgot_oldest = snapshot.forgot_oldest();
+    shared.save(snapshot);
+    shared.report(ServerEvent::Paired { from });
+    if forgot_oldest {
+        shared.report(ServerEvent::OldestForgotten);
+    }
+    if let Some(next_code) = next_code {
+        shared.report(ServerEvent::PairingCode(next_code));
+    }
+    Response::json(200, json!({ "paired": true }).to_string())
+        .with(
+            "Set-Cookie",
+            token_cookie(
+                &token_cookie_name(port, &shared.install),
+                &token,
+                COOKIE_MAX_AGE,
+            ),
+        )
+        .into()
+}
+
+fn unpair(token: &str, from: IpAddr, cookie: &str, shared: &Shared) -> Answer {
+    let snapshot = lock(&shared.devices).remove(token);
+    shared.wake_streams();
+    if let Some(snapshot) = snapshot {
+        shared.save(snapshot);
+    }
+    shared.report(ServerEvent::Unpaired { from });
+    Response::json(200, json!({ "paired": false }).to_string())
+        .with("Set-Cookie", token_cookie(cookie, "", 0))
+        .into()
+}
+
+fn body_error(problem: BodyError) -> Answer {
+    match problem {
+        BodyError::Malformed => error(text::bad_json()),
+        BodyError::Empty => error(text::nothing_to_change()),
+    }
+}
+
+fn range_error(problem: RangeError) -> ApiError {
+    match problem {
+        RangeError::Volume => text::volume_out_of_range(),
+        RangeError::Delay { min_ms, max_ms } => text::delay_out_of_range(min_ms, max_ms),
+    }
+}
+
+fn accepted(command: &Command, shared: &Shared) -> Answer {
+    if shared.deliver(command) {
+        Response::json(202, json!({ "accepted": true }).to_string()).into()
+    } else {
+        error(text::not_ready())
+    }
+}
+
+fn master(request: &Request, shared: &Shared) -> Answer {
+    let volume = match state::master_volume_from_body(&request.body) {
+        Ok(volume) => volume,
+        Err(problem) => return body_error(problem),
+    };
+    if let Err(problem) = state::check_master_volume(volume) {
+        return error(range_error(problem));
+    }
+    accepted(&Command::Master { volume }, shared)
+}
+
+fn speaker(request: &Request, id: Option<String>, shared: &Shared) -> Answer {
+    let change = match state::speaker_change_from_body(&request.body) {
+        Ok(change) => change,
+        Err(problem) => return body_error(problem),
+    };
+    let Some(id) = id else {
+        return error(text::unknown_speaker());
+    };
+    let checked = match lock(&shared.published)
+        .current
+        .as_ref()
+        .and_then(|state| state.speaker(&id))
+    {
+        None => Err(text::unknown_speaker()),
+        Some(speaker) if !speaker.available => Err(text::speaker_unavailable()),
+        Some(speaker) => speaker.check(&change).map_err(range_error),
+    };
+    match checked {
+        Ok(()) => accepted(&Command::Speaker { id, change }, shared),
+        Err(problem) => error(problem),
+    }
+}
+
+fn zone(request: &Request, id: Option<String>, shared: &Shared) -> Answer {
+    let change = match state::zone_change_from_body(&request.body) {
+        Ok(change) => change,
+        Err(problem) => return body_error(problem),
+    };
+    let Some(id) = id else {
+        return error(text::unknown_zone());
+    };
+    let checked = match lock(&shared.published)
+        .current
+        .as_ref()
+        .and_then(|state| state.zone(&id).map(|zone| state.check_zone(zone, &change)))
+    {
+        None => Err(text::unknown_zone()),
+        Some(result) => result.map_err(|problem| match problem {
+            ZoneProblem::Unavailable => text::zone_unavailable(),
+            ZoneProblem::Range(range) => range_error(range),
+        }),
+    };
+    match checked {
+        Ok(()) => accepted(&Command::Zone { id, change }, shared),
+        Err(problem) => error(problem),
+    }
+}
+
+/// `POST /api/source` `{id}`: a pick in the app's source picker. The app
+/// checks it again when it applies it.
+fn source(request: &Request, shared: &Shared) -> Answer {
+    let id = match state::source_id_from_body(&request.body) {
+        Ok(id) => id,
+        Err(problem) => return body_error(problem),
+    };
+    let checked = match lock(&shared.published)
+        .current
+        .as_ref()
+        .and_then(|state| state.source(&id))
+    {
+        None => Err(text::unknown_source()),
+        Some(source) if !source.available => Err(text::source_unavailable()),
+        Some(_) => Ok(()),
+    };
+    match checked {
+        Ok(()) => accepted(&Command::Source { id }, shared),
+        Err(problem) => error(problem),
+    }
+}
+
+/// `POST /api/mix` `{apps}`: the apps checked in the several-apps list, of
+/// those the snapshot lists as running, once each in the order sent. The app
+/// checks them again when it applies them.
+fn mix(request: &Request, shared: &Shared) -> Answer {
+    let Some(asked) = state::mix_apps_from_body(&request.body) else {
+        return error(text::bad_request());
+    };
+    let mut apps: Vec<String> = Vec::new();
+    if let Some(state) = lock(&shared.published).current.as_ref() {
+        for id in asked {
+            let running = state.mix_apps.iter().any(|app| app.running && app.id == id);
+            if running && !apps.contains(&id) {
+                apps.push(id);
+            }
+        }
+    }
+    if apps.is_empty() {
+        return error(text::mix_apps_gone());
+    }
+    accepted(&Command::Mix { apps }, shared)
+}
+
+fn preset(request: &Request, id: Option<String>, shared: &Shared) -> Answer {
+    if let Err(problem) = state::preset_recall_from_body(&request.body) {
+        return body_error(problem);
+    }
+    let known = id.as_deref().is_some_and(|id| {
+        lock(&shared.published)
+            .current
+            .as_ref()
+            .is_some_and(|state| state.preset(id).is_some())
+    });
+    match id {
+        Some(id) if known => accepted(&Command::Preset { id }, shared),
+        _ => error(text::unknown_preset()),
+    }
+}
+
+/// The event stream (HTML Living Standard §9.2): the current snapshot at
+/// once, then each new revision once, a `ping` event when it has been quiet
+/// for a heartbeat, so the page can tell a dead stream. It ends when the
+/// server stops, the device is forgotten or the device opens a stream too
+/// many, which sends a last `replaced` event.
+fn stream_events(stream: TcpStream, device: u64, cookies: &[String], shared: &Shared) {
+    let Ok(probe) = stream.try_clone() else {
+        return;
+    };
+    let id = shared.open_stream(device, probe);
+    send_events(stream, device, cookies, id, shared);
+    shared.close_stream(id);
+}
+
+/// Whether the page closed its event stream; a page never sends on one.
+fn closed(stream: &TcpStream) -> bool {
+    if stream.set_read_timeout(Some(PROBE)).is_err() {
+        return false;
+    }
+    peek_says_closed(&stream.peek(&mut [0u8; 1]), cfg!(windows))
+}
+
+fn peek_says_closed(peek: &io::Result<usize>, windows: bool) -> bool {
+    match peek {
+        Ok(count) => *count == 0,
+        // A busy Windows PC can end a timed read with WSA_IO_PENDING instead of a timeout.
+        Err(error) if windows && error.raw_os_error() == Some(997) => false,
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        ),
+    }
+}
+
+fn send_events(mut stream: TcpStream, device: u64, cookies: &[String], id: u64, shared: &Shared) {
+    let mut headers = vec![
+        ("Content-Type", "text/event-stream".to_owned()),
+        ("Cache-Control", "no-store".to_owned()),
+    ];
+    headers.extend(cookies.iter().map(|cookie| ("Set-Cookie", cookie.clone())));
+    let head = http::head(200, &headers, &shared.content_security_policy) + "\r\n";
+    if stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.flush())
+        .is_err()
+    {
+        return;
+    }
+    let mut sent = 0u64;
+    let mut last_write = Instant::now();
+    loop {
+        let batch = {
+            let mut published = lock(&shared.published);
+            loop {
+                if shared.stopped.load(Ordering::SeqCst)
+                    || !lock(&shared.devices).holds(device, SystemTime::now())
+                {
+                    return;
+                }
+                if !shared.stream_open(id) {
+                    drop(published);
+                    // Without it the page would reconnect and end the device's next stream in turn.
+                    let _ = stream
+                        .write_all(b"event: replaced\ndata: {}\n\n")
+                        .and_then(|()| stream.flush());
+                    return;
+                }
+                let batch = published.since(sent);
+                if !batch.is_empty() {
+                    break batch;
+                }
+                let left = shared.heartbeat.saturating_sub(last_write.elapsed());
+                if left.is_zero() {
+                    break Vec::new();
+                }
+                published = shared
+                    .changed
+                    .wait_timeout(published, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        };
+        let mut text = String::new();
+        if batch.is_empty() {
+            text.push_str("event: ping\ndata:\n\n");
+        }
+        for (revision, json) in &batch {
+            text.push_str(&format!("event: state\nid: {revision}\ndata: {json}\n\n"));
+            sent = *revision;
+        }
+        if stream
+            .write_all(text.as_bytes())
+            .and_then(|()| stream.flush())
+            .is_err()
+        {
+            return;
+        }
+        last_write = Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_timed_peek_on_windows_is_not_a_closed_page() {
+        let pending = Err(io::Error::from_raw_os_error(997));
+        assert!(!peek_says_closed(&pending, true));
+        assert!(peek_says_closed(&pending, false));
+        assert!(peek_says_closed(&Ok(0), true));
+        assert!(peek_says_closed(
+            &Err(io::ErrorKind::ConnectionReset.into()),
+            true
+        ));
+    }
+
+    fn held(peer: IpAddr, count: usize, reserved: bool, paired: bool) -> Vec<Slot> {
+        vec![
+            Slot {
+                peer,
+                reserved,
+                paired
+            };
+            count
+        ]
+    }
+
+    fn address(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    // Private addresses are built from their parts: published files never spell one.
+    fn home(subnet: u8, host: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, subnet, host))
+    }
+
+    /// Admits a loopback connection as if accept had reported `peer`; the
+    /// client has already sent a request.
+    fn admit_as(
+        server: &RemoteServer,
+        reported: &mut HashMap<IpAddr, Instant>,
+        peer: IpAddr,
+    ) -> TcpStream {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        assert!(
+            admit(
+                stream,
+                SocketAddr::new(peer, 50000),
+                &server.shared,
+                reported,
+                &[
+                    net::LocalNet {
+                        address: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                        prefix: 24,
+                        point_to_point: false,
+                    },
+                    net::LocalNet {
+                        address: address("fe80::10"),
+                        prefix: 64,
+                        point_to_point: false,
+                    },
+                ]
+            )
+            .is_none()
+        );
+        client
+    }
+
+    fn not_private_events(server: &RemoteServer) -> Vec<IpAddr> {
+        std::iter::from_fn(|| server.poll_event())
+            .filter_map(|event| match event {
+                ServerEvent::NotPrivate { from } => Some(from),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // covers: S338
+    #[test]
+    fn a_refused_address_is_reported_once_a_minute() {
+        let mut reported = HashMap::new();
+        let start = Instant::now();
+        let public = address("203.0.113.5");
+        let later = start + Duration::from_secs(59);
+        assert!(note_refusal(&mut reported, public, start));
+        assert!(!note_refusal(&mut reported, public, later));
+        assert!(note_refusal(&mut reported, address("203.0.113.6"), later));
+        assert!(note_refusal(
+            &mut reported,
+            public,
+            start + REFUSAL_LOG_INTERVAL
+        ));
+        for host in 0..MAX_REFUSALS_LOGGED {
+            let peer = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, host as u16));
+            note_refusal(&mut reported, peer, later);
+        }
+        assert_eq!(reported.len(), MAX_REFUSALS_LOGGED);
+    }
+
+    // covers: S338
+    #[test]
+    fn only_home_network_peers_get_an_answer_and_a_refusal_is_logged_once() {
+        let config = Config {
+            port: 0,
+            listen: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ..Config::default()
+        };
+        let server = RemoteServer::start(config, |_| {}).unwrap();
+        let mut reported = HashMap::new();
+        let public = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let mapped = IpAddr::V6(Ipv4Addr::new(8, 8, 8, 8).to_ipv6_mapped());
+        for peer in [public, mapped, public] {
+            let mut client = admit_as(&server, &mut reported, peer);
+            let mut answer = Vec::new();
+            let _ = client.read_to_end(&mut answer);
+            assert!(answer.is_empty(), "{peer} got an answer");
+        }
+        assert_eq!(not_private_events(&server), [public]);
+        for peer in [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            address("fe80::1"),
+        ] {
+            let mut client = admit_as(&server, &mut reported, peer);
+            let mut answer = Vec::new();
+            let _ = client.read_to_end(&mut answer);
+            assert!(answer.starts_with(b"HTTP/1.1 "), "{peer} got no answer");
+        }
+        assert!(not_private_events(&server).is_empty());
+    }
+
+    // covers: S378
+    #[test]
+    fn two_ipv6_hosts_in_one_64_have_a_connection_cap_each() {
+        let capacity = Capacity::default();
+        let laptop = net::peer_group(address("2001:db8:1:2::1"));
+        let mut slots = held(laptop, MAX_CONNECTIONS_PER_PEER, false, false);
+        assert_eq!(admission(&slots, laptop, capacity), Admission::PeerBusy);
+        let phone = net::peer_group(address("2001:db8:1:2::2"));
+        assert_eq!(admission(&slots, phone, capacity), Admission::Open);
+        slots.extend(held(phone, 1, false, true));
+        assert_eq!(admission(&slots, phone, capacity), Admission::Open);
+    }
+
+    // covers: S378
+    #[test]
+    fn unpaired_connections_leave_the_reserved_slots_to_paired_devices() {
+        let capacity = Capacity::default();
+        let peers: Vec<IpAddr> = (1..=4).map(|host| home(0, host)).collect();
+        let mut slots: Vec<Slot> = peers[..3]
+            .iter()
+            .flat_map(|peer| held(*peer, MAX_CONNECTIONS_PER_PEER, false, false))
+            .collect();
+        assert_eq!(slots.len(), MAX_CONNECTIONS - RESERVED_FOR_PAIRED);
+        let fourth = peers[3];
+        for _ in 0..RESERVED_PER_PEER {
+            assert_eq!(admission(&slots, fourth, capacity), Admission::Reserved);
+            slots.extend(held(fourth, 1, true, false));
+        }
+        assert_eq!(admission(&slots, fourth, capacity), Admission::Busy);
+        // A reserved slot that showed a token holds it like any paired connection.
+        let paired_phone = home(0, 9);
+        slots.extend(held(paired_phone, 1, true, true));
+        assert_eq!(
+            admission(&slots, paired_phone, capacity),
+            Admission::Reserved
+        );
+        slots.extend(held(paired_phone, 1, true, true));
+        assert_eq!(
+            admission(&slots, paired_phone, capacity),
+            Admission::Reserved
+        );
+        let full: Vec<Slot> = (0..MAX_CONNECTIONS)
+            .map(|index| Slot {
+                peer: home(1, index as u8),
+                reserved: false,
+                paired: true,
+            })
+            .collect();
+        assert_eq!(admission(&full, paired_phone, capacity), Admission::Busy);
+    }
+
+    // covers: S378
+    #[test]
+    fn a_host_with_many_addresses_cannot_hold_every_reserved_slot() {
+        let capacity = Capacity::default();
+        let mut slots: Vec<Slot> = (1..=3)
+            .flat_map(|host| held(home(0, host), MAX_CONNECTIONS_PER_PEER, false, false))
+            .collect();
+        let shared = slots.len();
+        // Link-local addresses are peers of their own, so one host can bring many.
+        for host in 1..=RESERVED_FOR_PAIRED / RESERVED_PER_PEER {
+            let peer = net::peer_group(address(&format!("fe80::{host}")));
+            for _ in 0..RESERVED_PER_PEER {
+                assert_eq!(admission(&slots, peer, capacity), Admission::Reserved);
+                slots.extend(held(peer, 1, true, false));
+            }
+        }
+        assert_eq!(slots.len(), MAX_CONNECTIONS);
+        let phone = home(0, 9);
+        assert_eq!(
+            admission(&slots, phone, capacity),
+            Admission::Replace(shared)
+        );
+        // A peer already waiting in its share of reserved slots gets no more.
+        let last = slots[MAX_CONNECTIONS - 1].peer;
+        assert_eq!(admission(&slots, last, capacity), Admission::Busy);
+    }
+
+    // covers: S378
+    #[test]
+    fn paired_connections_leave_the_shared_slots_open() {
+        let capacity = Capacity::default();
+        let mut slots = Vec::new();
+        for host in 1..=3 {
+            slots.extend(held(home(0, host), MAX_CONNECTIONS_PER_PEER, false, true));
+        }
+        assert_eq!(admission(&slots, home(0, 4), capacity), Admission::Open);
+    }
+
+    fn published(revisions: std::ops::RangeInclusive<u64>) -> Published {
+        let mut published = Published::default();
+        for revision in revisions {
+            published.revision = revision;
+            published
+                .history
+                .push_back((revision, Arc::from(revision.to_string())));
+        }
+        published
+    }
+
+    fn revisions(batch: Vec<(u64, Arc<str>)>) -> Vec<u64> {
+        batch.into_iter().map(|(revision, _)| revision).collect()
+    }
+
+    // covers: S377
+    #[test]
+    fn a_stream_gets_each_revision_once() {
+        let kept = published(3..=6);
+        assert_eq!(revisions(kept.since(0)), [6]);
+        assert_eq!(revisions(kept.since(4)), [5, 6]);
+        assert_eq!(revisions(kept.since(2)), [3, 4, 5, 6]);
+        assert_eq!(revisions(kept.since(1)), [6], "fell behind the history");
+        assert!(kept.since(6).is_empty());
+        assert!(Published::default().since(0).is_empty());
+    }
+
+    // covers: S376
+    #[test]
+    fn speaker_ids_are_percent_decoded() {
+        assert_eq!(percent_decode("den"), Some("den".to_owned()));
+        assert_eq!(
+            percent_decode("AppleUSB%3A12%2Fx%20y"),
+            Some("AppleUSB:12/x y".to_owned())
+        );
+        assert_eq!(percent_decode("caf%C3%A9"), Some("café".to_owned()));
+        assert_eq!(percent_decode("bad%2"), None);
+        assert_eq!(percent_decode("bad%zz"), None);
+        assert_eq!(percent_decode("%FF"), None);
+        assert_eq!(percent_decode(""), None);
+    }
+
+    fn pair_request(host: &str, code: &str) -> Request {
+        let head = format!(
+            "POST /api/pair HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Type: application/json"
+        );
+        let mut request = http::parse_head(head.as_bytes()).unwrap();
+        request.body = json!({ "code": code }).to_string().into_bytes();
+        request
+    }
+
+    fn status(answer: Answer) -> u16 {
+        match answer {
+            Answer::Response(response) => response.status,
+            Answer::Events { .. } => 200,
+        }
+    }
+
+    // A request already accepted when stop takes the sink; no socket reaches that window.
+    // covers: S376
+    #[test]
+    fn a_command_once_stopping_answers_503_and_reaches_nothing() {
+        let config = Config {
+            port: 0,
+            listen: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ..Config::default()
+        };
+        let reached = Arc::new(AtomicBool::new(false));
+        let sink = Arc::clone(&reached);
+        let mut server = RemoteServer::start(config, move |_: &Command| {
+            sink.store(true, Ordering::SeqCst);
+        })
+        .unwrap();
+        server
+            .publish_json(
+                r#"{"computer_name": "Den", "master": {"volume": 70}, "speakers": [
+                {"id": "kitchen", "name": "Kitchen", "kind": "local", "on": true, "volume": 40,
+                 "delay_ms": 0, "delay_min_ms": 0, "delay_max_ms": 1000, "available": true,
+                 "notice": null}]}"#,
+            )
+            .unwrap();
+        server.stop_in_place();
+        let mut request =
+            http::parse_head(b"POST /api/speakers/kitchen HTTP/1.1\r\nHost: localhost").unwrap();
+        request.body = br#"{"volume": 55}"#.to_vec();
+        let Answer::Response(response) =
+            speaker(&request, Some("kitchen".to_owned()), &server.shared)
+        else {
+            panic!("a command answers with a response");
+        };
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "not_ready");
+        assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    // Through route, not sockets: a test can't connect from 127.0.0.2 on macOS.
+    // covers: S368, S369, S373
+    #[test]
+    fn a_new_local_name_keeps_the_pairing_lockout_and_the_code() {
+        let config = Config {
+            port: 0,
+            listen: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            local_name: Some("kitchen".to_owned()),
+            ..Config::default()
+        };
+        let server = RemoteServer::start(config, |_: &Command| {}).unwrap();
+        let port = server.port();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let named = |name: &str| format!("{name}.local:{port}");
+        let code = server.pairing_code().unwrap();
+        let wrong: String = code
+            .chars()
+            .map(|digit| if digit == '0' { '1' } else { '0' })
+            .collect();
+        for index in 0..auth::WRONG_BEFORE_LOCK {
+            let host = 1 + (index as usize / auth::WRONG_PER_WINDOW) as u8;
+            let from = IpAddr::V4(Ipv4Addr::new(127, 0, 0, host));
+            let request = pair_request(&named("kitchen"), &wrong);
+            let host = named("kitchen");
+            assert_eq!(
+                status(route(&request, &host, from, local, &server.shared)),
+                401
+            );
+        }
+        assert!(server.pairing_locked());
+
+        server.set_local_name(Some("kitchen-2"));
+
+        assert!(server.pairing_locked());
+        assert_eq!(server.pairing_code().as_deref(), Some(code.as_str()));
+        let from = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 100));
+        let renamed = pair_request(&named("kitchen-2"), &code);
+        let host = named("kitchen-2");
+        assert_eq!(
+            status(route(&renamed, &host, from, local, &server.shared)),
+            429
+        );
+        let old = pair_request(&named("kitchen"), &code);
+        assert!(allowed_host(&old, from, local, &server.shared).is_none());
+        server.stop();
+    }
+
+    // Through serve on a socket of the test's own, listed as a held connection.
+    // covers: S373
+    #[test]
+    fn a_foreign_host_with_a_paired_token_leaves_last_seen_and_the_slot_alone() {
+        let config = Config {
+            port: 0,
+            listen: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ..Config::default()
+        };
+        let server = RemoteServer::start(config, |_: &Command| {}).unwrap();
+        let shared = &server.shared;
+        let token = auth::random_token().unwrap();
+        let paired_at = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+        let _ = lock(&shared.devices).add(&token, IpAddr::V4(Ipv4Addr::LOCALHOST), paired_at);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let (stream, from) = listener.accept().unwrap();
+        let paired = Arc::new(AtomicBool::new(false));
+        lock(&shared.connections).push(Connection {
+            slot: Slot {
+                peer: from.ip(),
+                reserved: false,
+                paired: false,
+            },
+            paired: Arc::clone(&paired),
+            stream: stream.try_clone().unwrap(),
+            thread: thread::spawn(|| {}),
+        });
+        let raw = format!(
+            "GET /api/state HTTP/1.1\r\nHost: evil.example:{port}\r\nCookie: {}={token}\r\n\r\n",
+            token_cookie_name(port, &shared.install)
+        );
+        client.write_all(raw.as_bytes()).unwrap();
+        let closer = stream.try_clone().unwrap();
+        serve(stream, from.ip(), false, &paired, shared);
+        let _ = closer.shutdown(Shutdown::Both);
+        let mut answer = String::new();
+        let _ = client.read_to_string(&mut answer);
+        assert!(answer.starts_with("HTTP/1.1 403 "), "{answer:?}");
+        assert!(!paired.load(Ordering::SeqCst), "the slot was marked paired");
+        assert!(
+            !lock(&shared.devices).contains(&token, paired_at + auth::DEVICE_IDLE_LIMIT),
+            "last-seen moved"
+        );
+        server.stop();
+    }
+
+    fn state_request(host: &str, port: u16, install: &str, token: &str) -> Request {
+        let head = format!(
+            "GET /api/state HTTP/1.1\r\nHost: {host}\r\nCookie: {}={token}",
+            token_cookie_name(port, install)
+        );
+        http::parse_head(head.as_bytes()).unwrap()
+    }
+
+    /// The new token an answer sets, if any.
+    fn set_token(answer: &Answer) -> Option<String> {
+        let Answer::Response(response) = answer else {
+            return None;
+        };
+        response.headers.iter().find_map(|(name, value)| {
+            let value = value.strip_prefix(&format!("{TOKEN_COOKIE}_"))?;
+            let (_, rest) = value.split_once('=')?;
+            let token = rest.split(';').next()?;
+            (*name == "Set-Cookie" && !token.is_empty()).then(|| token.to_owned())
+        })
+    }
+
+    fn local_server() -> (RemoteServer, SocketAddr, String) {
+        let config = Config {
+            port: 0,
+            listen: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ..Config::default()
+        };
+        let server = RemoteServer::start(config, |_: &Command| {}).unwrap();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server.port());
+        let host = format!("127.0.0.1:{}", server.port());
+        (server, local, host)
+    }
+
+    // covers: S425
+    #[test]
+    fn a_token_sent_from_another_address_is_refused_and_forgotten() {
+        let (server, local, host) = local_server();
+        let phone = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let code = server.pairing_code().unwrap();
+        let answer = route(
+            &pair_request(&host, &code),
+            &host,
+            phone,
+            local,
+            &server.shared,
+        );
+        let token = set_token(&answer).expect("a token");
+        let request = state_request(&host, local.port(), &server.shared.install, &token);
+        assert_ne!(
+            status(route(&request, &host, phone, local, &server.shared)),
+            401
+        );
+
+        let other = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
+        assert_eq!(
+            status(route(&request, &host, other, local, &server.shared)),
+            401
+        );
+        assert_eq!(
+            status(route(&request, &host, phone, local, &server.shared)),
+            401
+        );
+        assert_eq!(server.device_count(), 0);
+        server.stop();
+    }
+
+    // covers: S425
+    #[test]
+    fn an_old_token_gets_a_new_one_and_stops_working_after_the_grace() {
+        let (server, local, host) = local_server();
+        let phone = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let old = auth::random_token().unwrap();
+        let paired_at = SystemTime::now() - Duration::from_secs(60 * 60);
+        let _ = lock(&server.shared.devices).add(&old, phone, paired_at);
+
+        let request = state_request(&host, local.port(), &server.shared.install, &old);
+        let answer = route(&request, &host, phone, local, &server.shared);
+        let new = set_token(&answer).expect("a new token");
+        assert_ne!(new, old);
+        let renewed = state_request(&host, local.port(), &server.shared.install, &new);
+        let answer = route(&renewed, &host, phone, local, &server.shared);
+        assert_ne!(status(answer), 401);
+        assert_ne!(
+            status(route(&request, &host, phone, local, &server.shared)),
+            401
+        );
+
+        let later = SystemTime::now() + Duration::from_secs(61);
+        let devices = lock(&server.shared.devices);
+        assert!(devices.contains(&new, later));
+        assert!(!devices.contains(&old, later));
+        drop(devices);
+        server.stop();
+    }
+
+    // covers: S427
+    #[test]
+    fn a_replaced_token_after_the_grace_unpairs_the_device_and_is_logged() {
+        let (server, local, host) = local_server();
+        let phone = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let old = auth::random_token().unwrap();
+        let paired_at = SystemTime::now() - Duration::from_secs(60 * 60);
+        let mut devices = lock(&server.shared.devices);
+        let _ = devices.add(&old, phone, paired_at);
+        let due = paired_at + auth::ROTATE_AFTER;
+        let (new, _) = devices.rotate(&old, due).unwrap().expect("a new token");
+        assert!(devices.check(&new, phone, due).0.is_some());
+        drop(devices);
+        while server.poll_event().is_some() {}
+
+        let request = state_request(&host, local.port(), &server.shared.install, &old);
+        assert_eq!(
+            status(route(&request, &host, phone, local, &server.shared)),
+            401
+        );
+        let renewed = state_request(&host, local.port(), &server.shared.install, &new);
+        assert_eq!(
+            status(route(&renewed, &host, phone, local, &server.shared)),
+            401
+        );
+        assert_eq!(server.device_count(), 0);
+        let lines: Vec<String> = std::iter::from_fn(|| server.poll_event())
+            .map(|event| event.to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            ["remote: a replaced token came back from 127.0.0.1; its device is unpaired"]
+        );
+        server.stop();
+    }
+
+    // covers: S370
+    #[test]
+    fn log_lines_never_carry_a_code() {
+        let from = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let line = ServerEvent::PairFailed {
+            from,
+            why: PairOutcome::Wrong,
+        }
+        .to_string();
+        assert_eq!(line, "remote: pairing from 127.0.0.1 failed: wrong code");
+    }
+
+    // covers: S379
+    #[test]
+    fn a_config_reads_from_json_with_defaults() {
+        let config = Config::from_json("{}").unwrap();
+        assert_eq!(config.port, DEFAULT_PORT);
+        assert_eq!(config.listen.len(), 2);
+        assert_eq!(config.devices_path, None);
+        let config = Config::from_json(
+            r#"{"port": 0, "local_name": "kitchen", "devices_path": "remote-devices.json", "listen": ["127.0.0.1", "::1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.port, 0);
+        assert_eq!(config.local_name.as_deref(), Some("kitchen"));
+        assert_eq!(
+            config.devices_path,
+            Some(PathBuf::from("remote-devices.json"))
+        );
+        assert_eq!(
+            config.listen,
+            [
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            ]
+        );
+        for bad in [
+            "[]",
+            "not json",
+            r#"{"port": 70000}"#,
+            r#"{"port": "80"}"#,
+            r#"{"local_name": 1}"#,
+            r#"{"listen": ["nowhere"]}"#,
+        ] {
+            assert!(Config::from_json(bad).is_none(), "{bad}");
+        }
+    }
+}

@@ -1,0 +1,222 @@
+# Clauses of docs/ENGINE_SPEC.md that only the host application can implement,
+# so no test in core/ can cover them. One per line: the clause ID, a space, the
+# reason. tests/spec_coverage.rs fails if a clause listed here gains a
+# `// covers:` test, so keep this list honest and short.
+# A clause retired or superseded as a whole needs no line; one may stay as a record.
+S6 Architecture overview only; each component it names has its own clauses.
+S10 Hosts only: the capture leaves AudioSync's own process out; the Mac logic suite checks it for app sources, mixes and their taps, and the Windows tests for the whole system.
+S11 Mac host only: the Core Audio process objects that make up an app source; its logic suite checks it.
+S13 Mac host only: the process tap mutes the tapped processes' own output; its logic suite checks that every tap is set up muted and private (SourceCapture.configureTap) and that a retap keeps the app muted.
+S60 Mac host only: Core Audio output device enumeration and device object IDs; the --hardware engine suite checks it, and the Mac logic suite checks one renderer per output on and listed, bound to its device.
+S61 The renderer object wraps a Core Audio output unit; its pure parts are S56, S62, S64 and S65, and the --hardware engine suite checks the rest.
+S66 A renderer's delay call measured on real hardware by the --hardware engine suite; its pure parts are S3 and S46; the Mac logic suite checks the fade-out wait through the core's renderer.
+S67 Frames a real output device renders per second; the --hardware engine suite checks it.
+S72 Retired in part with the bundled engine: what stands, re-applying every active local output's gain on a master change, is the host's; the gain itself is S71's; the Mac logic suite and the Windows tests check the host's part.
+S101 The host's reconciles, driven by Core Audio's device-list notice, the sender's events and a 30 s safety net (the Mac logic suite's "reconcile: …" tests); the rest, the bundled engine's HTTP client transport (timeouts, serial write queue, path encoding), is retired.
+S106 Retired in part with the bundled engine: the decisions on the engine's reports; what stands, the access kinds, is the Mac host's (AirPlayPairing.Access), which its logic suite checks; the core's policy::pairing went too.
+S111 Mac host only: the app's SIGTERM and SIGINT handlers and the exit path; its logic suite checks the quit steps.
+S112 Host only: the interface of the Mac host's engine wrapper (Core Audio device IDs, callbacks); the Mac logic suite and the Windows adapter tests check it.
+S113 Host only: the Mac host makes its control calls and gets its callbacks on the main thread; the Mac logic suite and Tests/run-tests.sh check it, and the Windows adapter tests check that reports wait for the UI thread's poll.
+S114 Session start orchestration, which starts the host's capture after the core's ring and equalizer; the Windows controller's a_failed_start_leaves_nothing_running_and_every_feed_free tests its failure path.
+S115 Session stop orchestration, which stops the host's capture and renderers; the Windows controller's a_second_stop_is_safe_and_no_capture_runs_once_a_stop_finished tests it.
+S154 Mac host only: the Local Network hint and the Bonjour browser states behind it; its logic suite checks it.
+S155 Hosts only: the appearance setting and its stored value; the Mac logic suite and the Windows tests check it.
+S156 Repository shell tooling (shellcheck), checked by CI and Tests/run-tests.sh.
+S167 Retired in part with the bundled engine: its list and reconcile; what stands, the Local Network hint for an empty list, is the host's (S154), which the Mac logic suite checks.
+S170 The hosts' debug log files, which the Mac logic suite and the Windows host's tests check; neither lives in the core.
+S171 Mac host only: Core Audio device lists, their alive state, channel counts and private aggregate devices; its logic suite checks it.
+S173 Mac host only: the reference output, from Core Audio transport types and stream terminal types; its logic suite checks it.
+S174 Windows host only: the reference output, from its endpoint kinds and endpoint IDs; outputs.rs the_built_in_output_with_the_smallest_endpoint_id_is_the_reference checks it.
+S180 Windows host only: the one-time migration of its settings file; adapter.rs an_older_settings_file_is_migrated_once_and_saved_in_the_new_version checks it.
+S181 Hosts only: what the Mac and Windows windows show for offsets and the AirPlay delay; the Mac logic suite and the Windows tests check it.
+S186 Session stop and source change order in the host's engine wrapper (fade requests, the bounded wait, then stopping Core Audio or WASAPI IO); the core's parts are S185 and S189; the Mac logic suite, the --hardware engine suite and the Windows tests check it.
+S192 Hosts only: which rows read a device volume, and that the host never writes one by itself; the Mac logic suite and the Windows tests check it.
+S193 Mac host only: Core Audio volume and mute properties of an output device; its logic suite checks them through a fake Core Audio, a real device by hand.
+S194 Windows host only: WASAPI endpoint volume and mute (IAudioEndpointVolume); the wasapi/volume.rs and controller/device_volume.rs tests check it.
+S195 Hosts only: Core Audio property listeners and WASAPI endpoint volume notifications, and the thread hop to the UI; the Mac logic suite and the Windows tests check it.
+S198 Hosts only: where the device-volume hint shows in the main window and the panel or flyout rows; the Mac logic suite and the Windows tests check it.
+S199 Hosts only: the hint's wording in UIStrings (Mac) and strings.slint (Windows); the Mac logic suite and the Windows tests check it.
+S200 Hosts only: VoiceOver and Narrator labels of the hint and its fix button; the Mac logic suite and the Windows tests check it.
+S202 Hosts only: re-reads when a device goes away, comes back or its row is switched on again; the Mac logic suite and the Windows tests check it.
+S204 Mac host only: settings the Mac app saved under the bundled engine's output IDs move to the native sender's receiver IDs; its logic suite checks it.
+S211 Hosts only: the source picker's entries; the Mac logic suite and the Windows tests check it.
+S212 Hosts only: stored settings read back and clamped (the user defaults on the Mac, a JSON file on Windows); the Mac logic suite and the Windows host's tests check it.
+S213 Mac host only: notes on choices older builds read; its logic suite checks it.
+S214 Mac host only: where a window reopens; its logic suite checks it.
+S215 Hosts only: login-item launches, second launches and the core-setup start message; the Mac logic suite and the Windows tests check it.
+S216 Mac host only: closing a Core Audio process tap and its aggregate device; its logic suite checks it.
+S217 Hosts only: artwork encoded as a JPEG for the AirPlay sender; the Mac logic suite and the Windows host's tests check it.
+S218 Hosts only: the now-playing fields and artwork the receivers show; the Mac logic suite and the Windows host's tests check it.
+S219 Hosts only: what the app hands its own AirPlay sender as track info; the Mac logic suite and the Windows host's tests check it.
+S220 Hosts only: the delay field's typed text and when it applies; the Mac logic suite and the Windows host's tests check it.
+S221 Mac host only: the delay panels of the speaker rows; its logic suite checks it.
+S222 Hosts only: the window's model of the native AirPlay sender's receivers, speakers and failures; the Mac logic suite and the Windows tests check it.
+S225 Test harness only: the soak run's memory rule; the soak rules suite checks it.
+S228 Hosts only: the names the user gives speakers and the inline rename; the Mac logic suite and the Windows host's tests check it.
+S256 Web remote and hosts only: the snapshot's zones, presets and calibrating flag; the remote crate's, the Windows host's and the Mac logic suites check it.
+S257 Web remote and hosts only: the zone and preset routes and what the hosts apply; the remote crate's, the Windows host's and the Mac logic suites check it.
+S258 Web remote and hosts only: writes wait out a microphone run; the remote crate's, the Windows host's and the Mac logic suites check it.
+S242 Hosts only: the Mac process tap and the Windows per-app loopback mix pick and follow the apps; the Mac logic suite and the Windows capture tests check it.
+S244 Hosts only: the core's local delay model takes no source, so live input can't change it; the Windows controller tests check that the hosts pass the network wait under every source, and the Mac check "local delay: the Mac's AirPlay wait takes no source input" that the Mac's wait takes no source input.
+S259 Hosts only: the Presets card in the main window; the Windows tests check it, and the Mac logic suite checks its rows (PresetCore.rows), not its SwiftUI layout.
+S260 Hosts only: the preset row of the menu bar panel and the tray flyout; the Mac logic suite and the Windows tests check it.
+S261 Hosts only: the Presets submenu and its shortcuts; the Mac logic suite and the Windows tests check it.
+S262 Hosts only: saving, renaming, updating and deleting presets; the Mac logic suite and the Windows tests check it.
+S263 Hosts only: the presets' empty state; the Mac logic suite and the Windows tests check it.
+S264 Hosts only: where the current-preset mark shows; its rule is S253's, which the core covers.
+S265 Hosts only: carrying out a recall and its notice; the plan is S252's, which the core covers.
+S266 Hosts only: a recall's focus and the phone's start origin; the Mac logic suite and the Windows tests check it.
+S267 Hosts only: keyboard reach and focus of the preset controls; the Windows tests check it, the Mac logic suite its Control-Command-1 to 9 keys and the rest by hand.
+S268 Hosts only: the preset controls' colors in light and dark; the Windows contrast tests and the Mac logic suite (the Presets card's tokens and their 4.5:1 contrast) check it.
+S269 Hosts only: the preset wording in UIStrings (Mac) and strings.slint (Windows); the Mac logic suite's "presets: the preset texts" and view.rs the_preset_texts_come_from_strings check it.
+S280 Hosts only: keeping each speaker's reported latency and setting the session's L; the rule is the AirPlay crate's (AirPlay spec P200); the Windows tests and the Mac logic suite check it.
+S282 Hosts only: the debug log lines for reported latencies and L; the Mac logic suite and airplay.rs a_receiver_reporting_nothing_starts_at_zero_without_a_warning check them.
+S283 Hosts only: each AirPlay speaker's reported latency as its starting estimate, the per-speaker delay and L the host derives from it; S235's window part is the core's `airplay_wait_ms`, covered there.
+S284 Hosts only: Lf, E and each row's delay with several AirPlay 2 receivers, a target at its largest member's R_s; the Windows tests and the Mac logic suite check it.
+S285 Hosts only: every AirPlay 2 speaker playing, the two wait reasons and one speaker's failure on its own row; the Windows tests and the Mac logic suite check them, the two reasons included.
+S288 Hosts only: the web remote's debug switch at launch; the Windows host's tests and the Mac logic suite check it.
+S292 Hosts only: an explicit pause from a play-pause or the player's own pause seen in the host's now-playing readings, resumed by the mirror or by sound the host counts in its own capture; the Windows tests and the Mac logic suite check it.
+S293 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S294 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S295 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S296 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S297 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S298 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S299 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S300 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S301 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S302 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S303 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S304 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S305 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S306 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S307 Hosts only: the Windows updater of section 19; whether SmartScreen prompts after a swap is checked by hand at the first PC sitting with a real update.
+S308 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S309 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S310 Hosts only: a one-time Mac check that Sparkle offers only the Mac item of the first release appcast carrying Windows items; scripts/check_appcast.py refuses such an appcast until that check's date is on record.
+S311 Hosts only: the release appcast's Windows items; scripts/check_appcast.py checks it (a Python marker the core's coverage rule doesn't count), and scripts/sign_appcast.sh runs it on each release appcast.
+S314 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S315 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S316 Hosts only: the Windows updater of section 19 (desktop/src/updater); the Windows tests check it.
+S325 Hosts only: the Mac and Windows hosts restarting a Bluetooth output once when it starts on a link that just came up; the Mac logic suite and the Windows tests named in the clause check it.
+S326 Hosts only: the Windows output thread ending a stream that takes no frame for 2 s after it took frames once and the controller reopening it; the Windows tests named in the clause check it.
+S327 Hosts only: the Windows host checking every 2 s for an app source it can't watch; the Windows tests named in the clause check it.
+S329 Hosts only: the Windows host reopening only the capture after DeviceGone; the Windows tests named in the clause check it.
+S330 Hosts only: the Windows host reopening an output in its new format when Windows invalidates its stream under it, and the Mac host when its device's rate or channel count changes; the Windows tests and the Mac logic suite named in the clause check it.
+S331 Hosts only: the Windows and Mac hosts keeping on and retrying an output the system refuses to open; the Windows tests and the Mac logic suite check it.
+S332 Hosts only: the Windows and Mac hosts following sleep and resume and trying a lost capture for 60 s after a wake; the Windows tests and Mac logic tests named in the clause check it.
+S333 Hosts only: the Windows capture reading an input another app holds as busy and the controller retrying it every 3 s, and the Mac host doing the same for an input another process holds in hog mode; the Windows tests named in the clause check it, the Mac logic suite's "input busy: …", "capture watch: …" and "EC5 source: …" tests the Mac part.
+S334 Hosts only: the Mac host ending an output whose render callback hands its device no frame for 2 s after it took frames once and attaching it again; the Mac logic suite checks it.
+S335 Hosts only: the Mac host watching its capture for the whole session and on Core Audio's service restart, reopening only the capture, both watches resting from the will-sleep notice to the wake; the Mac logic suite's "capture watch: ..." tests check it.
+S336 Hosts only: the Mac host sending one waiting Apple event per player not yet allowed and reading only allowed players; the Mac logic suite checks it.
+S337 Web remote only: the remote crate failing its start as a port in use when another app holds its port on any address it listens on; the remote crate's tests check it.
+S338 Web remote only: the remote crate closing connections from peers outside the home network ranges and rate-limiting their log lines; the remote crate's tests check it.
+S339 Hosts only: the Mac and Windows hosts' Cast list when the sender's discovery ends, keeping a start in flight and turning off a browsed speaker that is on but no longer listed, and turning off one that is on with no session as soon as discovery reports it gone or its session ends after its row went offline; the Mac logic suite's "cast model: when discovery stops ..." tests and the Windows host's cast tests check it.
+S340 Web remote and hosts only: a paused track's playing flag and the page's Paused and "None of N found" text; the remote crate's, the Windows host's and the Mac logic suites check it.
+S341 Hosts only: the Mac and Windows hosts moving the zone, presets, name, auto-connect (Mac) and hidden entry of a Cast speaker added by address to the ID a browse found; the Mac logic suite's "cast: a speaker added by address that a browse finds ..." tests and the Windows host's adapter and cast tests check it.
+S342 Hosts only: the Mac host leaving on the stereo pair or home theater that holds a recalled member, as the Windows host does under S252; the Mac logic suite checks it.
+S343 Web remote and hosts only: the snapshot's name, master, track and rows with their volume and delay range, and the Mac's JSON text the core takes; the Windows host's tests and the Mac logic suite check it.
+S344 Web remote and hosts only: the source picker's entries and the source in use on the page, and a pick from it; the Windows host's tests and the Mac logic suite check it.
+S345 Hosts only: the Mac host reading the phone's speaker and master commands and applying them as the window's controls would; the Mac logic suite checks it.
+S346 Hosts only: the Mac's native AirPlay texts (PTP timing, PIN prompt, the AirPlay 2 kind, its tooltip and VoiceOver label); the Mac logic suite checks them.
+S348 Hosts only: both hosts keeping the phone's volume for a speaker that is off, a Cast speaker's following its slider; the Windows host's tests and the Mac logic suite check it.
+S349 Hosts only: an auto-connect AirPlay speaker that appears asking for a PIN or password, or unable to play, goes off with a notice; the Windows host's tests and the Mac logic suite check it.
+S350 Hosts only: the Waiting for audio notice when a capture session starts and gets no audio, and the Mac's not-working notice; the core holds none of it; the Mac's logic tests "capture notice: …" and the Windows host's tests marked S350 check it.
+S351 Hosts only: the end of the user session runs the quit steps; the Windows host's tests check it, and the Mac runs its quit steps from applicationWillTerminate.
+S353 Web remote and hosts only: the apps the phone may mix, the mix route and the host building the mix from it; checked by the remote crate's and the Windows host's tests and the Mac logic tests named in the test map.
+S354 Hosts only: each host keeping the last source of several apps and listing it in the picker and on the phone; checked by the Windows host's tests and the Mac logic suite.
+S355 Hosts only: the Windows host's input device source (listing, format, privacy, the unplugged input in the picker); the Windows tests named in the test map check it.
+S356 Mac and Windows hosts only: the notices of an AirPlay speaker off for want of a code, busy or declining; the Mac logic suite and the Windows tests check them.
+S357 Mac host only: the menu bar icon's clicks, the panel's Reduce Motion and its contrast; the Mac logic suite checks them.
+S358 Mac and Windows hosts only: the notice that the PTP ports are taken; the Mac logic suite and the Windows tests check it.
+S359 Mac host only: zone headers and folding in the main window and the menu bar panel; the Mac logic suite checks them.
+S360 Mac host only: hidden speakers and the panel's count of speakers on; the Mac logic suite checks them.
+S361 Mac and Windows hosts only: when track info and progress go to the AirPlay sender and Cast; the Mac logic suite and the Windows tests check it.
+S362 Mac and Windows hosts only: what a calibrate control that can't start names; the Mac logic suite and the Windows tests check it.
+S363 Mac host only: permission explanations, the setup window and the first install's built-in output; the Mac logic suite checks them.
+S364 Mac host only: the debug log's late output callback and session stop lines; the Mac logic suite checks them.
+S365 Mac host only: the updater's release-build gate; the Mac logic suite checks it.
+S366 Mac host only: the developer switch for the Bluetooth IO buffer; the Mac logic suite checks it.
+S367 Mac host only: the file that keeps the Cast device memory between runs; the Mac logic suite checks it.
+S368 Web remote only: the pairing code's digits, lifetime, single use and renewal; the remote crate's tests check it.
+S369 Web remote only: the limits on wrong pairing codes per address and for everyone; the remote crate's tests check it.
+S370 Web remote only: the pairing route, the device token cookie and unpairing; the remote crate's tests check it.
+S371 Web remote only: the paired devices kept, their idle limit and last-seen times; the remote crate's tests check it.
+S372 Web remote only: reading and saving the paired-device file; the remote crate's tests check it.
+S373 Web remote only: the Host and Origin checks; the remote crate's tests check it.
+S374 Web remote only: the limits on reading a request; the remote crate's tests check it.
+S375 Web remote only: the routes, their methods and the headers on every answer; the remote crate's tests check it.
+S376 Web remote only: the speaker, master and source routes; the remote crate's tests check it.
+S377 Web remote only: the event stream; the remote crate's tests check it.
+S378 Web remote only: the connection slots per address and for paired devices; the remote crate's tests check it.
+S379 Web remote only: the start settings and stopping; the remote crate's tests check it.
+S380 Windows and Linux hosts only: an app source followed by its executable and the process parent rule; the Windows tests named in the test map check it.
+S381 Hosts only: the Windows and Linux output lists, output kinds and the This PC section; the Windows tests named in the test map check them.
+S382 Hosts only: the Windows and Linux double-audio check and its notice; the Windows tests named in the test map check them.
+S383 Windows host only: auto-connect speakers switching on and starting streaming; the Windows tests named in the test map check it.
+S384 Hosts only: a local output's settings following it to a new device ID; the Windows tests and the Mac logic suite named in the test map check it.
+S385 Hosts only: the Windows and Linux settings and Cast speakers files kept aside and written whole; the Windows tests named in the test map check them.
+S386 Windows host only: how one source's app loopbacks are mixed; the Windows tests named in the test map check it.
+S387 Windows and Linux hosts only: the pairing files' encryption on Windows and owner-only mode on Linux; the desktop tests named in the test map check them.
+S388 Windows and Linux hosts only: Launch at Sign-In through the Run key and the Linux autostart entry; the desktop tests named in the test map check it.
+S389 Windows host only: the Windows versions the app runs on; the Windows tests named in the test map check it.
+S390 Windows host only: the web remote's notice on a Public network; the Windows tests named in the test map check it.
+S391 Windows host only: the firewall in the notes that no speaker was found; the Windows tests named in the test map check it.
+S392 Windows host only: the names kept for speakers that left the list; the Windows tests named in the test map check it.
+S393 Windows host only: the AirPlay and Cast search state and the notices for no sound output and a pairing not saved; the Windows tests named in the test map check them.
+S394 Windows host only: Google Cast speakers in the Windows app; the Windows tests named in the test map check it.
+S395 Windows host only: the calibration line through delay steps and Calibrate All results whose Apply a delay change refuses; the Windows tests named in the test map check them.
+S396 Windows host only: when the note that no AirPlay speaker was found shows; the Windows tests named in the test map check it.
+S397 Windows host only: the notice at launch that names the pairings copy; the Windows tests named in the test map check it.
+S398 Windows host only: the loopback gap fill; the Windows tests named in the test map check it.
+S399 Hosts only: where an AirPlay speaker without a volume of its own starts; the Mac logic check and the Windows test named in the test map check it.
+S400 Mac host only: the gear menu runs the item chosen in it; the Mac logic suite checks it.
+S401 Hosts only: Google Cast speakers in the apps; the Mac logic suite and the Windows test a_speakers_receiver_offset_counts_in_how_far_airplay_plays_ahead check it.
+S402 Mac host only: the main window's scrolling columns fade at their edges; the Mac logic suite checks it.
+S403 Mac host only: the menu bar panel's size and where it sits; the Mac logic suite checks them.
+S404 Mac host only: zone members in the main window's lists; the Mac logic suite checks them.
+S405 Mac host only: how the menu bar panel opens and closes, with its shadow and background; the Mac logic suite checks them.
+S406 Mac host only: work deferred until the menu bar panel is still, and the room it keeps; the Mac logic suite checks them.
+S407 Mac host only: the in-app guide's text, layout and illustrations; the Mac logic suite checks them.
+S409 Mac host only: why a volume slider in the main window is dimmed; the Mac logic suite checks it.
+S410 Mac host only: the About panel's version and license lines; the Mac logic suite checks it.
+S411 Mac host only: Sparkle itself runs the check schedule, the permission prompt, skipped versions and the install at quit; the Mac logic suite checks the Info.plist key that turns off its automatic download and install ("updates: Info.plist turns off Sparkle's automatic download and install").
+S412 Hosts only: no AirPlay session starting while the PC or the Mac sleeps, the reconnecting count and the Cast connect-failure count held meanwhile on both hosts; the Windows tests named in the clause check it, the Mac logic check "cast: a connect failure while the Mac sleeps counts nothing toward turning the speaker off (S412)" checks the Mac's Cast count, the Mac logic check "native airplay: a retried error while the Mac sleeps counts nothing toward reconnecting" checks the Mac's count, and the Mac logic checks "native airplay: a reconcile while the Mac sleeps starts no session, the one at the wake starts it" and "native airplay: a speaker switched on or found while the Mac sleeps starts no session" check the Mac's session hold.
+S414 Windows host only: the console control handler that turns Ctrl-C or Ctrl-Break into Quit; the Windows test named in the clause checks it.
+S416 Windows and Linux host only: the Windows and Linux Guide text, its name for the tray panel and its updates text; the desktop tests the clause names check it.
+S417 Linux host only: the PipeWire start that refuses a saved hands-free or missing input; the desktop test named in the clause checks it.
+S419 Hosts only: the menu bar panel's row notes and the tray panel's links; the Mac logic check named in the clause and the desktop tests in its test map table check it.
+S420 Windows and Linux hosts only: the main window's speaker list width, its tooltips for cut text and a window that fails to open; the desktop tests in the clause's test map table check it.
+S421 Windows host only: media sessions read when Windows reports a change; the desktop tests in the clause's test map table check it.
+S422 Hosts only: pairing texts that ask for a code; the Mac logic checks "pairing texts: …" and the desktop test named in the clause check it.
+S423 Hosts only: the notice cap across the engine's and the window's own notices; the desktop tests named in the clause check it.
+S424 Linux host only: the AppImage updater of section 19 (desktop/src/updater); the desktop tests marked S424 check it, on Windows with the Linux paths picked at run time and on Linux for the file, rename and start signal code only Linux runs.
+S425 Web remote only: the token's pairing address and its rotation; the remote crate's tests check it.
+S426 Web remote only: the install ID in the token cookie's name; the remote crate's tests check it.
+S427 Web remote only: a replaced token that comes back unpairs its device; the remote crate's tests check it.
+S428 Windows host only: the web remote's IP address on Wi-Fi or Ethernet, never a VPN tunnel's; the Windows tests named in the test map check it.
+S429 Hosts only: the keyboard's volume keys moving the master; the Windows tests and the Mac logic suite named in the test map check it.
+S430 Host only: the firewall line under the web remote's address is window text; the core has no part in it.
+S431 Hosts only: what a running capture does when its permission is taken away is host capture code; the core has no part in it.
+S432 Mac host only: the Setup window's rows and summary; the Mac logic suite checks them.
+S434 Mac host only: the note in an empty Connected Speakers when only hidden virtual outputs exist; the Mac logic suite checks it.
+S435 Windows host only: the Check Setup window's rows and summary; the desktop tests marked S435 check it.
+S436 Mac host only: where the app runs from and its login item; the Mac logic suite named in the test map checks it.
+S437 Windows host only: a Cast row's look when the speaker is paused on the device; the desktop tests marked S437 check it.
+S438 Windows host only: the tray panel's notice; the desktop tests marked S438 check it.
+S439 Windows host only: the tray panel's look; the desktop tests marked S439 check it.
+S440 Windows host only: the tray icon and its notice mark; the desktop tests marked S440 check it.
+S441 Hosts only: the Mac's signed appcast requirement and the release side that signs it; scripts/check_appcast.py checks the feed signature block (a Python marker the core's coverage rule doesn't count), and the Mac app enforces it.
+S442 Windows host only: a speaker row's state and code notes shown together; the desktop tests marked S442 check it.
+S443 Windows host only: Add by Address in the main window while Cast runs; the desktop tests marked S443 check it.
+S444 Windows host only: the order inside the main window's Connected Speakers; the desktop tests marked S444 check it.
+S445 Windows host only: the AirPlay Delay row shown only with an AirPlay speaker; the desktop tests marked S445 check it.
+S446 Windows host only: the In zones link's tooltip; the desktop tests marked S446 check it.
+S447 Windows host only: a speaker's name tooltip while its switch has the keyboard focus; the desktop tests marked S447 check it.
+S448 Windows host only: the source picker's input marker; the desktop tests marked S448 check it.
+S449 Windows host only: Web Remote in the View menu; the desktop tests marked S449 check it.
+S450 Windows host only: the main window's look; the desktop tests marked S450 check it.
+S451 Mac host only: the notice for a capture that goes silent after sound; the Mac logic suite checks it.
+S452 Windows host only: the two-tone keyboard focus ring on the controls and sliders; the desktop tests marked S452 check it.
+S453 Windows host only: the equalizer band's fill from 0 dB, its tick, Home and End, and the Custom label; the desktop tests marked S453 check it.
+S454 hosts and the remote crate: the app's notices on the Web Remote page; the remote crate, desktop and Mac logic tests marked S454 check it.

@@ -1,0 +1,254 @@
+import Foundation
+import CAudioSyncCore
+
+/// The 10-band graphic equalizer's settings, presets and saved curves. The
+/// Rust core runs the filters (`CoreEqualizer`), once on the captured stream,
+/// so every output, local and AirPlay, hears the same sound.
+enum Equalizer {
+
+    static let frequencies: [Double] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+    static let maxGain = 12.0   // dB, either way
+    static let gainStep = 0.5   // dB
+
+    struct Settings: Codable, Equatable {
+        var enabled = false
+        var preamp = 0.0                                          // dB
+        var gains = [Double](repeating: 0, count: Equalizer.frequencies.count)  // dB
+
+        /// Flat gains and a 0 dB preamp, so the picker reads Flat; the
+        /// enabled flag stays (S33).
+        mutating func reset() {
+            gains = [Double](repeating: 0, count: Equalizer.frequencies.count)
+            preamp = 0
+        }
+
+        /// Whether `new` switches the equalizer on or off, which the debug log
+        /// answers with each output's returned headroom; a band step doesn't.
+        func switches(to new: Settings) -> Bool { enabled != new.enabled }
+    }
+
+    /// A preset's stable identity; its display name lives in `UIStrings`.
+    enum PresetID: String, CaseIterable {
+        case flat, bassBoost, bassCut, trebleBoost, vocal, rock, pop, jazz,
+             classical, electronic, loudness, smallSpeakers
+    }
+
+    struct Preset {
+        let id: PresetID
+        let gains: [Double]
+    }
+
+    /// The core's presets in menu order (S33); one the app has no name for
+    /// is left out.
+    static let presets: [Preset] = (0..<asc_eq_preset_count()).compactMap { index -> Preset? in
+        guard let raw = asc_eq_preset_id(index),
+              let id = PresetID(rawValue: String(cString: raw)) else { return nil }
+        var gains = [Double](repeating: 0, count: Equalizer.frequencies.count)
+        guard asc_eq_preset_gains(index, &gains) else { return nil }
+        return Preset(id: id, gains: gains)
+    }
+
+    /// A gain on the controls' steps: clamped to ±12 dB, 0 for NaN.
+    static func quantized(_ db: Double) -> Double {
+        guard !db.isNaN else { return 0 }
+        return (min(max(db, -maxGain), maxGain) / gainStep).rounded() * gainStep + 0.0
+    }
+
+    // MARK: Saved curves (S270)
+
+    static let maxCurves = 50
+    static let maxCurveNameCharacters = 40
+
+    /// Ten band gains the user saved under a name; never the preamp.
+    struct Curve: Equatable {
+        var name: String
+        var gains: [Double]
+    }
+
+    /// The curve the picker shows.
+    enum CurveMatch: Equatable {
+        case preset(PresetID)
+        case saved(Int)
+    }
+
+    /// The ten gains of a preset or saved curve; nil for a bad index.
+    static func gains(of curve: CurveMatch, saved: [Curve]) -> [Double]? {
+        switch curve {
+        case .preset(let id): return presets.first { $0.id == id }?.gains
+        case .saved(let index): return saved.indices.contains(index) ? saved[index].gains : nil
+        }
+    }
+
+    /// The curve whose ten gains all equal `gains`: `chosen` while it still
+    /// does, then the saved curves in their order, then the presets in menu
+    /// order. Saved curves come first so one with a preset's gains keeps
+    /// Rename and Delete. The preamp never counts.
+    static func matching(_ gains: [Double], saved: [Curve], chosen: CurveMatch? = nil) -> CurveMatch? {
+        if let chosen, self.gains(of: chosen, saved: saved) == gains { return chosen }
+        if let index = saved.firstIndex(where: { $0.gains == gains }) { return .saved(index) }
+        return presets.first { $0.gains == gains }.map { CurveMatch.preset($0.id) }
+    }
+
+    /// A typed name as a curve keeps it: trimmed and cut to 40 Unicode scalars;
+    /// nil when nothing is left.
+    static func curveName(_ typed: String) -> String? {
+        let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: trimmed.unicodeScalars.prefix(maxCurveNameCharacters))
+        let cut = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+        return cut.isEmpty ? nil : cut
+    }
+
+    private static func sameName(_ a: String, _ b: String) -> Bool {
+        // A C string ends at a NUL, so the pieces between NULs cross the FFI one at a time.
+        let (pa, pb) = (a.split(separator: "\0", omittingEmptySubsequences: false),
+                        b.split(separator: "\0", omittingEmptySubsequences: false))
+        return pa.count == pb.count && zip(pa, pb).allSatisfy { asc_eq_same_curve_name(String($0), String($1)) }
+    }
+
+    /// The gains on the controls' steps, ten of them.
+    private static func steppedGains(_ gains: [Double]) -> [Double] {
+        (0..<frequencies.count).map { $0 < gains.count ? quantized(gains[$0]) : 0 }
+    }
+
+    /// Saves `gains` under `typed`: a saved curve of the same name, ignoring
+    /// case, takes the new gains in its place; otherwise the curve goes last.
+    /// Its index, or nil for an empty name or a full list.
+    static func save(_ typed: String, gains: [Double], in curves: inout [Curve]) -> Int? {
+        guard let name = curveName(typed) else { return nil }
+        let curve = Curve(name: name, gains: steppedGains(gains))
+        if let index = curves.firstIndex(where: { sameName($0.name, name) }) {
+            curves[index] = curve
+            return index
+        }
+        guard curves.count < maxCurves else { return nil }
+        curves.append(curve)
+        return curves.count - 1
+    }
+
+    /// False for a bad index, an empty name or one another saved curve has.
+    static func rename(_ index: Int, to typed: String, in curves: inout [Curve]) -> Bool {
+        guard curves.indices.contains(index), let name = curveName(typed),
+              !curves.indices.contains(where: { $0 != index && sameName(curves[$0].name, name) })
+        else { return false }
+        curves[index].name = name
+        return true
+    }
+
+    /// Saved curves as read back: names as `curveName` keeps them, gains on
+    /// the steps, unnamed curves and later duplicates of a name left out, at
+    /// most 50.
+    static func sanitized(_ saved: [Curve]) -> [Curve] {
+        var curves: [Curve] = []
+        for curve in saved where curves.count < maxCurves {
+            guard let name = curveName(curve.name),
+                  !curves.contains(where: { sameName($0.name, name) }) else { continue }
+            curves.append(Curve(name: name, gains: steppedGains(curve.gains)))
+        }
+        return curves
+    }
+}
+
+/// Saved curves as the app stores them under `Keys.equalizerCurves`: a JSON
+/// array of `{"name", "gains"}`, read leniently (an entry without a text name
+/// is skipped, a band that is not a number reads as 0 dB).
+enum StoredCurves {
+    static func decode(_ data: Data?) -> [Equalizer.Curve] {
+        guard let data, let entries = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return [] }
+        return Equalizer.sanitized(entries.compactMap { entry in
+            guard let fields = entry as? [String: Any], let name = fields["name"] as? String else { return nil }
+            // JSONSerialization hands back true and false as NSNumber too.
+            let gains = (fields["gains"] as? [Any] ?? []).map { band -> Double in
+                guard let number = band as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return 0 }
+                return number.doubleValue
+            }
+            return Equalizer.Curve(name: name, gains: gains)
+        })
+    }
+
+    static func encode(_ curves: [Equalizer.Curve]) -> Data? {
+        let entries: [[String: Any]] = curves.map { ["name": $0.name, "gains": $0.gains] }
+        return try? JSONSerialization.data(withJSONObject: entries)
+    }
+}
+
+/// Equalizer state for the SwiftUI panel.
+final class EqualizerModel: ObservableObject {
+    @Published var settings: Equalizer.Settings
+    @Published private(set) var curves: [Equalizer.Curve]
+    var onChange: (Equalizer.Settings) -> Void = { _ in }
+    var onCurvesChange: ([Equalizer.Curve]) -> Void = { _ in }
+
+    init(settings: Equalizer.Settings, curves: [Equalizer.Curve] = []) {
+        self.settings = settings
+        self.curves = Equalizer.sanitized(curves)
+    }
+
+    func set(_ new: Equalizer.Settings) {
+        if let chosen, Equalizer.gains(of: chosen, saved: curves) != new.gains { self.chosen = nil }
+        settings = new
+        onChange(new)
+    }
+
+    /// The curve last picked, saved or reset to, until the gains leave it, so
+    /// the picker tells a preset from a saved curve with the same gains. Not
+    /// stored on purpose: at launch `matching` picks from the gains alone.
+    @Published private(set) var chosen: Equalizer.CurveMatch?
+
+    var shownCurve: Equalizer.CurveMatch? { Equalizer.matching(settings.gains, saved: curves, chosen: chosen) }
+
+    /// The saved curve the picker shows, which Rename and Delete act on.
+    var shownSavedIndex: Int? {
+        if case .saved(let index) = shownCurve { return index }
+        return nil
+    }
+
+    /// Picking a curve sets the gains only and turns the equalizer on.
+    func pick(_ curve: Equalizer.CurveMatch) {
+        guard let gains = Equalizer.gains(of: curve, saved: curves) else { return }
+        chosen = curve
+        var new = settings
+        new.gains = gains
+        new.enabled = true
+        set(new)
+    }
+
+    func reset() {
+        chosen = .preset(.flat)
+        var new = settings
+        new.reset()
+        set(new)
+    }
+
+    /// False for an empty name or a full list.
+    func saveCurve(named typed: String) -> Bool {
+        var new = curves
+        guard let index = Equalizer.save(typed, gains: settings.gains, in: &new) else { return false }
+        chosen = .saved(index)
+        setCurves(new)
+        return true
+    }
+
+    /// False for an empty name or one another saved curve has.
+    func renameCurve(_ index: Int, to typed: String) -> Bool {
+        var new = curves
+        guard Equalizer.rename(index, to: typed, in: &new) else { return false }
+        setCurves(new)
+        return true
+    }
+
+    func deleteCurve(_ index: Int) {
+        guard curves.indices.contains(index) else { return }
+        var new = curves
+        new.remove(at: index)
+        if case .saved(let picked) = chosen {
+            chosen = picked == index ? nil : .saved(picked > index ? picked - 1 : picked)
+        }
+        setCurves(new)
+    }
+
+    private func setCurves(_ new: [Equalizer.Curve]) {
+        curves = new
+        onCurvesChange(new)
+    }
+}

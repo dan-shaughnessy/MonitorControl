@@ -1,0 +1,79 @@
+name: MSIX
+
+# Only a version tag or a manual run builds the Store package; branch pushes never run this.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: msix.yml-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SLINT_COMPILER_DENY_WARNINGS: '1'
+
+jobs:
+  msix:
+    name: Unsigned MSIX (x64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain (1.99.1, with the x86_64-pc-windows-msvc target)
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+
+      # Left unmarked as a release build, so the updater stays off: the Store
+      # delivers updates to a packaged install.
+      - name: Build
+        working-directory: desktop
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      # A fresh Windows has no Visual C++ runtime; the exe must not need it.
+      - name: The executable links the C runtime statically
+        working-directory: desktop
+        run: python -I ../scripts/check_crt_imports.py target/x86_64-pc-windows-msvc/release/audiosync.exe
+
+      - name: The executable carries the manifest and the version information
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          $exe = (Resolve-Path "target/x86_64-pc-windows-msvc/release/audiosync.exe").Path
+          # The manifest is stored as plain text in the executable.
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+          foreach ($entry in '{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}', 'PerMonitorV2') {
+            if (-not $text.Contains($entry)) { throw "the embedded manifest lacks $entry" }
+          }
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+          if ($info.ProductName -ne 'AudioSync') { throw "unexpected product name '$($info.ProductName)'" }
+          "audiosync.exe $($info.ProductVersion) for x64: manifest and version information present"
+
+      - name: Third-party notices (THIRD-PARTY-NOTICES.txt)
+        working-directory: desktop
+        run: python -I ../scripts/windows_notices.py x86_64-pc-windows-msvc
+
+      - name: Pack the MSIX
+        run: |
+          scripts/make_msix.sh \
+            desktop/target/x86_64-pc-windows-msvc/release/audiosync.exe \
+            desktop/target/x86_64-pc-windows-msvc/release/THIRD-PARTY-NOTICES.txt
+
+      - name: Upload the unsigned MSIX (workflow artifact, not a release)
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: audiosync-msix-x64
+          path: dist/msix/*.msix
+          if-no-files-found: error

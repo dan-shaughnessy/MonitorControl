@@ -9,6 +9,7 @@ import ServiceManagement
 import Settings
 import SimplyCoreAudio
 import Sparkle
+import DeskAudio
 
 class AppDelegate: NSObject, NSApplicationDelegate {
   let statusItem: NSStatusItem = {
@@ -42,6 +43,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     #endif
     return AutomationPrefsViewController(controller: self.automationController)
   }()
+
+  lazy var deskSession = DeskSession()
+
+  @objc func deskAudioSettingsClicked(_: AnyObject) { self.deskSession.showAudioSettings() }
+
+  @objc func deskSetupClicked(_: AnyObject) { self.deskSession.showSetup() }
+  @objc func deskPauseClicked(_: AnyObject) { self.deskSession.pause() }
+  @objc func deskPersonalClicked(_: AnyObject) { self.deskSession.request(.personal) }
+  @objc func deskRESMLClicked(_: AnyObject) { self.deskSession.request(.resml) }
 
   var mediaKeyTap = MediaKeyTapManager()
   var keyboardShortcuts = KeyboardShortcutsManager()
@@ -93,6 +103,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
     #endif
+    NotificationCenter.default.addObserver(forName: Notification.Name("desk.inputRequested"), object: nil, queue: .main) { [weak self] notification in
+      guard let self, let source = notification.userInfo?["source"] as? String else { return }
+      if source == "resml" { self.deskSession.request(.resml) }
+      if source == "personal" { self.deskSession.request(.personal) }
+    }
+    NotificationCenter.default.addObserver(forName: Notification.Name("desk.pause"), object: nil, queue: .main) { [weak self] _ in self?.deskSession.pause() }
+    NotificationCenter.default.addObserver(forName: Notification.Name("desk.manualInputRequested"), object: nil, queue: .main) { [weak self] notification in
+      guard let self, let display = notification.object as? OtherDisplay,
+        DisplayCandidate.find(self.automationController.config)?.displayID == display.identifier,
+        let source = notification.userInfo?["source"] as? String else { return }
+      if source == "resml" { self.deskSession.request(.resml) }
+      if source == "personal" { self.deskSession.request(.personal) }
+    }
+    NotificationCenter.default.addObserver(forName: Notification.Name("desk.cancelPending"), object: nil, queue: .main) { [weak self] _ in self?.deskSession.cancelPending() }
     self.subscribeEventListeners()
     self.showSafeModeAlertIfNeeded()
     if !prefs.bool(forKey: PrefKey.appAlreadyLaunched.rawValue) {
@@ -158,6 +182,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationWillTerminate(_: Notification) {
+    self.deskSession.disconnect()
     self.automationController.stop()
     os_log("Goodbye!", type: .info)
     DisplayManager.shared.resetSwBrightnessForAllDisplays(noPrefSave: true)

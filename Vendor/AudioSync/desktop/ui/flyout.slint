@@ -1,0 +1,1145 @@
+// The tray flyout: what the macOS app's menu bar panel offers, opened by
+// clicking the AudioSync icon in the notification area. Streaming on and
+// off, the newest notice, the source, the master volume, every zone with
+// its speakers under it and every other speaker, then Exit; the mark and
+// name open the main window. Escape or a click elsewhere closes it.
+
+import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+import { Tokens } from "tokens.slint";
+import { Strings } from "strings.slint";
+import { CastList, DeviceVolumeHint, NoticeItem, PresetItem, UpdateButton, RowState, SpeakerItem, SpeakerKind, ZoneItem } from "types.slint";
+import { Announcer, BrandMark, Divider, FocusRing, Fluent, Glyph, Glyphs, KindIcon, LabelTip, LinkButton, MarqueeText, MasterVolume, NoticeStack, PairPicker, QuietText, SecondaryText, SpeakerBadge, ToggleSwitch, Wordmark, ZoneArrowFocus, Motion } from "widgets.slint";
+
+// The preset row under the source (spec S260): Presets and the current
+// preset's name, else "Choose a Preset"; its menu lists every preset, the
+// current one checked, and recalls the one chosen.
+component PresetPicker inherits Rectangle {
+    in property <[PresetItem]> presets;
+    // The current preset's name; empty while none is current.
+    in property <string> current;
+    callback recalled(string);
+
+    function open-menu() {
+        menu.show({ x: 0, y: root.height });
+    }
+
+    min-height: 36px;
+    border-radius: Fluent.radius-control;
+    background: touch.pressed ? Fluent.pressed : touch.has-hover ? Fluent.hover : transparent;
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: Strings.presets;
+    accessible-value: root.current != "" ? root.current : Strings.choose-preset;
+    accessible-action-default => {
+        root.open-menu();
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.open-menu();
+        }
+
+        menu := ContextMenuArea {
+            Menu {
+                for preset in root.presets: MenuItem {
+                    title: preset.name;
+                    checkable: true;
+                    checked: preset.current;
+                    activated => {
+                        root.recalled(preset.id);
+                    }
+                }
+            }
+
+            focus := FocusScope {
+                focus-on-click: false;
+                key-pressed(event) => {
+                    if event.text == " " || event.text == Key.Return {
+                        root.open-menu();
+                        return accept;
+                    }
+                    return reject;
+                }
+
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    spacing: 8px;
+
+                    Glyph {
+                        glyph: Glyphs.presets;
+                        color: Tokens.text;
+                        width: 16px;
+                    }
+
+                    Text {
+                        text: Strings.presets;
+                        color: Tokens.text;
+                        vertical-alignment: center;
+                        accessible-role: none;
+                    }
+
+                    MarqueeText {
+                        text: root.current != "" ? root.current : Strings.choose-preset;
+                        text-color: Tokens.secondary-text;
+                        horizontal-stretch: 1;
+                        accessible-role: none;
+                    }
+
+                    Glyph {
+                        glyph: Glyphs.chevron-down;
+                        font-size: 12px;
+                        color: Tokens.secondary-text;
+                    }
+                }
+            }
+        }
+    }
+
+    FocusRing {
+        visible-focus: focus.has-focus;
+        border-radius: root.border-radius;
+    }
+}
+
+// A compact row's round mark: a teal disc with a white glyph while it
+// plays, a teal ring while it is on and waits, a grey ring while off. The
+// disc grows in as the speaker starts playing; with animation effects off it
+// fades in.
+component RowDisc inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> on;
+    in property <bool> plays;
+    property <float> fill: root.plays ? 1 : 0;
+    animate fill {
+        duration: Motion.on ? 440ms : 150ms;
+        easing: cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    width: 28px;
+    height: 28px;
+    border-radius: self.width / 2;
+    border-width: root.plays ? 0px : root.on ? 2.5px : 1.5px;
+    border-color: root.on ? Tokens.teal : Tokens.secondary-text;
+
+    Rectangle {
+        width: root.width * (Motion.on ? root.fill : 1);
+        height: self.width;
+        border-radius: self.width / 2;
+        background: Tokens.teal;
+        opacity: Motion.on ? 1 : root.fill;
+    }
+
+    Glyph {
+        glyph: root.glyph;
+        font-size: 13px;
+        color: root.plays ? #ffffff : root.on ? Tokens.teal-text : Tokens.secondary-text;
+    }
+}
+
+// A compact row, one button as on the Mac: a click anywhere on it, Space or
+// Enter switches the speaker. The name, with the note of a speaker or zone
+// that is on but can't play right now at the right (a zone's count first)
+// ("In use by another app", "Reconnecting…", which Narrator reads as the
+// row's value), and a small glyph when a switched-on output's own volume in
+// Windows is low or muted (spec S198). The flyout has no volume sliders, so
+// the fix is in the main window; the hint itself is in the description.
+component FlyoutRow inherits Rectangle {
+    in property <string> glyph;
+    in property <string> name;
+    in property <string> label;
+    in property <string> description;
+    in property <RowState> state;
+    in property <bool> plays;
+    in property <bool> enabled: true;
+    in property <DeviceVolumeHint> device-volume;
+    // A zone's count, before the note; and what Narrator reads as the
+    // row's value instead of its state.
+    in property <string> caption;
+    // The note the main window row gives (Strings.speaker-note).
+    in property <string> note;
+    in property <string> value-text;
+    // A renamed speaker's own name, shown in the row's tooltip; else empty.
+    in property <string> system-name;
+    // The kind's glyph after the name, where `show-kind` is set.
+    in property <SpeakerKind> kind;
+    in property <bool> show-kind;
+    // A zone's speakers start past its arrow.
+    in property <length> indent;
+    callback toggled();
+    // The row gained (true) or lost (false) keyboard focus.
+    callback focus-changed(bool);
+
+    min-height: 38px;
+    border-radius: Fluent.radius-control;
+    background: !root.enabled ? transparent : touch.pressed ? Fluent.pressed : touch.has-hover ? Fluent.hover : transparent;
+    animate background { duration: Fluent.fast; }
+    forward-focus: focus;
+    // A toggle button, not a switch: see ToggleSwitch.
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-checkable: true;
+    accessible-checked: root.state != RowState.off;
+    accessible-value: root.value-text != "" ? root.value-text : Strings.value(root.state, root.name);
+    // The value already reads a state note; any other note leads.
+    accessible-description: Strings.flyout-speaker-description(root.description, root.note == Strings.row-note(root.state, root.name) ? "" : root.note);
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        root.toggled();
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if event.text == " " || event.text == Key.Return {
+                root.toggled();
+                return accept;
+            }
+            return reject;
+        }
+        focus-changed-event => {
+            root.focus-changed(self.has-focus);
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.toggled();
+        }
+
+        // Narrator reads the device name from the row instead.
+        Tooltip {
+            LabelTip {
+                text: Strings.speaker-tooltip(root.name, root.system-name);
+                max-tip-width: root.width;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 6px + root.indent;
+        padding-right: 6px;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        spacing: 10px;
+
+        VerticalLayout {
+            alignment: center;
+            RowDisc {
+                glyph: root.glyph;
+                on: root.state != RowState.off;
+                plays: root.plays;
+                opacity: root.enabled ? 1 : Tokens.disabled-opacity;
+                transform-scale: !Motion.on || !root.enabled ? 1 : touch.pressed ? 0.92 : touch.has-hover ? 1.04 : 1;
+                animate transform-scale { duration: Fluent.fast; }
+            }
+        }
+
+        // One line, as in the Mac's menu bar panel: the name and its kind,
+        // then the note at the right.
+        HorizontalLayout {
+            spacing: 6px;
+            horizontal-stretch: 1;
+
+            // No stretch, so a long note ends in "…" before the name does,
+            // as on the Mac.
+            Rectangle {
+                horizontal-stretch: 0;
+                min-width: 0px;
+                preferred-width: name-label.preferred-width;
+                max-width: name-label.preferred-width;
+                min-height: name-label.preferred-height;
+
+                // Cut with "…", as drawn; the tooltip has the whole name.
+                name-label := Text {
+                    width: 100%;
+                    height: 100%;
+                    text: root.name;
+                    color: Tokens.text;
+                    font-weight: root.plays ? 600 : 400;
+                    vertical-alignment: center;
+                    wrap: no-wrap;
+                    overflow: elide;
+                    accessible-role: none;
+                }
+            }
+
+            if root.show-kind: KindIcon {
+                kind: root.kind;
+                clicked => {
+                    if root.enabled {
+                        root.toggled();
+                    }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            if Strings.speaker-caption(root.caption, root.note) != "": QuietText {
+                text: Strings.speaker-caption(root.caption, root.note);
+                horizontal-stretch: 1;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                wrap: no-wrap;
+                overflow: elide;
+            }
+        }
+
+        if root.device-volume != DeviceVolumeHint.none: Glyph {
+            glyph: Glyphs.device-volume(root.device-volume);
+            font-size: 12px;
+            color: Tokens.secondary-text;
+        }
+    }
+
+    FocusRing {
+        visible-focus: focus.has-focus;
+        border-radius: root.border-radius;
+    }
+}
+
+// A zone's row, routed like its header in the main window: only the round
+// toggle switches the zone, and a click anywhere else on the row, the name
+// and the arrow included, shows or hides its speakers. Left and Right on the
+// toggle do that from the keyboard, and so do Space and Enter on the arrow,
+// a Tab stop of its own as on the Mac.
+component FlyoutZoneHeader inherits Rectangle {
+    in property <ZoneItem> item;
+    callback toggled();
+    callback expanded-changed(bool);
+    // The toggle, or the arrow in its place, gained (true) or lost (false)
+    // keyboard focus.
+    callback focus-changed(bool);
+    property <bool> live: root.item.present > 0;
+    property <string> count: root.item.total == 0 ? Strings.zone-empty : Strings.speaker-caption(Strings.zone-count(root.item.on, root.item.total, root.item.waiting, root.item.present, root.item.in-pair), Strings.row-note(root.item.state, root.item.waiting-name));
+
+    border-radius: Fluent.radius-control;
+    background: hover.has-hover ? Fluent.hover : transparent;
+    animate background { duration: Fluent.fast; }
+
+    hover := TouchArea {
+        clicked => {
+            root.expanded-changed(!root.item.expanded);
+        }
+
+        // The fold arrow first, then the badge, the name and the count at
+        // the right.
+        HorizontalLayout {
+            spacing: 8px;
+            padding-top: 4px;
+            padding-bottom: 4px;
+            padding-left: 2px;
+            padding-right: 8px;
+
+            VerticalLayout {
+                alignment: center;
+
+                Rectangle {
+                    width: 16px;
+                    height: 16px;
+                    accessible-role: button;
+                    accessible-label: root.item.expanded ? Strings.hide-zone-speakers(root.item.name) : Strings.show-zone-speakers(root.item.name);
+                    accessible-value: root.live ? "" : root.count;
+                    // No expanded state, as on the main window's arrow: UI Automation offers Invoke.
+                    accessible-action-default => {
+                        root.expanded-changed(!root.item.expanded);
+                    }
+
+                    ZoneArrowFocus {
+                        expanded: root.item.expanded;
+                        expanded-changed(open) => {
+                            root.expanded-changed(open);
+                        }
+                        focus-changed(focused) => {
+                            root.focus-changed(focused);
+                        }
+                    }
+
+                    Glyph {
+                        glyph: root.item.expanded ? Glyphs.chevron-down : Glyphs.chevron-right;
+                        font-size: 12px;
+                        color: Tokens.secondary-text;
+                    }
+                }
+            }
+
+            // The mark of the speaker rows, under the zone's toggle.
+            Rectangle {
+                width: 28px;
+                height: 28px;
+
+                RowDisc {
+                    glyph: Glyphs.zone;
+                    on: root.item.state != RowState.off;
+                    plays: root.item.state == RowState.playing;
+                    opacity: root.live ? 1 : Tokens.disabled-opacity;
+                }
+
+                SpeakerBadge {
+                    bare: true;
+                    size: 28px;
+                    glyph: Glyphs.zone;
+                    state: root.item.state;
+                    enabled: root.live;
+                    narrated: root.live;
+                    label: Strings.zone-label(root.item.name);
+                    value-text: Strings.zone-value(root.item.on, root.item.total, root.item.waiting);
+                    description: Strings.row-note(root.item.state, root.item.waiting-name);
+                    expandable: true;
+                    expanded: root.item.expanded;
+                    toggled => {
+                        root.toggled();
+                    }
+                    focus-changed(focused) => {
+                        root.focus-changed(focused);
+                    }
+                    expanded-changed(open) => {
+                        root.expanded-changed(open);
+                    }
+                }
+            }
+
+            // No stretch, so the count ends in "…" before the name does.
+            Rectangle {
+                horizontal-stretch: 0;
+                min-width: 0px;
+                preferred-width: zone-name.preferred-width;
+                max-width: zone-name.preferred-width;
+                min-height: zone-name.preferred-height;
+
+                zone-name := Text {
+                    width: 100%;
+                    height: 100%;
+                    text: root.item.name;
+                    color: Tokens.text;
+                    font-weight: root.item.state == RowState.playing ? 600 : 400;
+                    vertical-alignment: center;
+                    wrap: no-wrap;
+                    overflow: elide;
+                    accessible-role: none;
+                }
+            }
+
+            QuietText {
+                text: root.count;
+                horizontal-stretch: 1;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                wrap: no-wrap;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+export component TrayFlyout inherits Window {
+    in property <bool> running;
+    in property <string> status;
+    in property <[string]> sources;
+    in property <int> source-index;
+    // The chosen input device's channel pairs; none up to two channels.
+    in property <[string]> input-pairs;
+    in property <int> input-pair-index;
+    // The note under the source while an input device plays through an
+    // AirPlay speaker; empty hides it.
+    in property <string> live-input-hint;
+    in property <float> master-volume;
+    in property <int> master-volume-waves;
+    // The speakers in no zone: this PC's, then the connected ones.
+    in property <[SpeakerItem]> this-pc;
+    in property <[SpeakerItem]> speakers;
+    in property <[ZoneItem]> zones;
+    in property <[PresetItem]> presets;
+    in property <string> current-preset;
+    // What plays, as the main window's Now Playing card shows it.
+    in property <bool> now-playing-shown;
+    in property <string> now-playing-title;
+    in property <string> now-playing-subtitle;
+    in property <bool> now-playing-has-artwork;
+    in property <image> now-playing-artwork;
+    // AirPlay discovery has run for 20 seconds without finding a speaker.
+    in property <bool> airplay-none-found;
+    // Every speaker present is hidden.
+    in property <bool> all-hidden;
+    in property <bool> connected-all-hidden;
+    // AirPlay discovery runs and has found no speaker yet, short of 20 s.
+    in property <bool> airplay-searching;
+    in property <CastList> cast-list;
+    // A Google Cast sender runs, so Add by Address… can list a speaker.
+    in property <bool> cast-by-address;
+    // Streaming is on with every speaker off.
+    in property <bool> no-speaker-on;
+    // The newest notice only (or none); `notice-count` counts them all.
+    in property <[NoticeItem]> notices;
+    in property <int> notice-count;
+    // What Narrator says about a new notice, while the app wants it said
+    // here (empty otherwise).
+    in property <string> notice-announcement;
+    callback power-toggled(bool);
+    callback source-selected(int);
+    // Several Apps… under the source: opens the main window's list.
+    callback several-apps-requested();
+    callback input-pair-selected(int);
+    callback master-volume-changed(float);
+    callback master-mute-toggled();
+    callback speaker-toggled(string);
+    callback zone-toggled(string);
+    // A zone's speakers shown (true) or hidden; the flyout keeps its own
+    // fold state.
+    callback zone-expanded-changed(string, bool);
+    callback preset-recall-requested(string);
+    // Ctrl+1 to Ctrl+9: recall the preset in that place (spec S261).
+    callback preset-shortcut(int);
+    callback notice-dismissed(int);
+    callback notices-dismissed-all();
+    // Show How on a notice: open its guide.
+    callback notice-guide-requested(int);
+    // Retry on a notice: start AirPlay again.
+    callback notice-retry-requested(int);
+    // Open Privacy Settings on a notice.
+    callback notice-privacy-requested(int);
+    callback notice-update-button-pressed(UpdateButton);
+    // Open Network Settings under the no-speakers note.
+    callback network-settings-requested();
+    // Add by Address…: the main window's dialog.
+    callback cast-add-address-requested();
+    callback open-app();
+    callback exit-app();
+    callback close-requested();
+
+    title: Strings.flyout-title;
+    no-frame: true;
+    always-on-top: true;
+    width: 340px;
+    // True once Windows draws the flyout's rounded frame (border and shadow).
+    in property <bool> rounded;
+    // Set false then true by the app as the flyout opens: the content
+    // slides up and fades in, as Windows 11's flyouts open.
+    in property <bool> revealed: true;
+    background: Tokens.surface;
+    default-font-family: Fluent.font;
+    default-font-size: Tokens.font-size-body;
+    // Key events go to the focused item, so Escape needs the scope focused.
+    forward-focus: focus;
+
+    // Whether a control that a refresh can remove has keyboard focus: the
+    // notice's buttons (dismiss, Show How), the buttons for more notices and
+    // Dismiss All, a zone or speaker row, or the Add by Address link. Slint
+    // leaves nothing focused when the focused control is removed, and
+    // Escape then does nothing until Tab, so the app calls
+    // `take-focus` when a refresh removed the part that held it. A removed
+    // control never reports losing focus; `take-focus` clears these. (The
+    // stack gets one notice, so its own Dismiss All stays hidden; the row
+    // under it has one.)
+    out property <bool> notice-focused;
+    out property <bool> more-notices-focused;
+    out property <bool> zone-focused;
+    out property <bool> speaker-focused;
+    out property <bool> add-address-focused;
+    out property <bool> network-settings-focused;
+    // The height that shows every part down to the buttons, which the app
+    // sizes the window to: Slint's own preferred height counts a wrapped
+    // notice as one line. The parts sit at the top, so this holds at any
+    // window height.
+    out property <length> fit-height: root.footer-bottom + 16px;
+    // How much less room the zones and speakers list gets, set by the app
+    // on a screen too short for the whole flyout; the list scrolls.
+    in property <length> list-cut;
+    // How much less room everything between the header and the buttons
+    // gets, set by the app when the list is at its floor or absent and the
+    // screen is still too short; that part scrolls.
+    in property <length> body-cut;
+    // Where the buttons end, which `fit-height` reads.
+    out property <length> footer-bottom: footer.absolute-position.y - focus.y + footer.height;
+    // For the layout tests (src/view.rs): the height Windows makes the window at.
+    out property <length> made-height: root.preferred-height;
+    // For the motion test: how far the content sits below its place.
+    out property <length> content-offset: focus.y;
+
+    // Called each time the flyout opens (the last focused control may be
+    // gone, and Escape must work before anything inside is clicked), and
+    // when a refresh removed the control that had the focus.
+    public function take-focus() {
+        root.notice-focused = false;
+        root.more-notices-focused = false;
+        root.zone-focused = false;
+        root.speaker-focused = false;
+        root.add-address-focused = false;
+        root.network-settings-focused = false;
+        focus.focus();
+    }
+
+    changed running => {
+        power.checked = root.running;
+    }
+    changed source-index => {
+        source.current-index = root.source-index;
+    }
+
+    // Without the system's rounded frame, draw the edge.
+    Rectangle {
+        border-width: root.rounded ? 0px : 1px;
+        border-color: Tokens.separator;
+    }
+
+    focus := FocusScope {
+        y: root.revealed || !Motion.on ? 0px : 16px;
+        opacity: root.revealed ? 1 : 0;
+        // Back to the start at once, so the next open plays in full.
+        animate y, opacity {
+            duration: !root.revealed ? 0ms : Motion.on ? 250ms : 150ms;
+            easing: cubic-bezier(0.1, 0.9, 0.2, 1);
+        }
+
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close-requested();
+                return accept;
+            }
+            if event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift && !event.modifiers.meta && event.text.character-count == 1 && event.text.is-float() && event.text.to-float() >= 1 {
+                root.preset-shortcut(event.text.to-float());
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            alignment: start;
+            padding: Fluent.card-padding;
+            spacing: 8px;
+
+            HorizontalLayout {
+                spacing: 10px;
+
+                // The mark and name open the main window, the first stop for
+                // Tab, as on the Mac.
+                brand := Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: Fluent.radius-control;
+                    background: brand-touch.pressed ? Fluent.pressed : brand-touch.has-hover ? Fluent.hover : transparent;
+                    animate background { duration: Fluent.fast; }
+                    forward-focus: brand-focus;
+                    accessible-role: button;
+                    accessible-label: Strings.open-app-status(root.status);
+                    accessible-action-default => {
+                        root.open-app();
+                    }
+
+                    brand-focus := FocusScope {
+                        focus-on-click: false;
+                        key-pressed(event) => {
+                            if event.text == " " || event.text == Key.Return {
+                                root.open-app();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+
+                    brand-touch := TouchArea {
+                        clicked => {
+                            root.open-app();
+                        }
+
+                        Tooltip {
+                            brand-tip := LabelTip {
+                                text: Strings.open-app;
+                                max-tip-width: 240px;
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        padding-top: 2px;
+                        padding-bottom: 2px;
+                        spacing: 10px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            BrandMark {
+                                running: root.running;
+                                width: 22px;
+                                height: 22px;
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Wordmark {
+                                size: 14px;
+                            }
+
+                            QuietText {
+                                text: root.status;
+                            }
+                        }
+                    }
+
+                    FocusRing {
+                        visible-focus: brand-focus.has-focus;
+                        border-radius: parent.border-radius;
+                    }
+                }
+
+                TouchArea {
+                    horizontal-stretch: 0;
+                    power := ToggleSwitch {
+                        height: 100%;
+                        text: Strings.streaming-switch;
+                        checked: root.running;
+                        accessible-label: Strings.streaming-switch;
+                        toggled => {
+                            root.power-toggled(self.checked);
+                            // Show what the engine did, even if it refused.
+                            self.checked = root.running;
+                        }
+                    }
+
+                    Tooltip {
+                        power-tip := LabelTip {
+                            text: root.running ? Strings.turn-off : Strings.turn-on;
+                            max-tip-width: 240px;
+                        }
+                    }
+                }
+            }
+
+            // Between the header and the buttons, all of it scrolls when the
+            // screen is too short even for the list at its three rows. Its
+            // height comes from where the parts end: a layout's preferred
+            // height measures a wrapped notice as one line.
+            body-view := ScrollView {
+                property <length> natural: body-end.y - body.spacing;
+                height: max(48px, self.natural - root.body-cut);
+                content-height: self.natural;
+
+                body := VerticalLayout {
+                    height: self.preferred-height;
+                    alignment: start;
+                    spacing: 10px;
+
+                    if root.notices.length > 0: NoticeStack {
+                        notices: root.notices;
+                        compact: true;
+                        capped: root.notice-count > 1;
+                        dismissed(id) => {
+                            root.notice-dismissed(id);
+                        }
+                        dismissed-all => {
+                            root.notices-dismissed-all();
+                        }
+                        guide-requested(id) => {
+                            root.notice-guide-requested(id);
+                        }
+                        retry-requested(id) => {
+                            root.notice-retry-requested(id);
+                        }
+                        privacy-requested(id) => {
+                            root.notice-privacy-requested(id);
+                        }
+                        update-button-pressed(button) => {
+                            root.notice-update-button-pressed(button);
+                        }
+                        button-focus-changed(focused) => {
+                            root.notice-focused = focused;
+                        }
+                    }
+
+                    if root.notice-count > root.notices.length: HorizontalLayout {
+                        alignment: space-between;
+                        more := Button {
+                            text: Strings.more-notices(root.notice-count - root.notices.length);
+                            accessible-label: self.text;
+                            clicked => {
+                                root.open-app();
+                            }
+                            // A standard button reports focus only through has-focus.
+                            changed has-focus => {
+                                root.more-notices-focused = more.has-focus || all.has-focus;
+                            }
+                        }
+
+                        all := Button {
+                            text: Strings.dismiss-all-notices;
+                            accessible-label: Strings.dismiss-all-notices;
+                            clicked => {
+                                root.notices-dismissed-all();
+                            }
+                            changed has-focus => {
+                                root.more-notices-focused = more.has-focus || all.has-focus;
+                            }
+                        }
+                    }
+
+                    // What plays, with no buttons, over the source. No visible
+                    // labels above the source and the volume, as in the Mac
+                    // panel; Narrator still hears each control's name.
+                    Rectangle {
+                        border-radius: Fluent.radius-card;
+                        background: Fluent.hero;
+
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 10px;
+
+                            if root.now-playing-shown: HorizontalLayout {
+                                spacing: 11px;
+                                accessible-role: groupbox;
+                                accessible-label: Strings.now-playing;
+
+                                Rectangle {
+                                    width: 48px;
+                                    height: 48px;
+                                    border-radius: 6px;
+                                    clip: true;
+                                    background: Tokens.text.with-alpha(0.06);
+
+                                    if root.now-playing-has-artwork: Image {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        source: root.now-playing-artwork;
+                                        image-fit: cover;
+                                        accessible-role: none;
+                                    }
+
+                                    if !root.now-playing-has-artwork: Glyph {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        glyph: Glyphs.music-note;
+                                        color: Tokens.secondary-text;
+                                        font-size: 20px;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 2px;
+                                    horizontal-stretch: 1;
+
+                                    MarqueeText {
+                                        text: root.now-playing-title;
+                                        font-weight: 600;
+                                    }
+
+                                    if root.now-playing-subtitle != "": MarqueeText {
+                                        text: root.now-playing-subtitle;
+                                        font-size: Tokens.font-size-callout;
+                                        text-color: Tokens.secondary-text;
+                                    }
+                                }
+                            }
+
+                            source := ComboBox {
+                                model: root.sources;
+                                current-index: root.source-index;
+                                accessible-label: Strings.source-label;
+                                selected => {
+                                    root.source-selected(self.current-index);
+                                    self.current-index = root.source-index;
+                                }
+                            }
+                        }
+                    }
+
+                    // A link, not a drop-down entry, so arrowing or wheeling
+                    // through the sources never lands on it and closes the panel.
+                    HorizontalLayout {
+                        alignment: start;
+                        LinkButton {
+                            text: Strings.source-mix-more;
+                            label: Strings.source-mix-more;
+                            clicked => {
+                                root.several-apps-requested();
+                            }
+                        }
+                    }
+
+                    if root.input-pairs.length > 0: VerticalLayout {
+                        spacing: 4px;
+
+                        SecondaryText {
+                            text: Strings.input-channels-label;
+                        }
+
+                        PairPicker {
+                            model: root.input-pairs;
+                            chosen: root.input-pair-index;
+                            picked(index) => {
+                                root.input-pair-selected(index);
+                            }
+                        }
+                    }
+
+                    if root.live-input-hint != "": SecondaryText {
+                        text: root.live-input-hint;
+                    }
+
+                    // Recall only: the main window saves, renames and deletes.
+                    if root.presets.length > 0: PresetPicker {
+                        presets: root.presets;
+                        current: root.current-preset;
+                        recalled(id) => {
+                            root.preset-recall-requested(id);
+                        }
+                    }
+
+                    // This PC's speakers sit with the volume, above the divider, as
+                    // in the Mac panel; the zones and connected speakers come after.
+                    VerticalLayout {
+                        spacing: 2px;
+
+                        MasterVolume {
+                            volume: root.master-volume;
+                            waves: root.master-volume-waves;
+                            mute-toggled => {
+                                root.master-mute-toggled();
+                            }
+                            changed(value) => {
+                                root.master-volume-changed(value);
+                            }
+                        }
+
+                        // Four rows, then it scrolls: with the list below it shares
+                        // the 260 px the list had alone, so a PC with many outputs
+                        // still fits a small screen.
+                        this-pc-view := ScrollView {
+                            height: min(this-pc-list.preferred-height, 144px);
+
+                            this-pc-list := VerticalLayout {
+                                for speaker in root.this-pc: FlyoutRow {
+                                    glyph: Glyphs.speaker(speaker.kind);
+                                    name: speaker.name;
+                                    label: speaker.cast-group ? Strings.cast-group-label(speaker.name, speaker.cast-group-note) : Strings.speaker-label(speaker.name, speaker.kind, speaker.show-kind, speaker.system-name);
+                                    description: Strings.flyout-speaker-description(Strings.help(speaker.state), Strings.device-volume-hint(speaker.device-volume, speaker.device-volume-percent));
+                                    note: Strings.speaker-note(speaker);
+                                    system-name: speaker.system-name;
+                                    state: speaker.state;
+                                    plays: speaker.plays;
+                                    device-volume: speaker.device-volume;
+
+                                    toggled => {
+                                        root.speaker-toggled(speaker.id);
+                                    }
+                                    focus-changed(focused) => {
+                                        root.speaker-focused = focused;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    if root.no-speaker-on && (root.zones.length > 0 || root.speakers.length > 0 || root.this-pc.length > 0): SecondaryText {
+                        text: Strings.no-speaker-on;
+                    }
+
+                    // "No speakers found" waits for 20 seconds of AirPlay discovery;
+                    // until then it says it looks, as the main window's note does.
+                    // Otherwise it is the main window's note itself.
+                    if root.zones.length == 0 && root.speakers.length == 0 && !(root.this-pc.length > 0 && root.connected-all-hidden): none-note := HorizontalLayout {
+                        property <bool> both-none: root.airplay-none-found && root.cast-list == CastList.none-found;
+                        property <string> list-note: root.airplay-none-found ? (self.both-none ? Strings.network-none-found : Strings.airplay-none-found) : root.airplay-searching ? (root.cast-list == CastList.none-found || root.cast-list == CastList.failed ? Strings.looking-for-airplay-speakers : Strings.looking-for-speakers) : Strings.connected-none;
+                        property <string> cast-note: self.both-none || self.list-note == Strings.looking-for-speakers ? "" : Strings.cast-list(root.cast-list);
+                        property <string> text: root.this-pc.length == 0 && root.all-hidden ? Strings.flyout-all-hidden : root.this-pc.length == 0 && root.airplay-none-found ? Strings.no-speakers : self.cast-note == "" ? self.list-note : self.list-note == Strings.connected-none ? self.cast-note : self.list-note + " " + self.cast-note;
+                        spacing: 10px;
+
+                        // While it looks: a dot that beats once a second, still
+                        // with animation effects off.
+                        if none-note.text == Strings.looking-for-speakers || none-note.text == Strings.looking-for-airplay-speakers: Rectangle {
+                            property <float> beat: Motion.on ? mod(animation-tick() / 1ms, 1000) / 1000 : 1;
+                            width: 15px;
+
+                            Rectangle {
+                                width: 7px * (self.beat < 0.11 ? 1 + 0.6 * self.beat / 0.11 : self.beat < 0.22 ? 1.6 - 0.6 * (self.beat - 0.11) / 0.11 : 1);
+                                height: self.width;
+                                border-radius: self.width / 2;
+                                background: Tokens.secondary-text;
+                                property <float> beat: parent.beat;
+                            }
+                        }
+
+                        SecondaryText {
+                            text: none-note.text;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    // Linux has no Settings page to open.
+                    if root.zones.length == 0 && root.speakers.length == 0 && root.airplay-none-found && Platform.os != OperatingSystemType.linux: HorizontalLayout {
+                        alignment: start;
+                        LinkButton {
+                            text: Strings.open-network-settings;
+                            label: Strings.open-network-settings;
+                            clicked => {
+                                root.network-settings-requested();
+                            }
+                            changed keyboard-focused => {
+                                root.network-settings-focused = self.keyboard-focused;
+                            }
+                        }
+                    }
+
+                    if root.zones.length > 0 || root.speakers.length > 0: ScrollView {
+                        // Every row up to five or so, less this PC's rows above, then
+                        // it scrolls; three rows at least.
+                        height: min(list.preferred-height, max(108px, 260px - root.list-cut - this-pc-view.height));
+
+                        list := VerticalLayout {
+                            for zone in root.zones: VerticalLayout {
+                                accessible-role: groupbox;
+                                accessible-label: zone.name;
+
+                                FlyoutZoneHeader {
+                                    item: zone;
+                                    toggled => {
+                                        root.zone-toggled(zone.id);
+                                    }
+                                    expanded-changed(open) => {
+                                        root.zone-expanded-changed(zone.id, open);
+                                    }
+                                    focus-changed(focused) => {
+                                        root.zone-focused = focused;
+                                    }
+                                }
+
+                                // Its speakers while it is unfolded, their toggles
+                                // under the zone's, past the arrow.
+                                for speaker in zone.expanded ? zone.members : []: FlyoutRow {
+                                    indent: 26px;
+                                    glyph: Glyphs.speaker(speaker.kind);
+                                    name: speaker.name;
+                                    label: speaker.cast-group ? Strings.cast-group-label(speaker.name, speaker.cast-group-note) : Strings.speaker-label(speaker.name, speaker.kind, speaker.show-kind, speaker.system-name);
+                                    description: Strings.flyout-speaker-description(Strings.help(speaker.state), Strings.device-volume-hint(speaker.device-volume, speaker.device-volume-percent));
+                                    caption: speaker.zone-note;
+                                    note: Strings.speaker-note(speaker);
+                                    system-name: speaker.system-name;
+                                    kind: speaker.kind;
+                                    show-kind: speaker.show-kind && !speaker.cast-group;
+                                    state: speaker.state;
+                                    plays: speaker.plays;
+                                    enabled: !speaker.missing;
+                                    device-volume: speaker.device-volume;
+                                    toggled => {
+                                        root.speaker-toggled(speaker.id);
+                                    }
+                                    focus-changed(focused) => {
+                                        root.speaker-focused = focused;
+                                    }
+                                }
+                            }
+
+                            for speaker in root.speakers: FlyoutRow {
+                                glyph: Glyphs.speaker(speaker.kind);
+                                name: speaker.name;
+                                label: speaker.cast-group ? Strings.cast-group-label(speaker.name, speaker.cast-group-note) : Strings.speaker-label(speaker.name, speaker.kind, speaker.show-kind, speaker.system-name);
+                                description: Strings.flyout-speaker-description(Strings.help(speaker.state), Strings.device-volume-hint(speaker.device-volume, speaker.device-volume-percent));
+                                note: Strings.speaker-note(speaker);
+                                system-name: speaker.system-name;
+                                kind: speaker.kind;
+                                show-kind: speaker.show-kind && !speaker.cast-group;
+                                state: speaker.state;
+                                plays: speaker.plays;
+                                device-volume: speaker.device-volume;
+
+                                toggled => {
+                                    root.speaker-toggled(speaker.id);
+                                }
+                                focus-changed(focused) => {
+                                    root.speaker-focused = focused;
+                                }
+                            }
+                        }
+                    }
+
+                    if root.connected-all-hidden: SecondaryText {
+                        text: Strings.flyout-connected-hidden;
+                    }
+
+                    if root.cast-by-address && root.cast-list == CastList.none-found: HorizontalLayout {
+                        alignment: start;
+                        LinkButton {
+                            text: Strings.cast-add-address;
+                            label: Strings.cast-add-address;
+                            clicked => {
+                                root.cast-add-address-requested();
+                            }
+                            changed keyboard-focused => {
+                                root.add-address-focused = self.keyboard-focused;
+                            }
+                        }
+                    }
+
+                    body-end := Rectangle {
+                        height: 0px;
+                    }
+                }
+            }
+
+            Divider { }
+
+            footer := HorizontalLayout {
+                alignment: end;
+
+                exit := Rectangle {
+                    border-radius: Fluent.radius-control;
+                    background: exit-touch.pressed ? Fluent.pressed : exit-touch.has-hover ? Fluent.hover : transparent;
+                    animate background { duration: Fluent.fast; }
+                    forward-focus: exit-focus;
+                    accessible-role: button;
+                    accessible-label: Strings.exit-app;
+                    accessible-action-default => {
+                        root.exit-app();
+                    }
+
+                    exit-focus := FocusScope {
+                        focus-on-click: false;
+                        key-pressed(event) => {
+                            if event.text == " " || event.text == Key.Return {
+                                root.exit-app();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+
+                    exit-touch := TouchArea {
+                        clicked => {
+                            root.exit-app();
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+
+                        Text {
+                            text: Strings.exit-short;
+                            font-size: Tokens.font-size-callout;
+                            color: Tokens.text;
+                            accessible-role: none;
+                        }
+                    }
+
+                    FocusRing {
+                        visible-focus: exit-focus.has-focus;
+                        border-radius: parent.border-radius;
+                    }
+                }
+            }
+        }
+    }
+
+    Announcer {
+        said: root.notice-announcement;
+    }
+}

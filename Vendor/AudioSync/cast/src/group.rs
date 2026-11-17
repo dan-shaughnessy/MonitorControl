@@ -1,0 +1,230 @@
+//! Cast groups (C89 to C103): the member list from the multizone namespace
+//! and the addresses a group session follows while its leader changes.
+
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use serde_json::{Map, Value};
+
+use crate::discovery::DeviceId;
+use crate::media::device_text;
+
+/// One member of a group as the multizone namespace names it (C94).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupMember {
+    /// `deviceId` as sent.
+    pub device_id: String,
+    /// `deviceId` read as a UUID, for the match against discovered `id`s
+    /// (C95); `None` when it is not one.
+    pub id: Option<DeviceId>,
+    pub name: Option<String>,
+}
+
+impl GroupMember {
+    fn from_value(value: &Value) -> Option<GroupMember> {
+        let device_id = value.get("deviceId")?.as_str()?.to_owned();
+        Some(GroupMember {
+            id: DeviceId::parse(&device_id),
+            name: value.get("name").and_then(Value::as_str).map(device_text),
+            device_id,
+        })
+    }
+
+    /// Whether `device_id` names this member: as UUIDs when both read as
+    /// one, so case and dashes don't matter (C95), else as text.
+    pub fn is(&self, device_id: &str) -> bool {
+        match (self.id, DeviceId::parse(device_id)) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => self.device_id.eq_ignore_ascii_case(device_id),
+        }
+    }
+}
+
+/// A message on the multizone namespace (C94, C96).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MultizoneMessage {
+    /// `MULTIZONE_STATUS`: the whole list.
+    Status(Vec<GroupMember>),
+    /// `DEVICE_ADDED` or `DEVICE_UPDATED`.
+    Upsert(GroupMember),
+    /// `DEVICE_REMOVED`.
+    Removed(String),
+    /// Any other type, or one of the above without the fields it needs;
+    /// logged only.
+    Other(String),
+}
+
+impl MultizoneMessage {
+    pub fn from_payload(kind: &str, payload: &Map<String, Value>) -> MultizoneMessage {
+        let other = || MultizoneMessage::Other(device_text(kind));
+        match kind {
+            "MULTIZONE_STATUS" => payload
+                .get("status")
+                .and_then(|status| status.get("devices"))
+                .and_then(Value::as_array)
+                .map_or_else(other, |devices| {
+                    MultizoneMessage::Status(
+                        devices.iter().filter_map(GroupMember::from_value).collect(),
+                    )
+                }),
+            "DEVICE_ADDED" | "DEVICE_UPDATED" => payload
+                .get("device")
+                .and_then(GroupMember::from_value)
+                .map_or_else(other, MultizoneMessage::Upsert),
+            "DEVICE_REMOVED" => payload
+                .get("deviceId")
+                .and_then(Value::as_str)
+                .map_or_else(other, |id| MultizoneMessage::Removed(id.to_owned())),
+            _ => other(),
+        }
+    }
+}
+
+/// The most members a group's list keeps; a home group is a handful of
+/// speakers, so a longer list is a hostile or broken leader.
+pub const MAX_GROUP_MEMBERS: usize = 64;
+
+/// A group's members as the session knows them: unknown until the first
+/// message that names some (C94).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemberList {
+    members: Option<Vec<GroupMember>>,
+}
+
+impl MemberList {
+    pub fn new() -> MemberList {
+        MemberList::default()
+    }
+
+    /// `None` while no message has named the members.
+    pub fn members(&self) -> Option<&[GroupMember]> {
+        self.members.as_deref()
+    }
+
+    /// Applies a message; true when the list changed. `Other` changes
+    /// nothing (C96).
+    pub fn apply(&mut self, message: &MultizoneMessage) -> bool {
+        let before = self.members.clone();
+        match message {
+            MultizoneMessage::Status(members) => {
+                let kept = members.len().min(MAX_GROUP_MEMBERS);
+                self.members = Some(members[..kept].to_vec());
+            }
+            MultizoneMessage::Upsert(member) => {
+                let list = self.members.get_or_insert_with(Vec::new);
+                let full = list.len() >= MAX_GROUP_MEMBERS;
+                match list.iter_mut().find(|known| known.is(&member.device_id)) {
+                    Some(known) => *known = member.clone(),
+                    None if !full => list.push(member.clone()),
+                    None => {}
+                }
+            }
+            MultizoneMessage::Removed(device_id) => {
+                if let Some(list) = &mut self.members {
+                    list.retain(|known| !known.is(device_id));
+                }
+            }
+            MultizoneMessage::Other(_) => {}
+        }
+        self.members != before
+    }
+}
+
+/// The addresses a group session uses, kept current by the host from the
+/// group's latest records (C90) and its members' (C103).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupAddresses {
+    /// The group's own addresses and port: where its leader is now.
+    pub group: Vec<SocketAddr>,
+    /// The addresses of the discovered devices that match a member (C95).
+    pub members: Vec<IpAddr>,
+}
+
+/// [`GroupAddresses`] shared between the host, which updates them as
+/// discovery reports, and the session, which reads them on every connect.
+#[derive(Clone, Debug, Default)]
+pub struct GroupRecords(Arc<Mutex<GroupAddresses>>);
+
+/// The same shared records, not equal contents.
+impl PartialEq for GroupRecords {
+    fn eq(&self, other: &GroupRecords) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl GroupRecords {
+    pub fn new(group: Vec<SocketAddr>) -> GroupRecords {
+        GroupRecords(Arc::new(Mutex::new(GroupAddresses {
+            group,
+            members: Vec::new(),
+        })))
+    }
+
+    pub fn get(&self) -> GroupAddresses {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The group's records moved or were resolved again. An empty list
+    /// keeps the last one: the records expired, and the session retries
+    /// where the group was until they come back.
+    pub fn set_group(&self, group: Vec<SocketAddr>) {
+        if group.is_empty() {
+            return;
+        }
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).group = group;
+    }
+
+    pub fn set_members(&self, members: Vec<IpAddr>) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .members = members;
+    }
+
+    /// Every address the stream server answers for this group (C103).
+    pub fn allowed(&self) -> Vec<IpAddr> {
+        let addresses = self.get();
+        let mut allowed: Vec<IpAddr> = addresses.group.iter().map(SocketAddr::ip).collect();
+        allowed.extend(addresses.members);
+        allowed.sort();
+        allowed.dedup();
+        allowed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(n: usize) -> GroupMember {
+        GroupMember {
+            device_id: format!("member-{n}"),
+            id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn the_member_list_stops_at_its_cap() {
+        let mut list = MemberList::new();
+        for n in 0..10_000 {
+            list.apply(&MultizoneMessage::Upsert(member(n)));
+        }
+        assert_eq!(list.members().map(<[_]>::len), Some(MAX_GROUP_MEMBERS));
+        let renamed = GroupMember {
+            name: Some("Kitchen".to_owned()),
+            ..member(0)
+        };
+        assert!(list.apply(&MultizoneMessage::Upsert(renamed)));
+        list.apply(&MultizoneMessage::Removed("member-1".to_owned()));
+        assert!(list.apply(&MultizoneMessage::Upsert(member(20_000))));
+        assert_eq!(list.members().map(<[_]>::len), Some(MAX_GROUP_MEMBERS));
+
+        let mut status = MemberList::new();
+        status.apply(&MultizoneMessage::Status((0..10_000).map(member).collect()));
+        assert_eq!(status.members().map(<[_]>::len), Some(MAX_GROUP_MEMBERS));
+    }
+}

@@ -1,0 +1,329 @@
+// Engine test on real output hardware, completely silent: every output runs at
+// gain 0, so no sound is produced. Checks that each output device renders,
+// that per-speaker delay is applied end to end (and changes live), and that
+// an output fades in on its first audio and plays its fade-out before its IO
+// stops (S184-S186), on the Rust core's ring and renderers as a session makes
+// them. Run with: Tests/run-tests.sh --hardware
+import Foundation
+import CoreAudio
+import Synchronization
+
+var failedChecks = 0
+func check(_ ok: Bool, _ name: String, _ detail: String = "") {
+    print((ok ? "✅ PASS  " : "❌ FAIL  ") + name + (detail.isEmpty ? "" : "  — " + detail))
+    if !ok { failedChecks += 1 }
+}
+
+let rate = 48000.0
+guard let parts = EngineParts.make() else {
+    print("❌ FAIL  the core's session parts could not be made")
+    exit(1)
+}
+let ring = parts.ring
+
+// Real-time producer: 10 ms chunks paced by the wall clock, like a capture tap.
+let producing = Atomic<Bool>(true)
+let producer = Thread {
+    let chunk = 480
+    let buf = UnsafeMutablePointer<Float>.allocate(capacity: chunk * 2)
+    buf.initialize(repeating: 0, count: chunk * 2)
+    let start = Date()
+    var written = 0
+    while producing.load(ordering: .relaxed) {
+        let due = Int(Date().timeIntervalSince(start) * rate)
+        while written + chunk <= due {
+            ring.write(interleaved: buf, frames: chunk)
+            written += chunk
+        }
+        usleep(2000)
+    }
+}
+producer.start()
+Thread.sleep(forTimeInterval: 3.5)   // build up history beyond the largest delay tested
+
+// covers: S60, S61, S66, S67 (on every listed output device, at gain 0)
+let devices = AudioDevices().allOutputDevices().filter { !$0.uid.isEmpty && !$0.name.contains("Aggregate") }
+check(!devices.isEmpty, "found output devices", devices.map(\.name).joined(separator: ", "))
+var ranAt44k = false
+
+for dev in devices {
+    guard let r = parts.makeRenderer(captureRate: rate) else {
+        check(false, "\(dev.name): output can be made")
+        continue
+    }
+    r.setGain(linear: 0)   // silent
+    do {
+        try r.start(on: dev.id, captureRate: rate, delayMs: 2000)
+        r.setGain(linear: 0)
+    } catch let startError {
+        check(false, "\(dev.name): output starts", "\(startError)")
+        continue
+    }
+    // S184: the ring holds more than the delay, so the first callback copies
+    // audio, and the output fades in from closed to open. A device whose
+    // first callback holds the whole fade ends it already open.
+    var states: [CoreRenderer.FadeState] = []
+    var firstCallbackFrames: Int64 = 0
+    let watchUntil = Date().addingTimeInterval(0.3)
+    while Date() < watchUntil {
+        let state = r.fadeState
+        if states.last != state { states.append(state) }
+        if firstCallbackFrames == 0 { firstCallbackFrames = r.framesRendered.load(ordering: .relaxed) }
+        usleep(250)
+    }
+    let wholeFadeInOneCallback = firstCallbackFrames >= Int64(r.fadeFrames)
+    check(states.last == .open && (states.contains(.fadingIn) || wholeFadeInOneCallback),
+          "\(dev.name): first audio fades in",
+          "\(states) over \(r.fadeFrames) frames, first callback \(firstCallbackFrames) frames")
+
+    Thread.sleep(forTimeInterval: 0.7)
+    let rendered = r.framesRendered.load(ordering: .relaxed)
+    check(rendered > 24000, "\(dev.name): renders audio", "\(rendered) frames in 1 s")
+
+    // Lag ≈ delay − one device buffer, ± one producer chunk; each change
+    // fades out and back in (S187) and lands exactly (S46).
+    for ms in [2000.0, 500.0, 3000.0, 150.0] {
+        r.setDelay(ms: ms)
+        Thread.sleep(forTimeInterval: 0.4)
+        let lagMs = Double(r.lagFrames) / rate * 1000
+        check(abs(lagMs - ms) < 60, "\(dev.name): delay \(Int(ms)) ms",
+              String(format: "measured %.0f ms", lagMs))
+    }
+
+    // covers: S187 (an increase closes the output for its masked silence, so the fade-out shows as .closed)
+    let resyncsBefore = r.counters.resyncs
+    let framesBefore = r.framesRendered.load(ordering: .relaxed)
+    let changed = Date()
+    r.setDelay(ms: 400)
+    var changeStates: [CoreRenderer.FadeState] = [r.fadeState]
+    while Date().timeIntervalSince(changed) < 0.7 {
+        let state = r.fadeState
+        if changeStates.last != state { changeStates.append(state) }
+        usleep(250)
+    }
+    let changeSeconds = Date().timeIntervalSince(changed)
+    let changeFrames = r.framesRendered.load(ordering: .relaxed) - framesBefore
+    let changeResyncs = r.counters.resyncs - resyncsBefore
+    let changeLagMs = Double(r.lagFrames) / rate * 1000
+    check(changeStates.first == .open && changeStates.contains(.closed) && changeStates.last == .open
+          && changeResyncs == 1 && Double(changeFrames) > 0.8 * r.renderRate * changeSeconds
+          && abs(changeLagMs - 400) < 60 && r.stopNote == "running",
+          "\(dev.name): delay change fades out and in without restarting the output",
+          "\(changeStates), \(changeResyncs) resyncs, \(changeFrames) frames in "
+              + String(format: "%.0f ms at %.0f Hz, lag %.0f ms; ", changeSeconds * 1000, r.renderRate, changeLagMs)
+              + r.stopNote)
+
+    // S185: asked to fade out, the output keeps its IO running and renders
+    // zeros after the fade until the host clock passes the fade's last
+    // frame's output time plus the device's latency; only then may it stop.
+    // An output whose latency is beyond the 500 ms cap is stopped at the cap.
+    let latencyMs = Double(r.outputLatencyNs) / 1_000_000
+    let beyondCap = r.outputLatencyNs >= OutputRetirement.capNs
+    let renderedBefore = r.framesRendered.load(ordering: .relaxed)
+    let asked = HostClock.now()
+    r.requestFadeOut()
+    var fadeStates: [CoreRenderer.FadeState] = []
+    var fadedAfterNs: UInt64?
+    while HostClock.now() - asked < OutputRetirement.capNs {
+        let state = r.fadeState
+        if fadeStates.last != state { fadeStates.append(state) }
+        let now = HostClock.now()
+        if r.hasFaded(nowNs: now) {
+            fadedAfterNs = now - asked
+            break
+        }
+        usleep(250)
+    }
+    let renderedWhileFading = r.framesRendered.load(ordering: .relaxed) - renderedBefore
+    r.halt()
+    let playedFirst = fadedAfterNs != nil && r.stopNote == "stopped once its fade-out had played"
+    var fadeDetail = "\(fadeStates); "
+    if let fadedAfterNs {
+        fadeDetail += String(format: "played after %.1f ms", Double(fadedAfterNs) / 1e6)
+    } else {
+        fadeDetail += "not played within 500 ms"
+    }
+    fadeDetail += String(format: ", latency %.1f ms, ", latencyMs)
+    fadeDetail += "\(renderedWhileFading) frames rendered meanwhile; \(r.stopNote)"
+    check(fadeStates.last == .closed && renderedWhileFading >= Int64(r.fadeFrames) && (playedFirst || beyondCap),
+          "\(dev.name): stop fades out before the output stops", fadeDetail)
+
+    // covers: S134 (IO stopped when halt returns)
+    let renderedAtHalt = r.framesRendered.load(ordering: .relaxed)
+    Thread.sleep(forTimeInterval: 0.2)
+    let renderedAfterHalt = r.framesRendered.load(ordering: .relaxed) - renderedAtHalt
+    check(renderedAfterHalt == 0, "\(dev.name): no callback runs once the output has stopped",
+          "\(renderedAfterHalt) frames rendered in the 200 ms after halt")
+
+    // covers: S186 (a switch-off the way the session makes it returns once the fade
+    // has played, never later than 500 ms after the request)
+    do {
+        try r.start(on: dev.id, captureRate: rate, delayMs: 150)
+        r.setGain(linear: 0)
+        Thread.sleep(forTimeInterval: 0.4)
+        let retirement = OutputRetirement()
+        let began = Date()
+        retirement.remove([r])
+        retirement.finishAll()
+        let took = Date().timeIntervalSince(began)
+        let played = r.stopNote == "stopped once its fade-out had played"
+        check(retirement.isIdle && took <= 0.52 && (played || took >= 0.5),
+              "\(dev.name): stop returns once the fade has played, within 500 ms",
+              String(format: "%.1f ms, latency %.1f ms; ", took * 1000, latencyMs) + r.stopNote)
+    } catch {
+        check(false, "\(dev.name): stop returns once the fade has played, within 500 ms", "restart: \(error)")
+    }
+    r.halt()
+
+    // covers: S206 (the Mac's 44.1 kHz outputs at hold-back 0 starved right after each start)
+    // Related, not covered here: S209 (late callbacks) and S317 (the start window).
+    do {
+        try r.start(on: dev.id, captureRate: rate, delayMs: 0)
+        r.setGain(linear: 0)
+        if r.renderRate == 44100 {
+            ranAt44k = true
+            Thread.sleep(forTimeInterval: 2)
+            let counted = r.counters
+            check(counted.starvedRenders == 0, "\(dev.name): 44.1 kHz output at hold-back 0 never starves after start",
+                  "\(counted.starvedRenders) starved renders, \(counted.starvedFrames) frames in 2 s")
+        }
+    } catch {
+        check(false, "\(dev.name): output restarts at hold-back 0", "\(error)")
+    }
+    r.halt()
+}
+if !ranAt44k {
+    print("   SKIP  44.1 kHz output at hold-back 0 never starves after start: no output device runs at 44.1 kHz")
+}
+
+// covers: S17, S133 (the Mac's heard flag, read on the main thread; the sound is a constant
+// test signal written to a virtual loopback device's output, which reaches no speaker)
+let toneOn = Atomic<Bool>(false)
+let loopbackName = ProcessInfo.processInfo.environment["AUDIOSYNC_TEST_LOOPBACK"] ?? ""
+if loopbackName.isEmpty {
+    print("   SKIP  loopback capture: heard flag: AUDIOSYNC_TEST_LOOPBACK (a virtual loopback device's name) is not set")
+} else if let loopback = devices.first(where: { $0.name == loopbackName && $0.transport == kAudioDeviceTransportTypeVirtual }),
+          let heardParts = EngineParts.make() {
+    var toneProc: AudioDeviceIOProcID?
+    let toneStatus = AudioDeviceCreateIOProcIDWithBlock(&toneProc, loopback.id, nil) { _, _, _, output, _ in
+        let level: Float = toneOn.load(ordering: .relaxed) ? 0.25 : 0
+        for buffer in UnsafeMutableAudioBufferListPointer(output) {
+            guard let samples = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+            for index in 0..<Int(buffer.mDataByteSize) / MemoryLayout<Float>.size { samples[index] = level }
+        }
+    }
+    let capture = SourceCapture()
+    if toneStatus == noErr, let toneProc, AudioDeviceStart(loopback.id, toneProc) == noErr {
+        let heardBeforeStart = capture.sessionHeard
+        Thread.sleep(forTimeInterval: 0.5)   // the loopback's input carries the signal's zeros by now
+        var stage = "loopback capture: heard flag false at a session's start"
+        do {
+            try capture.start(source: .input(uid: loopback.uid), parts: heardParts)
+            Thread.sleep(forTimeInterval: 0.3)
+            check(!heardBeforeStart && capture.isReading && !capture.sessionHeard,
+                  "loopback capture: heard flag false at a session's start",
+                  "before start \(heardBeforeStart), reading \(capture.isReading), heard \(capture.sessionHeard)")
+
+            toneOn.store(true, ordering: .relaxed)
+            let toneStart = Date()
+            while !capture.sessionHeard && Date().timeIntervalSince(toneStart) < 2 { usleep(10_000) }
+            check(capture.sessionHeard, "loopback capture: heard flag true after a frame with sound",
+                  capture.sessionHeard
+                      ? String(format: "heard after %.0f ms", Date().timeIntervalSince(toneStart) * 1000)
+                      : "nothing heard in 2 s; does the terminal have microphone access?")
+
+            capture.halt()
+            check(!capture.sessionHeard, "loopback capture: heard flag false while stopped")
+
+            toneOn.store(false, ordering: .relaxed)
+            Thread.sleep(forTimeInterval: 0.5)
+            stage = "loopback capture: heard flag false at the next session's start"
+            try capture.start(source: .input(uid: loopback.uid), parts: heardParts)
+            Thread.sleep(forTimeInterval: 0.3)
+            check(capture.isReading && !capture.sessionHeard,
+                  "loopback capture: heard flag false at the next session's start",
+                  "reading \(capture.isReading), heard \(capture.sessionHeard)")
+        } catch {
+            check(false, stage, "\(loopbackName): capture start: \(error)")
+        }
+        capture.halt()
+        _ = AudioDeviceStop(loopback.id, toneProc)
+    } else {
+        check(false, "loopback capture: heard flag false at a session's start",
+              "\(loopbackName): the test signal did not start (\(toneStatus))")
+    }
+    if let toneProc { _ = AudioDeviceDestroyIOProcID(loopback.id, toneProc) }
+} else {
+    check(false, "loopback capture: heard flag false at a session's start",
+          "no virtual output device named \(loopbackName), or the engine parts could not be made")
+}
+
+func setDefaultOutput(_ id: AudioDeviceID) -> Bool {
+    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                             mScope: kAudioObjectPropertyScopeGlobal,
+                                             mElement: kAudioObjectPropertyElementMain)
+    var value = id
+    return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil,
+                                      UInt32(MemoryLayout<AudioDeviceID>.size), &value) == noErr
+}
+
+// covers: S145 (the default output moves off a running output's device to a virtual one and back, at gain 0)
+let defaultName = "default output change leaves a running output alone"
+let systemDevices = AudioDevices()
+let home = systemDevices.defaultOutputDevice()
+let others = devices.filter { $0.id != home?.id }
+let virtualAway = others.first { $0.transport == kAudioDeviceTransportTypeVirtual }
+var defaultSkip: String?
+if ProcessInfo.processInfo.environment["AUDIOSYNC_TEST_MOVE_DEFAULT"] != "1" {
+    defaultSkip = "AUDIOSYNC_TEST_MOVE_DEFAULT=1 is not set"
+} else if home == nil {
+    defaultSkip = "no default output"
+} else if others.isEmpty {
+    defaultSkip = "no second output device"
+} else if virtualAway == nil {
+    defaultSkip = "no virtual output device to move the default to"
+}
+if let defaultSkip {
+    print("   SKIP  \(defaultName): \(defaultSkip)")
+} else if let home, let away = virtualAway, let r = parts.makeRenderer(captureRate: rate) {
+    r.setGain(linear: 0)
+    do {
+        try r.start(on: home.id, captureRate: rate, delayMs: 300)
+        Thread.sleep(forTimeInterval: 0.6)
+        let rateBefore = r.renderRate
+        let resyncsBefore = r.counters.resyncs
+        let framesBefore = r.framesRendered.load(ordering: .relaxed)
+        let changed = Date()
+        defer { _ = setDefaultOutput(home.id) }
+        let moved = setDefaultOutput(away.id) && systemDevices.defaultOutputDevice()?.id == away.id
+        var states: [CoreRenderer.FadeState] = [r.fadeState]
+        while moved && Date().timeIntervalSince(changed) < 1 {
+            let state = r.fadeState
+            if states.last != state { states.append(state) }
+            usleep(250)
+        }
+        if moved {
+            let seconds = Date().timeIntervalSince(changed)
+            let frames = r.framesRendered.load(ordering: .relaxed) - framesBefore
+            let resyncs = r.counters.resyncs - resyncsBefore
+            let lagMs = Double(r.lagFrames) / rate * 1000
+            check(states == [.open] && resyncs == 0 && r.renderRate == rateBefore
+                  && Double(frames) > 0.8 * r.renderRate * seconds && abs(lagMs - 300) < 60 && r.stopNote == "running",
+                  defaultName,
+                  "\(home.name) -> \(away.name): \(states), \(resyncs) resyncs, \(frames) frames in "
+                      + String(format: "%.0f ms at %.0f Hz, lag %.0f ms; ", seconds * 1000, r.renderRate, lagMs)
+                      + r.stopNote)
+        } else {
+            print("   SKIP  \(defaultName): macOS refused \(away.name) as the default output")
+        }
+    } catch {
+        check(false, defaultName, "\(home.name): output starts: \(error)")
+    }
+    r.halt()
+} else {
+    print("   SKIP  \(defaultName): the output could not be made")
+}
+
+producing.store(false, ordering: .relaxed)
+print(failedChecks == 0 ? "\nALL ENGINE TESTS PASSED" : "\n\(failedChecks) FAILURE(S)")
+exit(failedChecks > 0 ? 1 : 0)

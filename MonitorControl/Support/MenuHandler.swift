@@ -22,6 +22,7 @@ class MenuHandler: NSMenu, NSMenuDelegate {
   func menuWillOpen(_: NSMenu) {
     self.updateMenuRelevantDisplay()
     self.refreshAutomationStatus()
+    self.items.first { $0.title == "Desk Audio" }?.submenu?.items.first?.title = app.deskSession.status
     app.keyboardShortcuts.disengage()
   }
 
@@ -73,6 +74,18 @@ class MenuHandler: NSMenu, NSMenuDelegate {
       }
     }
     self.addAutomationOptions()
+    let desk = NSMenu()
+    let status = desk.addItem(withTitle: app.deskSession.status, action: nil, keyEquivalent: "")
+    status.isEnabled = false
+    for (title, action) in [("Desk Setup…", #selector(app.deskSetupClicked)),
+                            ("Audio Outputs…", #selector(app.deskAudioSettingsClicked)),
+                            ("Use Personal Audio", #selector(app.deskPersonalClicked)),
+                            ("Use RESML Audio", #selector(app.deskRESMLClicked)),
+                            ("Pause Desk Audio", #selector(app.deskPauseClicked))] {
+      let item = desk.addItem(withTitle: title, action: action, keyEquivalent: "")
+      item.target = app
+    }
+    self.addItem(withTitle: "Desk Audio", action: nil, keyEquivalent: "").submenu = desk
     self.addDefaultMenuOptions()
   }
 

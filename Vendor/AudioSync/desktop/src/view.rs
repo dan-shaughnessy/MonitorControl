@@ -1,0 +1,17844 @@
+//! Connects the windows to a [`Backend`]: fills them from its snapshots and
+//! turns every user action into a backend call, then refreshes. A timer polls
+//! the backend twice a second, so what happens on its own (a device unplugged,
+//! a source that quit) shows too.
+//!
+//! The models are updated in place, row by row, so a slider being dragged or a
+//! field being typed in keeps its focus while the rest of the window updates.
+//! A list whose length changes is rebuilt; when that removes the control that
+//! had the focus in the tray flyout, the flyout takes the focus back so Escape
+//! still closes it, and in the main window the focus goes to the next notice,
+//! the same control of the row rebuilt, a neighbouring row's options, or the
+//! streaming switch.
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::rc::{Rc, Weak};
+use std::time::Duration;
+
+use audiosync_core::calibrate_all::{
+    AirPlayMoves, AirPlayShared, Class, EndReason, Measurement, RowState as SheetRowState,
+    SharedState,
+};
+use audiosync_core::channels::InputPair;
+use audiosync_core::eq::{self, CurveMatch, EqSettings};
+use audiosync_core::meter;
+use audiosync_core::policy::device_volume::Hint;
+use audiosync_core::policy::presets::new_preset_name;
+use audiosync_core::policy::source_quit::WhenSourceQuits;
+use audiosync_core::policy::speakers::MAX_NOTICES;
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
+
+mod cast_address;
+mod password;
+
+use crate::audio::backend::AirPlayGroupKind;
+use crate::audio::calibration::{self, Failure, Missing, Phase, Step, Which};
+use crate::backdrop::Frame;
+use crate::debug_log::DebugLog;
+use crate::guide::{self, Guide, GuideStep, SettingsPage};
+use crate::launch_at_login::{self, LaunchAtLogin};
+use crate::network_profile::{self, Watch};
+use crate::now_playing_card::{CardSource, MediaControls, NowPlayingCard, Repeat, Transport};
+use crate::ui_model::{
+    self, AirPlayWait, AllPhase, AllProgress, AppState, Backend, LeftOutRow, MAX_PRESETS,
+    MainWindowShows, NoticeMessage, PinPrompt, PresetError, PresetLeftOff, SheetRow, SheetState,
+    SourceKind, SourceName, SpeakerState, SwitchName, ViewSettings, WindowFrame,
+};
+use crate::volume_keys::{self, VolumeKey};
+use crate::{
+    AboutDialog, AirPlayProblem, Availability, CalibrationRowItem, CastAddressDialog, CastList,
+    CastProblem, CastState, DeviceVolumeHint, EqualizerWindow, GuidePage, GuideStepItem,
+    GuideWindow, HiddenItem, LeftOutItem, MainControl, MainWindow, MixAppItem, Motion, NameField,
+    NoticeItem, NoticeKind, Palette, PasswordDialog, PinDialog, PinPhase, PresetItem, RowPart,
+    RowState, SpeakerGroup, SpeakerItem, SpeakerKind, Strings, Tokens, TrayFlyout, UpdateButton,
+    ZoneChoice, ZoneItem, ZoneNameDialog, ZoneTarget, speaker_names,
+};
+
+mod help_window;
+mod remote_window;
+mod setup_window;
+
+/// The digits the PIN field keeps of what was typed: four at most.
+fn pin_digits(text: &str) -> String {
+    text.chars().filter(char::is_ascii_digit).take(4).collect()
+}
+
+/// What the zone name dialog is open for.
+#[derive(Clone, Debug, PartialEq)]
+enum DialogPurpose {
+    /// New Zone from Active Speakers.
+    NewZone,
+    /// New Zone… in a speaker's menu, by speaker ID.
+    NewZoneWith(String),
+    /// Only a message (no name field), e.g. why a zone can't be made yet.
+    Message,
+    /// Save as Preset….
+    SavePreset,
+    /// Rename… on a preset, by preset ID.
+    RenamePreset(String),
+    /// Save Curve in the equalizer.
+    SaveCurve,
+    /// Rename in the equalizer, for the saved curve of this name.
+    RenameCurve(String),
+}
+
+/// Where a name is edited: a speaker's full row (in its section or under
+/// its zone), its In zones row, or a zone's header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RenamePlace {
+    #[default]
+    Row,
+    InZones,
+    Zone,
+}
+
+/// UI state the backend doesn't keep: which sync controls are open, what is
+/// being typed in their fields, and whether virtual outputs are listed.
+#[derive(Default)]
+struct UiState {
+    sync_open: HashSet<String>,
+    /// What is typed in each speaker's delay field, by speaker ID.
+    delay_drafts: HashMap<String, TypedDelay>,
+    airplay_delay_draft: TypedDelay,
+    /// The speaker whose name is being edited in its row, and what is typed
+    /// there; one at a time (spec S228).
+    rename: Option<(String, String)>,
+    /// Where the open rename's field shows.
+    rename_place: RenamePlace,
+    /// The open rename's field has had the focus; only then does the focus
+    /// moving to another control apply the name.
+    rename_focused: bool,
+    /// View > Show Virtual Devices; off at launch, like the Mac's default.
+    show_virtual: bool,
+    /// View > Appearance as chosen, which the theme preview doesn't change.
+    appearance: ui_model::Appearance,
+    /// View > Web Remote.
+    remote: crate::remote::RemoteSettings,
+    /// File > Check for Updates Automatically, as saved.
+    check_updates_automatically: bool,
+    /// Speakers > Volume Keys Control AudioSync, as saved (spec S429).
+    volume_keys: bool,
+    /// The last update check that read the appcast, Unix seconds.
+    last_update_check: Option<u64>,
+    /// The version the updater stopped offering at launch (spec S316).
+    update_record: Option<ui_model::UpdateRecord>,
+    /// A message the name dialog couldn't show while it asked for a name.
+    dialog_notice: Option<ui_model::Notice>,
+    listed_virtual: ListedVirtual,
+    /// The zones whose speakers are hidden by their arrow, by ID; a zone
+    /// opens expanded.
+    collapsed: HashSet<String>,
+    /// The same for the flyout, which keeps its own (S359).
+    flyout_collapsed: HashSet<String>,
+    /// Whether the source was a mix at the last refresh.
+    source_was_mix: bool,
+    /// The equalizer curve last picked or saved, so the picker tells it from
+    /// a curve with the same gains (spec S270).
+    chosen_curve: Option<CurveMatch>,
+    /// The gains when Save Curve opened its dialog, which Save stores even
+    /// if the picker, bands or Reset change them meanwhile.
+    save_curve_gains: [f64; eq::BAND_COUNT],
+}
+
+/// The virtual outputs the speaker lists have shown this session. With Show
+/// Virtual Devices off, a virtual output is listed while it is on, set to
+/// auto-connect or in a zone; once listed, it stays listed for the rest of
+/// the session (until the app restarts or Show Virtual Devices changes), so
+/// turning it off doesn't remove its row from under the keyboard focus, and
+/// the lists never change shape later on their own.
+#[derive(Default)]
+struct ListedVirtual {
+    ids: HashSet<String>,
+}
+
+impl ListedVirtual {
+    /// Remembers the virtual outputs listed now.
+    fn note(&mut self, state: &ui_model::AppState, show_virtual: bool) {
+        for speaker in &state.speakers {
+            let chosen = speaker.is_listed(show_virtual)
+                || speaker.auto_connect
+                || state.zone_of(&speaker.id).is_some();
+            if speaker.kind == ui_model::SpeakerKind::Virtual && chosen {
+                self.ids.insert(speaker.id.clone());
+            }
+        }
+    }
+
+    /// Whether the speaker lists show the speaker.
+    fn lists(&self, speaker: &ui_model::Speaker, show_virtual: bool) -> bool {
+        speaker.is_listed(show_virtual) || self.ids.contains(&speaker.id)
+    }
+
+    /// Show Virtual Devices changed: only its rule decides again.
+    fn forget(&mut self) {
+        self.ids.clear();
+    }
+}
+
+/// What is being typed in a delay field (a speaker's or the AirPlay delay).
+/// Typing only keeps the text: applying "2" and "22" on the way to "220"
+/// would re-time the output at each of them, and the AirPlay delay's lower
+/// bound (2000 ms under the sender's latency) would clamp them. Enter or
+/// leaving the field applies it; Escape drops it.
+#[derive(Default)]
+struct TypedDelay {
+    /// The text, and the value the field showed when it was typed.
+    draft: Option<(String, Option<f64>)>,
+    /// A speaker's field keeps the text when its delay is set elsewhere
+    /// (the phone remote, a calibration), as on the Mac (S181); the AirPlay
+    /// delay field follows a new value (a new sender latency) instead.
+    survives: bool,
+}
+
+impl TypedDelay {
+    /// Keeps `text` if the field takes it (`ui_model::delay_field_text`);
+    /// otherwise the field goes back to what it showed before, and this
+    /// returns false.
+    fn edit(&mut self, text: &str, shown: Option<f64>) -> bool {
+        let taken = ui_model::delay_field_text(text);
+        if let Some(text) = taken {
+            self.draft = Some((text.to_string(), shown));
+        }
+        taken.is_some()
+    }
+
+    /// The text the field shows instead of `shown`, the applied value.
+    fn text(&self, shown: Option<f64>) -> Option<&str> {
+        self.draft
+            .as_ref()
+            .filter(|(_, typed_at)| self.survives || *typed_at == shown)
+            .map(|(text, _)| text.as_str())
+    }
+
+    /// Ends the typing: the number to apply, if the typed text is one. The
+    /// field then shows the applied value.
+    fn commit(&mut self, shown: Option<f64>) -> Option<f64> {
+        let number = self.text(shown).and_then(ui_model::parse_ms);
+        self.draft = None;
+        number
+    }
+
+    /// Drops the typed text (Escape): the field shows the applied value
+    /// again, and leaving it applies nothing.
+    fn cancel(&mut self) {
+        self.draft = None;
+    }
+}
+
+/// The waves on the master volume's speaker, by the rounded level: none at
+/// 0, one up to 33, two up to 66, three above, as on the Mac.
+fn volume_waves(volume: f64) -> i32 {
+    match volume {
+        v if v < 0.5 => 0,
+        v if v < 33.5 => 1,
+        v if v < 66.5 => 2,
+        _ => 3,
+    }
+}
+
+/// The lowest master level Unmute brings back: stepping down to 0 passes
+/// every level, and one of 1 would sound muted still.
+const UNMUTE_FLOOR: f64 = 5.0;
+
+/// Whether a delay field holds a draft: `typed`, the text it shows instead of
+/// the applied value, isn't `applied` as the field shows it. A draft applies
+/// only on Enter or leaving the field, so the field marks it.
+fn is_draft(typed: Option<&str>, applied: &str) -> bool {
+    typed.is_some_and(|text| text != applied)
+}
+
+/// Whether Connected Speakers lists nothing only because its outputs are
+/// virtual ones that View > Show Virtual Devices hides: its note says so.
+fn only_virtual_outputs_hidden(
+    connected: &[&ui_model::Speaker],
+    listed: impl Fn(&ui_model::Speaker) -> bool,
+) -> bool {
+    !connected.is_empty() && connected.iter().all(|s| !listed(s))
+}
+
+struct Models {
+    sources: Rc<VecModel<SharedString>>,
+    /// The chosen input device's channel pairs; empty up to two channels.
+    input_pairs: Rc<VecModel<SharedString>>,
+    mix_apps: Rc<VecModel<MixAppItem>>,
+    this_pc: Rc<VecModel<SpeakerItem>>,
+    connected: Rc<VecModel<SpeakerItem>>,
+    /// The compact rows of the speakers in a zone, under their own section.
+    this_pc_zoned: Rc<VecModel<SpeakerItem>>,
+    connected_zoned: Rc<VecModel<SpeakerItem>>,
+    /// The flyout's speakers in no zone: this PC's, under the volume, and
+    /// the connected ones, after the zones.
+    flyout_this_pc: Rc<VecModel<SpeakerItem>>,
+    flyout_connected: Rc<VecModel<SpeakerItem>>,
+    zones: Rc<VecModel<ZoneItem>>,
+    /// The zones as the flyout folds them.
+    flyout_zones: Rc<VecModel<ZoneItem>>,
+    /// Each zone's rows by zone ID, kept between refreshes so an unchanged
+    /// zone's item compares equal and its rows aren't rebuilt.
+    zone_models: RefCell<HashMap<String, ZoneModels>>,
+    /// The rows' Move to Zone lists by the zone a row is in ("" for none),
+    /// kept between refreshes as the zone rows are.
+    move_zones: RefCell<HashMap<String, Rc<VecModel<ZoneChoice>>>>,
+    notices: Rc<VecModel<NoticeItem>>,
+    flyout_notices: Rc<VecModel<NoticeItem>>,
+    gains: Rc<VecModel<f32>>,
+    presets: Rc<VecModel<SharedString>>,
+    /// The speaker presets, in the main window and the flyout.
+    speaker_presets: Rc<VecModel<PresetItem>>,
+    calibration_rows: Rc<VecModel<CalibrationRowItem>>,
+    calibration_left_out: Rc<VecModel<LeftOutItem>>,
+}
+
+/// A zone's member rows and its Use … Instead entries.
+#[derive(Default)]
+struct ZoneModels {
+    members: Rc<VecModel<SpeakerItem>>,
+    targets: Rc<VecModel<ZoneTarget>>,
+}
+
+/// A zone as one refresh builds it, before its rows go into its models.
+struct ZoneRowsBuilt {
+    item: ZoneItem,
+    flyout_expanded: bool,
+    members: Vec<SpeakerItem>,
+    targets: Vec<ZoneTarget>,
+}
+
+/// The shape of the zones' member lists: it changes when any list's length
+/// does, which rebuilds that list's rows ([`sync_model`]).
+fn zone_shape(lengths: impl Iterator<Item = usize>) -> u64 {
+    lengths.fold(1, |shape, length| {
+        shape.wrapping_mul(31).wrapping_add(length as u64 + 1)
+    })
+}
+
+/// How many member rows a zone lists under its header: none while its
+/// speakers are hidden, so folding a zone counts as removing them.
+fn listed_members(expanded: bool, members: usize) -> usize {
+    if expanded { members } else { 0 }
+}
+
+/// How many notices the main window lists, newest first.
+const MAIN_NOTICE_LIMIT: usize = 4;
+/// The flyout lists only the newest notice and a button for the rest.
+const FLYOUT_NOTICE_LIMIT: usize = 1;
+
+/// How long a notice's announcement stays in its window's live region at
+/// most (it goes sooner with its notice). Cleared, nothing stray is left for
+/// Narrator's scan mode, and the same words can be announced again later.
+const ANNOUNCEMENT_CLEARS_AFTER: Duration = Duration::from_secs(5);
+
+/// How long a live region stays empty before the words it held come back.
+/// Windows announces a live region only as it appears or its words change,
+/// so the emptied one has to reach it first, a frame or two after the change.
+const ANNOUNCEMENT_REPEAT_GAP: Duration = Duration::from_millis(100);
+
+/// The most UTF-16 units a tray icon's tooltip holds (128 with the
+/// terminating null).
+#[cfg(any(windows, target_os = "linux", test))]
+const TOOLTIP_MAX_UNITS: usize = 127;
+
+/// A listed notice, as the announcer compares them.
+#[derive(Debug)]
+struct Listed {
+    id: u64,
+    subject: String,
+    title: SharedString,
+    post: u64,
+}
+
+/// What the live regions should do after a refresh.
+#[derive(Debug, PartialEq)]
+enum Announcement {
+    /// Say this notice title.
+    Say(SharedString),
+    /// The notice last said is gone: empty them.
+    Clear,
+    /// Leave them as they are.
+    Keep,
+}
+
+/// Picks the notice Narrator is told about: the newest one posted since the
+/// last refresh, unless it only repeats a listed notice (same subject and
+/// title, as an AirPlay speaker's retries do). The notices there at launch
+/// are not news.
+#[derive(Debug, Default)]
+struct NoticeAnnouncer {
+    /// The ids listed at the last refresh, oldest posted first; `None`
+    /// until the first refresh. The view's own notices have fixed ids far
+    /// above the backend's, so an id says nothing about post order.
+    posted: Option<Vec<u64>>,
+    /// The subject and title of each notice listed at the last refresh.
+    listed: Vec<(String, SharedString)>,
+    /// The id and repost mark of each notice listed at the last refresh.
+    posts: Vec<(u64, u64)>,
+    /// The subject of the notice last said, until it leaves the list.
+    said: Option<String>,
+}
+
+impl NoticeAnnouncer {
+    /// The listed notices' ids, oldest posted first.
+    fn posted(&self) -> &[u64] {
+        self.posted.as_deref().unwrap_or_default()
+    }
+
+    /// What to announce for `notices`. A notice whose id wasn't listed at
+    /// the last refresh was posted since, and so was one whose repost mark
+    /// changed: the window's own notices keep their id when posted again.
+    fn next(&mut self, notices: &[Listed]) -> Announcement {
+        let repeats = |n: &Listed| {
+            self.listed
+                .iter()
+                .any(|(subject, title)| *subject == n.subject && *title == n.title)
+        };
+        let reposted = |n: &Listed| {
+            self.posts
+                .iter()
+                .any(|&(id, post)| id == n.id && post != n.post)
+        };
+        let known = self.posted.take();
+        let mut new: Vec<&Listed> = notices
+            .iter()
+            .filter(|n| !known.as_ref().is_some_and(|ids| ids.contains(&n.id)) || reposted(n))
+            .collect();
+        new.sort_by_key(|n| n.id);
+        let fresh = known
+            .is_some()
+            .then(|| new.iter().rev().find(|n| !repeats(n)).copied())
+            .flatten();
+        let mut posted = known.unwrap_or_default();
+        posted.retain(|id| notices.iter().any(|n| n.id == *id) && !new.iter().any(|n| n.id == *id));
+        posted.extend(new.iter().map(|n| n.id));
+        self.posted = Some(posted);
+        self.listed = notices
+            .iter()
+            .map(|n| (n.subject.clone(), n.title.clone()))
+            .collect();
+        self.posts = notices.iter().map(|n| (n.id, n.post)).collect();
+        if let Some(notice) = fresh {
+            self.said = Some(notice.subject.clone());
+            return Announcement::Say(notice.title.clone());
+        }
+        match &self.said {
+            Some(said) if !notices.iter().any(|n| n.subject == *said) => {
+                self.said = None;
+                Announcement::Clear
+            }
+            _ => Announcement::Keep,
+        }
+    }
+}
+
+/// How often the backend is polled for what happened on its own.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often a running calibration is moved on: the signal waits for the
+/// microphone's first frames, and each run ends once its recording is in.
+const CALIBRATION_TICK: Duration = Duration::from_millis(20);
+
+/// How often Launch at Sign-In is read again from the registry, so a change
+/// in Task Manager shows in the menus (Slint's menu bar says nothing before
+/// it opens). One small registry read.
+const LOGIN_CHECK: Duration = Duration::from_secs(2);
+
+/// The Settings page where Windows turns startup apps on or off.
+const STARTUP_APPS_PAGE: &str = "ms-settings:startupapps";
+
+/// The web remote's Public network notice's id, next to Launch at Sign-In's
+/// and as far from the backend's.
+const REMOTE_PUBLIC_NOTICE_ID: u64 = launch_at_login::NOTICE_ID - 2;
+
+/// The Windows updater's notice's id, next to those.
+const UPDATER_NOTICE_ID: u64 = REMOTE_PUBLIC_NOTICE_ID - 1;
+
+/// The id of the notice that holds a name dialog message, next to those.
+const DIALOG_NOTICE_ID: u64 = UPDATER_NOTICE_ID - 1;
+
+/// How often, 20 ms apart, the saved main window size waits for the native
+/// window before it gives up (about two seconds).
+const NATIVE_WINDOW_TRIES: u8 = 100;
+
+/// Roughly what the main window's outer frame adds to its inner size, in
+/// logical pixels: the borders, the title bar and the menu bar. Used to fit
+/// a saved size to a monitor, where a little extra room does no harm.
+const MAIN_WINDOW_CHROME: (f64, f64) = (16.0, 64.0);
+
+/// The parts of the tray flyout that a refresh can remove, with the controls
+/// in them: the listed notice, the button for more notices, the zone rows,
+/// the speaker rows (a zone's members among them), the Add by Address link
+/// and the Open Network Settings link.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FlyoutParts {
+    notices: bool,
+    more_notices: bool,
+    zones: bool,
+    speakers: bool,
+    add_address: bool,
+    network_settings: bool,
+}
+
+impl FlyoutParts {
+    /// Whether a part is set in both.
+    fn overlaps(self, other: FlyoutParts) -> bool {
+        (self.notices && other.notices)
+            || (self.more_notices && other.more_notices)
+            || (self.zones && other.zones)
+            || (self.speakers && other.speakers)
+            || (self.add_address && other.add_address)
+            || (self.network_settings && other.network_settings)
+    }
+}
+
+/// What the tray flyout shows: how many notices there are and how many of
+/// them it lists, how many zones, how many of this PC's and connected
+/// speakers in no zone, and the shape of the zones' member lists
+/// ([`zone_shape`]), and whether it shows the Add by Address link and the
+/// Open Network Settings link.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FlyoutCounts {
+    notices: usize,
+    listed_notices: usize,
+    zones: usize,
+    this_pc: usize,
+    speakers: usize,
+    zone_members: u64,
+    add_address: bool,
+    network_settings: bool,
+}
+
+impl FlyoutCounts {
+    /// Whether the flyout shows the button for the notices it doesn't list.
+    fn shows_more_notices(self) -> bool {
+        self.notices > self.listed_notices
+    }
+
+    /// The parts that a refresh to `next` removes. A list whose length
+    /// changes is rebuilt ([`sync_model`]), so all its rows go, even the
+    /// ones whose items come back.
+    fn removed_by(self, next: FlyoutCounts) -> FlyoutParts {
+        FlyoutParts {
+            notices: self.listed_notices != next.listed_notices,
+            more_notices: self.shows_more_notices() && !next.shows_more_notices(),
+            zones: self.zones != next.zones,
+            speakers: self.this_pc != next.this_pc
+                || self.speakers != next.speakers
+                || self.zone_members != next.zone_members,
+            add_address: self.add_address && !next.add_address,
+            network_settings: self.network_settings && !next.network_settings,
+        }
+    }
+}
+
+/// What has the keyboard focus in the main window's lists, as their rows
+/// report it. A row that a refresh removes never reports losing it.
+#[derive(Debug, Default)]
+struct MainFocus {
+    /// A notice's button, by notice id.
+    notice: Option<i32>,
+    /// The notices' Dismiss All button.
+    dismiss_all: bool,
+    /// A speaker row's control: the speaker id and the row's part.
+    speaker: Option<(SharedString, RowPart)>,
+    /// A zone header's control: the zone id and the header's part.
+    zone: Option<(SharedString, RowPart)>,
+    /// An In zones row's control: the speaker id and the row's part.
+    in_zones: Option<(SharedString, RowPart)>,
+    /// Another main-window control: the streaming switch, the source, the
+    /// transport, the master volume, the equalizer or calibration card or
+    /// the AirPlay delay.
+    control: Option<MainControl>,
+    /// The speaker Hide Speaker is taking out: its neighbour's switch takes
+    /// the focus, since only that row was meant to go.
+    hiding: Option<SharedString>,
+}
+
+/// Notes that the notice `id` gained or lost the focus.
+fn note_focus<T: PartialEq>(slot: &mut Option<T>, id: T, focused: bool) {
+    if focused {
+        *slot = Some(id);
+    } else if slot.as_ref() == Some(&id) {
+        // Another row may have reported gaining it first.
+        *slot = None;
+    }
+}
+
+/// Notes that the focus moved to `part` of the row `id`, or left the row
+/// (`RowPart::None`).
+fn note_row_focus(slot: &mut Option<(SharedString, RowPart)>, id: SharedString, part: RowPart) {
+    if part != RowPart::None {
+        *slot = Some((id, part));
+    } else if slot.as_ref().is_some_and(|(held, _)| *held == id) {
+        // Another row may have reported gaining it first.
+        *slot = None;
+    }
+}
+
+/// Where the main window's keyboard focus goes after a refresh rebuilt
+/// the list that had it.
+#[derive(Clone, Debug, PartialEq)]
+enum MainFocusTarget {
+    /// The notice at this index.
+    Notice(usize),
+    /// A speaker row or zone header, by id, on this part (the row falls
+    /// back to a harmless part when it hasn't that one).
+    Speaker(SharedString, RowPart),
+    Zone(SharedString, RowPart),
+    /// An In zones row, by speaker id, on this part.
+    InZones(SharedString, RowPart),
+    StreamingSwitch,
+}
+
+/// The row next to `old[at]`, which `new` no longer lists: the next row
+/// that `new` still lists, else the previous one, else the one in its
+/// place; none when `new` is empty.
+fn neighbour<T>(
+    old: &[T],
+    new: &[T],
+    at: usize,
+    id: impl Fn(&T) -> &SharedString,
+) -> Option<SharedString> {
+    let kept = |row: &&T| new.iter().any(|n| id(n) == id(row));
+    old[at + 1..]
+        .iter()
+        .find(kept)
+        .or_else(|| old[..at].iter().rev().find(kept))
+        .or_else(|| new.get(at.min(new.len().saturating_sub(1))))
+        .map(|row| id(row).clone())
+}
+
+/// The options of the first row `new` lists, This PC's, then Connected
+/// Speakers', then the first zone header's (a row's list is empty, so its
+/// own list adds nothing); the streaming switch when every list is empty.
+fn first_row(new: &MainLists) -> MainFocusTarget {
+    let speaker = new.this_pc.first().or_else(|| new.connected.first());
+    match (speaker, new.zones.first()) {
+        (Some(speaker), _) => MainFocusTarget::Speaker(speaker.id.clone(), RowPart::Options),
+        (None, Some(zone)) => MainFocusTarget::Zone(zone.id.clone(), RowPart::Options),
+        (None, None) => MainFocusTarget::StreamingSwitch,
+    }
+}
+
+impl MainFocus {
+    /// Whether the name field of `id` in `place` has the focus.
+    fn holds_name(&self, place: RenamePlace, id: &str) -> bool {
+        let slot = match place {
+            RenamePlace::Row => &self.speaker,
+            RenamePlace::InZones => &self.in_zones,
+            RenamePlace::Zone => &self.zone,
+        };
+        matches!(slot, Some((held, RowPart::Name)) if held.as_str() == id)
+    }
+
+    /// Where the focus goes when the lists change from `old` to `new`, if a
+    /// rebuilt list (its length changed, [`sync_model`]) had it.
+    fn target(&self, old: &MainLists, new: &MainLists) -> Option<MainFocusTarget> {
+        let notice_ids = |lists: &MainLists| lists.notices.iter().map(|n| n.id).collect::<Vec<_>>();
+        if (self.notice.is_some() || self.dismiss_all) && old.notices.len() != new.notices.len() {
+            let (old_ids, new_ids) = (notice_ids(old), notice_ids(new));
+            let index = match self.notice {
+                // The same notice if it stayed, else the one in its place.
+                Some(id) => new_ids
+                    .iter()
+                    .position(|&n| n == id)
+                    .or_else(|| old_ids.iter().position(|&n| n == id))
+                    .unwrap_or(0),
+                // Dismiss All sits under the last notice.
+                None => old_ids.len(),
+            };
+            return Some(match new_ids.len() {
+                0 => MainFocusTarget::StreamingSwitch,
+                len => MainFocusTarget::Notice(index.min(len - 1)),
+            });
+        }
+        // A row that went hands the focus to a neighbour's options, where
+        // Space or Enter opens a menu rather than toggling a speaker or
+        // streaming; once its list is empty, to the first row of the other
+        // lists ([`first_row`]), and the streaming switch takes it only when
+        // no row is left.
+        // The zones' cards are all rebuilt when their number changes.
+        let zones_rebuilt = old.zones.len() != new.zones.len();
+        if let Some((id, part)) = &self.speaker {
+            let none: &[SpeakerItem] = &[];
+            let mut lists: Vec<(&[SpeakerItem], &[SpeakerItem], Option<&SharedString>)> = vec![
+                (&old.this_pc, &new.this_pc, None),
+                (&old.connected, &new.connected, None),
+            ];
+            for zone in &old.zones {
+                let rows = new
+                    .zones
+                    .iter()
+                    .find(|z| z.id == zone.id)
+                    .map_or(none, |z| &z.rows[..]);
+                lists.push((&zone.rows, rows, Some(&zone.id)));
+            }
+            for (old_rows, new_rows, zone) in lists {
+                let Some(at) = old_rows.iter().position(|s| s.id == *id) else {
+                    continue;
+                };
+                if old_rows.len() == new_rows.len() && !(zone.is_some() && zones_rebuilt) {
+                    break;
+                }
+                if new.rows().any(|s| s.id == *id) {
+                    return Some(MainFocusTarget::Speaker(id.clone(), *part));
+                }
+                let part = if self.hiding.as_ref() == Some(id) {
+                    RowPart::Toggle
+                } else {
+                    RowPart::Options
+                };
+                // A zone's last row (or every row, collapsed): its header.
+                let header = zone
+                    .filter(|zone| new.zones.iter().any(|z| z.id == **zone))
+                    .map(|zone| MainFocusTarget::Zone(zone.clone(), RowPart::Options));
+                return Some(neighbour(old_rows, new_rows, at, |s| &s.id).map_or_else(
+                    || header.unwrap_or_else(|| first_row(new)),
+                    |next| MainFocusTarget::Speaker(next, part),
+                ));
+            }
+        }
+        if let Some((id, part)) = &self.zone
+            && zones_rebuilt
+            && let Some(at) = old.zones.iter().position(|z| z.id == *id)
+        {
+            return Some(if new.zones.iter().any(|z| z.id == *id) {
+                MainFocusTarget::Zone(id.clone(), *part)
+            } else {
+                neighbour(&old.zones, &new.zones, at, |z| &z.id).map_or_else(
+                    || first_row(new),
+                    |next| MainFocusTarget::Zone(next, RowPart::Options),
+                )
+            });
+        }
+        if let Some((id, part)) = &self.in_zones {
+            for (old_rows, new_rows) in [
+                (&old.this_pc_zoned, &new.this_pc_zoned),
+                (&old.connected_zoned, &new.connected_zoned),
+            ] {
+                let Some(at) = old_rows.iter().position(|s| s.id == *id) else {
+                    continue;
+                };
+                if old_rows.len() == new_rows.len() {
+                    break;
+                }
+                if new_rows.iter().any(|s| s.id == *id) {
+                    return Some(MainFocusTarget::InZones(id.clone(), *part));
+                }
+                return Some(neighbour(old_rows, new_rows, at, |s| &s.id).map_or_else(
+                    || first_row(new),
+                    |next| MainFocusTarget::InZones(next, RowPart::Options),
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// A zone in the main window's lists: its ID and the member rows it shows
+/// (none while it is collapsed).
+#[derive(Debug, Default)]
+struct ZoneRows {
+    id: SharedString,
+    rows: Vec<SpeakerItem>,
+}
+
+/// The main window's lists that a refresh can rebuild.
+#[derive(Debug, Default)]
+struct MainLists {
+    notices: Vec<NoticeItem>,
+    this_pc: Vec<SpeakerItem>,
+    connected: Vec<SpeakerItem>,
+    zones: Vec<ZoneRows>,
+    /// The In zones rows under This PC and under Connected Speakers.
+    this_pc_zoned: Vec<SpeakerItem>,
+    connected_zoned: Vec<SpeakerItem>,
+}
+
+impl MainLists {
+    /// Every speaker row, in zones or not.
+    fn rows(&self) -> impl Iterator<Item = &SpeakerItem> {
+        self.this_pc
+            .iter()
+            .chain(&self.connected)
+            .chain(self.zones.iter().flat_map(|zone| &zone.rows))
+    }
+}
+
+/// Runs after every refresh with the new state.
+type RefreshHook = Box<dyn Fn(&AppState)>;
+
+/// The application's windows and the backend behind them.
+pub struct App {
+    backend: RefCell<Box<dyn Backend>>,
+    pub main: MainWindow,
+    pub flyout: TrayFlyout,
+    pub equalizer: EqualizerWindow,
+    zone_dialog: ZoneNameDialog,
+    /// The PIN prompt of an Apple TV pairing.
+    pin_dialog: PinDialog,
+    /// The speaker the PIN dialog is open for, while it is.
+    pin_for: RefCell<Option<String>>,
+    /// The PIN dialog shows a made-up pairing (the PIN preview), which no
+    /// refresh closes.
+    pin_preview: Cell<bool>,
+    /// The password prompt of a speaker protected by a password.
+    password_dialog: PasswordDialog,
+    /// The speaker the password dialog is open for, while it is.
+    password_for: RefCell<Option<String>>,
+    /// Add by Address…, for a Google Cast speaker discovery can't find.
+    cast_address_dialog: CastAddressDialog,
+    /// The answer of the address check Add by Address… is waiting for.
+    cast_check: RefCell<Option<std::sync::mpsc::Receiver<cast_address::CheckAnswer>>>,
+    /// Looks for that answer while the check runs.
+    cast_check_timer: Timer,
+    about: AboutDialog,
+    guide: GuideWindow,
+    /// The paragraphs the guide shows.
+    guide_steps: Rc<VecModel<GuideStepItem>>,
+    /// The guide is open for the double-audio notice and follows it (not
+    /// for a made-up preview notice).
+    guide_follows_notice: Cell<bool>,
+    /// The AudioSync Guide (Help > AudioSync Guide), `help_window.rs`.
+    help: crate::HelpWindow,
+    /// View > Web Remote, `remote_window.rs`.
+    remote_window: crate::RemoteWindow,
+    /// File > Check Setup…, `setup_window.rs`.
+    setup: crate::SetupWindow,
+    setup_check: RefCell<setup_window::SetupCheck>,
+    remote: RefCell<remote_window::RemoteHost>,
+    log: DebugLog,
+    ui: RefCell<UiState>,
+    /// What has the keyboard focus in the main window's lists.
+    main_focus: RefCell<MainFocus>,
+    dialog_purpose: RefCell<DialogPurpose>,
+    models: Models,
+    /// With a tray icon, closing the main window keeps the app running there.
+    tray_available: Cell<bool>,
+    /// The appearance every window shows: View > Appearance, or the theme
+    /// preview's.
+    appearance: Cell<ui_model::Appearance>,
+    /// False until the first Light or Dark: until then the windows follow
+    /// Windows by themselves, after it AudioSync sets their palette and
+    /// frame, for Match System too.
+    themed_by_hand: Cell<bool>,
+    menu_bar_theme: MenuBarTheme,
+    /// Whether each window got its Windows 11 frame, as last logged.
+    frames: RefCell<HashMap<&'static str, bool>>,
+    /// Called after every refresh, e.g. to update the tray icon and tooltip.
+    on_refresh: RefCell<Option<RefreshHook>>,
+    /// Which new notice Narrator is told about.
+    notice_announcer: RefCell<NoticeAnnouncer>,
+    /// The notices fading out of the main window after a dismiss. Kept here,
+    /// not in the rows, which a refresh may rebuild mid-fade. Each keeps the
+    /// text it fades with, so one raised again with new text leaves the fade.
+    closing_notices: RefCell<Vec<(u64, NoticeMessage)>>,
+    /// The calibration ending Narrator was last told about.
+    calibration_announced: RefCell<Option<(String, Phase)>>,
+    /// The Calibrate All ending Narrator was last told about.
+    calibrate_all_announced: Cell<u64>,
+    /// The speaker of the running Calibrate All Narrator was last told about.
+    calibrate_all_measuring: RefCell<Option<String>>,
+    /// The delay fields holding a number out of range, so Narrator hears
+    /// the range once as a field goes out of it (`newly_out_of_range`).
+    out_of_range: RefCell<HashSet<String>>,
+    /// Clears the announcement a while after it was made.
+    announcement_timer: Timer,
+    /// Puts back an announcement emptied to be said again.
+    repeat_timer: Timer,
+    /// Polls the backend; it stops when the app is dropped.
+    poll_timer: Timer,
+    /// Moves a microphone calibration on while one holds the outputs.
+    calibration_timer: Timer,
+    /// Moves the input level meter while an input device is captured.
+    meter_timer: Timer,
+    /// The meter's length as last shown, 0 to 1.
+    meter_level: Cell<f32>,
+    /// Launch at Sign-In and its notice, which the windows own: the
+    /// backend's notices are about audio.
+    login: RefCell<LaunchAtLogin>,
+    login_timer: Timer,
+    /// The updater, in a Windows or Linux release build only.
+    #[cfg(any(windows, all(target_os = "linux", not(test))))]
+    updater: RefCell<Option<crate::updater::Updater>>,
+    /// The Now Playing card, and the source it was last given.
+    now_playing: RefCell<NowPlayingCard>,
+    now_playing_source: RefCell<Option<CardSource>>,
+    /// The networks' profiles while a note says no speaker was found.
+    network_watch: RefCell<Option<Watch>>,
+    /// The last master level of at least `UNMUTE_FLOOR`, which Unmute
+    /// brings back; 50 until one is seen.
+    unmute_to: Cell<f64>,
+    /// The keyboard hook while the volume keys move the master (spec S429).
+    #[cfg(all(windows, not(test)))]
+    volume_key_hook: RefCell<Option<crate::volume_keys::KeyHook>>,
+}
+
+#[cfg(all(windows, not(test)))]
+thread_local! {
+    /// The app the keyboard hook's keys go to.
+    static VOLUME_KEY_APP: RefCell<Weak<App>> = const { RefCell::new(Weak::new()) };
+}
+
+/// Runs on the keyboard hook's thread: hands the key to the UI thread.
+#[cfg(all(windows, not(test)))]
+fn deliver_volume_key(key: VolumeKey) {
+    let _ = slint::invoke_from_event_loop(move || {
+        VOLUME_KEY_APP.with(|app| with_app(&app.borrow(), |app| app.volume_key(key)));
+    });
+}
+
+/// The main window's native window and the menu bar theme last sent to it.
+/// muda answers that message by toggling the window's activation, which comes
+/// back as a focus that applies the frame again, so it is sent only when it
+/// changed.
+#[derive(Default)]
+struct MenuBarTheme(Cell<Option<(isize, bool)>>);
+
+impl MenuBarTheme {
+    /// Records `dark` for native window `id`; `true` when the message is due.
+    fn due(&self, id: isize, dark: bool) -> bool {
+        self.0.replace(Some((id, dark))) != Some((id, dark))
+    }
+
+    /// Makes the next `due` true, after Windows gave the menu bar its own theme.
+    fn forget(&self) {
+        self.0.set(None);
+    }
+}
+
+/// Runs `action` on the app if it still exists.
+#[cfg(any(windows, all(target_os = "linux", not(test))))]
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+fn with_app(app: &Weak<App>, action: impl FnOnce(&App)) {
+    if let Some(app) = app.upgrade() {
+        action(&app);
+    }
+}
+
+/// Fades the main window's notices `ids` out (all listed ones for None),
+/// then dismisses those still listed with the text they faded with.
+fn close_main_notices(weak: &Weak<App>, ids: Option<u64>) {
+    let Some(app) = weak.upgrade() else { return };
+    let shown: Vec<(u64, NoticeMessage)> = {
+        let mut closing = app.closing_notices.borrow_mut();
+        let new: Vec<(u64, NoticeMessage)> = app
+            .snapshot()
+            .notices
+            .into_iter()
+            .filter(|n| {
+                ids.is_none_or(|id| id == n.id) && closing.iter().all(|(id, _)| *id != n.id)
+            })
+            .map(|n| (n.id, n.message))
+            .collect();
+        closing.extend(new.iter().cloned());
+        new
+    };
+    if shown.is_empty() {
+        // A window still showing a notice the backend already dropped catches up.
+        if ids.is_some() {
+            app.refresh();
+        }
+        return;
+    }
+    app.refresh();
+    // The fade's length in widgets.slint's NoticeStack.
+    let fade = if app.main.global::<Motion>().get_on() {
+        300
+    } else {
+        150
+    };
+    let weak = weak.clone();
+    Timer::single_shot(Duration::from_millis(fade), move || {
+        with_app(&weak, |app| {
+            // One raised again with new text left the fade on that refresh, so
+            // it stays even if its text has since changed back.
+            let still: Vec<(u64, NoticeMessage)> = {
+                let mut closing = app.closing_notices.borrow_mut();
+                let still = shown
+                    .iter()
+                    .filter(|fading| closing.contains(fading))
+                    .cloned()
+                    .collect();
+                closing.retain(|fading| !shown.contains(fading));
+                still
+            };
+            app.dismiss_listed_notices(|n| {
+                still.iter().any(|(id, m)| *id == n.id && *m == n.message)
+            })
+        });
+    });
+}
+
+/// Applies the open rename once the focus has left its field for another
+/// control, outside the focus callback, which must not rebuild the list.
+fn apply_rename_left(app: &Weak<App>) {
+    if let Some(id) = app.upgrade().and_then(|app| app.focus_left_rename()) {
+        let app = app.clone();
+        Timer::single_shot(Duration::ZERO, move || {
+            with_app(&app, |app| app.end_rename_in(&id, true));
+        });
+    }
+}
+
+/// Asks the row or zone header where a name is edited to take the keyboard
+/// focus on `part`.
+fn focus_row(main: &MainWindow, place: RenamePlace, id: SharedString, part: RowPart) {
+    match place {
+        RenamePlace::Row => {
+            main.set_focus_speaker_part(part);
+            main.set_focus_speaker_id(id);
+        }
+        RenamePlace::InZones => {
+            main.set_focus_in_zones_part(part);
+            main.set_focus_in_zones_id(id);
+        }
+        RenamePlace::Zone => {
+            main.set_focus_zone_part(part);
+            main.set_focus_zone_id(id);
+        }
+    }
+}
+
+/// Sets the main window's size as soon as its native window exists, checking
+/// every 20 ms up to `tries` times, then maximizes it when `maximized` (a
+/// size set on a maximized window would restore it to normal).
+fn set_size_once_native(
+    main: slint::Weak<MainWindow>,
+    size: slint::LogicalSize,
+    maximized: bool,
+    tries: u8,
+) {
+    use slint::winit_030::WinitWindowAccessor;
+
+    Timer::single_shot(Duration::from_millis(20), move || {
+        let Some(window_owner) = main.upgrade() else {
+            return;
+        };
+        let window = window_owner.window();
+        if window.with_winit_window(|_| ()).is_some() {
+            keep_main_min_size(window);
+            window.set_size(size);
+            if maximized {
+                window.set_maximized(true);
+            }
+        } else if tries > 1 {
+            set_size_once_native(main, size, maximized, tries - 1);
+        }
+    });
+}
+
+/// What a titled window does on gaining the focus besides taking its frame.
+#[derive(Clone, Copy, PartialEq)]
+enum Titled {
+    Window,
+    /// Keeps only the close button and fits the PIN dialog.
+    Dialog,
+    /// Holds `settings::MIN_WINDOW`.
+    Main,
+}
+
+/// Holds the main window at `settings::MIN_WINDOW` natively (a MoveWindow
+/// from another program shrank it to 286 x 193), growing it first if it is
+/// smaller.
+fn keep_main_min_size(window: &slint::Window) {
+    use slint::winit_030::WinitWindowAccessor;
+    use slint::winit_030::winit::dpi::LogicalSize;
+
+    let (width, height) = crate::settings::MIN_WINDOW;
+    window.with_winit_window(|window| {
+        window.set_min_inner_size(Some(LogicalSize::new(width, height)));
+    });
+    crate::platform::hold_min_size(window, crate::settings::MIN_WINDOW);
+}
+
+/// Where the main window moves before it shows again: a place on a monitor
+/// that is gone since it hid gets the launch's place, centered in the
+/// `primary` monitor's work area and fitted to it. `None` when it stays
+/// where it is: while it shows, or while minimized, when Windows parks it off
+/// every monitor.
+fn place_to_show(
+    frame: WindowFrame,
+    on_a_monitor: bool,
+    minimized: bool,
+    visible: bool,
+    primary: Option<(crate::placement::Bounds, f64)>,
+) -> Option<WindowFrame> {
+    if on_a_monitor || minimized || visible {
+        return None;
+    }
+    let (work_area, scale) = primary?;
+    Some(fitted_main_frame(frame, work_area, scale, false))
+}
+
+/// The saved main window `frame` as it opens on the monitor with
+/// `work_area` (physical pixels) and `scale`: its inner size (logical
+/// pixels) and outer position (physical pixels), fitted inside the work
+/// area. `keep_place` when the saved place is on that monitor; else the
+/// window opens centered on it.
+fn fitted_main_frame(
+    frame: WindowFrame,
+    work_area: crate::placement::Bounds,
+    scale: f64,
+    keep_place: bool,
+) -> WindowFrame {
+    let outer = crate::placement::Bounds {
+        x: f64::from(frame.x),
+        y: f64::from(frame.y),
+        width: (frame.width + MAIN_WINDOW_CHROME.0) * scale,
+        height: (frame.height + MAIN_WINDOW_CHROME.1) * scale,
+    };
+    let fitted = crate::placement::fit_window(outer, work_area, keep_place);
+    if fitted == outer {
+        return frame;
+    }
+    let (min_width, min_height) = crate::settings::MIN_WINDOW;
+    let inner = |outer: f64, chrome: f64, saved: f64, min: f64| {
+        (outer / scale - chrome).round().clamp(min, saved.max(min))
+    };
+    WindowFrame {
+        x: fitted.x.round() as i32,
+        y: fitted.y.round() as i32,
+        width: inner(fitted.width, MAIN_WINDOW_CHROME.0, frame.width, min_width),
+        height: inner(
+            fitted.height,
+            MAIN_WINDOW_CHROME.1,
+            frame.height,
+            min_height,
+        ),
+        maximized: frame.maximized,
+    }
+}
+
+impl App {
+    /// The windows over `backend`; what they do themselves goes to `log`.
+    pub fn new(backend: Box<dyn Backend>, log: DebugLog) -> Result<Rc<App>, slint::PlatformError> {
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        let log_for_updater = log.clone();
+        crate::platform::set_min_size_log(log.clone());
+        let models = Models {
+            sources: Rc::new(VecModel::default()),
+            input_pairs: Rc::new(VecModel::default()),
+            mix_apps: Rc::new(VecModel::default()),
+            this_pc: Rc::new(VecModel::default()),
+            this_pc_zoned: Rc::new(VecModel::default()),
+            connected_zoned: Rc::new(VecModel::default()),
+            connected: Rc::new(VecModel::default()),
+            flyout_this_pc: Rc::new(VecModel::default()),
+            flyout_connected: Rc::new(VecModel::default()),
+            zones: Rc::new(VecModel::default()),
+            flyout_zones: Rc::new(VecModel::default()),
+            zone_models: RefCell::default(),
+            move_zones: RefCell::default(),
+            notices: Rc::new(VecModel::default()),
+            flyout_notices: Rc::new(VecModel::default()),
+            gains: Rc::new(VecModel::default()),
+            presets: Rc::new(VecModel::default()),
+            speaker_presets: Rc::new(VecModel::default()),
+            calibration_rows: Rc::new(VecModel::default()),
+            calibration_left_out: Rc::new(VecModel::default()),
+        };
+        let app = Rc::new(App {
+            backend: RefCell::new(backend),
+            main: MainWindow::new()?,
+            flyout: TrayFlyout::new()?,
+            equalizer: EqualizerWindow::new()?,
+            zone_dialog: ZoneNameDialog::new()?,
+            pin_dialog: PinDialog::new()?,
+            pin_for: RefCell::new(None),
+            pin_preview: Cell::new(false),
+            password_dialog: PasswordDialog::new()?,
+            password_for: RefCell::new(None),
+            cast_address_dialog: CastAddressDialog::new()?,
+            cast_check: RefCell::default(),
+            cast_check_timer: Timer::default(),
+            about: AboutDialog::new()?,
+            guide: GuideWindow::new()?,
+            guide_steps: Rc::new(VecModel::default()),
+            guide_follows_notice: Cell::new(false),
+            help: crate::HelpWindow::new()?,
+            remote_window: crate::RemoteWindow::new()?,
+            setup: crate::SetupWindow::new()?,
+            setup_check: RefCell::default(),
+            remote: RefCell::default(),
+            log,
+            ui: RefCell::default(),
+            main_focus: RefCell::default(),
+            dialog_purpose: RefCell::new(DialogPurpose::Message),
+            models,
+            tray_available: Cell::new(false),
+            appearance: Cell::new(ui_model::Appearance::System),
+            themed_by_hand: Cell::new(false),
+            menu_bar_theme: MenuBarTheme::default(),
+            frames: RefCell::default(),
+            on_refresh: RefCell::new(None),
+            notice_announcer: RefCell::default(),
+            closing_notices: RefCell::default(),
+            calibration_announced: RefCell::default(),
+            calibrate_all_announced: Cell::new(0),
+            calibrate_all_measuring: RefCell::default(),
+            out_of_range: RefCell::default(),
+            announcement_timer: Timer::default(),
+            repeat_timer: Timer::default(),
+            poll_timer: Timer::default(),
+            calibration_timer: Timer::default(),
+            meter_timer: Timer::default(),
+            meter_level: Cell::new(0.0),
+            login: RefCell::new(LaunchAtLogin::new(
+                launch_at_login::system_store(),
+                launch_at_login::own_exe(),
+            )),
+            login_timer: Timer::default(),
+            #[cfg(any(windows, all(target_os = "linux", not(test))))]
+            updater: RefCell::new(crate::updater::for_this_exe(log_for_updater)),
+            now_playing: RefCell::default(),
+            now_playing_source: RefCell::default(),
+            network_watch: RefCell::default(),
+            unmute_to: Cell::new(50.0),
+            #[cfg(all(windows, not(test)))]
+            volume_key_hook: RefCell::default(),
+        });
+        #[cfg(all(windows, not(test)))]
+        VOLUME_KEY_APP.with(|slot| *slot.borrow_mut() = Rc::downgrade(&app));
+        let sessions = i32::try_from(audiosync_airplay::sender::AIRPLAY2_SESSIONS);
+        app.main
+            .global::<Strings>()
+            .set_airplay2_sessions(sessions.unwrap_or(i32::MAX));
+        app.attach_models();
+        app.connect_main();
+        app.connect_flyout();
+        app.connect_equalizer();
+        app.connect_dialogs();
+        app.connect_password_dialog();
+        app.connect_cast_address_dialog();
+        app.connect_guide();
+        app.connect_help();
+        app.connect_remote();
+        app.connect_setup();
+        app.restore_view(true);
+        app.restore_remote();
+        app.launch_update_check();
+        if app.login.borrow().status() == launch_at_login::Status::Missing {
+            app.log.log(|| {
+                "launch at sign-in: the startup entry names an exe that is gone; shown off, left as it is"
+                    .to_owned()
+            });
+        }
+        app.refresh();
+        let weak = Rc::downgrade(&app);
+        app.poll_timer
+            .start(TimerMode::Repeated, POLL_INTERVAL, move || {
+                with_app(&weak, |app| {
+                    app.poll();
+                    app.poll_updater();
+                    app.follow_input_level(&weak);
+                })
+            });
+        let weak = Rc::downgrade(&app);
+        app.login_timer
+            .start(TimerMode::Repeated, LOGIN_CHECK, move || {
+                with_app(&weak, App::reread_launch_at_login)
+            });
+        Ok(app)
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn set_tray_available(&self, available: bool) {
+        self.tray_available.set(available);
+    }
+
+    /// The media sessions the Now Playing card reads and drives; without
+    /// them the card never shows.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn set_media_controls(&self, mut controls: Box<dyn MediaControls>) {
+        let main = self.main.as_weak();
+        controls.on_reading(std::sync::Arc::new(move || {
+            let _ = main.upgrade_in_event_loop(|main| main.invoke_now_playing_read());
+        }));
+        self.now_playing.borrow_mut().set_controls(controls);
+        let _ = self.sync_now_playing();
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn set_on_refresh(&self, callback: impl Fn(&AppState) + 'static) {
+        *self.on_refresh.borrow_mut() = Some(Box::new(callback));
+    }
+
+    pub fn strings(&self) -> Strings<'_> {
+        self.main.global::<Strings>()
+    }
+
+    pub fn snapshot(&self) -> AppState {
+        let mut state = self.every_notice();
+        keep_newest_notices(&mut state.notices, self.notice_announcer.borrow().posted());
+        state
+    }
+
+    /// [`App::snapshot`] with every notice, also those past the capacity.
+    fn every_notice(&self) -> AppState {
+        let mut state = self.backend.borrow().snapshot();
+        state.notices.extend(self.login.borrow().notice().cloned());
+        state.notices.extend(self.remote_public_notice());
+        state.notices.extend(self.updater_notice());
+        state.notices.extend(self.ui.borrow().dialog_notice.clone());
+        state
+    }
+
+    /// The listed notices' ids, oldest posted first, for [`tray_tooltip`].
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn notices_posted(&self) -> Vec<u64> {
+        self.notice_announcer.borrow().posted().to_vec()
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn launch_at_login(&self) -> bool {
+        self.login.borrow().is_on()
+    }
+
+    /// Reads Launch at Sign-In again, and shows it if it changed.
+    pub fn reread_launch_at_login(&self) {
+        if self.login.borrow_mut().reread() {
+            self.refresh();
+        }
+    }
+
+    /// The user turned Launch at Sign-In on or off.
+    pub fn set_launch_at_login(&self, on: bool) {
+        let outcome = self
+            .login
+            .borrow_mut()
+            .set(on, crate::platform::notice_time);
+        let status = self.login.borrow().status();
+        self.log.log(|| match &outcome.error {
+            Some(error) => format!(
+                "launch at sign-in: turning it {} failed ({error}); {status:?}",
+                if on { "on" } else { "off" }
+            ),
+            None => format!(
+                "launch at sign-in: turned {}; {status:?}",
+                if on { "on" } else { "off" }
+            ),
+        });
+        if outcome.open_startup_settings && !crate::platform::open_settings(STARTUP_APPS_PAGE) {
+            self.log
+                .log(|| format!("launch at sign-in: {STARTUP_APPS_PAGE} didn't open"));
+        }
+        self.refresh();
+    }
+
+    fn dismiss_notice(&self, id: u64) {
+        if self.dismiss_own_notice(id) {
+            self.refresh();
+        } else {
+            self.update(|b| b.dismiss_notice(id));
+        }
+    }
+
+    /// Dismisses the window's own notice `id`; false if it is the backend's.
+    fn dismiss_own_notice(&self, id: u64) -> bool {
+        let dialog = id == DIALOG_NOTICE_ID && self.ui.borrow_mut().dialog_notice.take().is_some();
+        dialog
+            || self.login.borrow_mut().dismiss(id)
+            || self.dismiss_remote_notice(id)
+            || self.dismiss_updater_notice(id)
+    }
+
+    /// Dismisses the listed notices only: one that dropped off stays.
+    fn dismiss_all_notices(&self) {
+        self.dismiss_listed_notices(|_| true);
+    }
+
+    fn dismiss_listed_notices(&self, chosen: impl Fn(&ui_model::Notice) -> bool) {
+        for notice in self.snapshot().notices {
+            if chosen(&notice) && !self.dismiss_own_notice(notice.id) {
+                self.backend.borrow_mut().dismiss_notice(notice.id);
+            }
+        }
+        self.refresh();
+    }
+
+    /// Changes the backend, then shows the result everywhere.
+    pub fn update(&self, change: impl FnOnce(&mut dyn Backend)) {
+        change(self.backend.borrow_mut().as_mut());
+        self.refresh();
+    }
+
+    /// Ticks a calibration that holds the outputs every 20 ms until it
+    /// lets them go.
+    fn follow_calibration(&self, weak: &Weak<App>) {
+        if !self.snapshot().calibration.busy || self.calibration_timer.running() {
+            return;
+        }
+        let weak = weak.clone();
+        self.calibration_timer
+            .start(TimerMode::Repeated, CALIBRATION_TICK, move || {
+                with_app(&weak, App::tick_calibration)
+            });
+    }
+
+    fn tick_calibration(&self) {
+        if self.backend.borrow_mut().tick_calibration() {
+            self.refresh();
+        }
+        if !self.snapshot().calibration.busy {
+            self.calibration_timer.stop();
+        }
+    }
+
+    /// Starts the input level meter once an input device is captured while
+    /// the main window shows; it stops itself when the capture ends, the
+    /// source changes or the window hides or is minimized.
+    fn follow_input_level(&self, weak: &Weak<App>) {
+        if self.meter_timer.running() {
+            return;
+        }
+        if !matches!(self.main_window_shows(), MainWindowShows::Not) {
+            // Drops the peak the input kept while the window was hidden.
+            self.backend.borrow_mut().input_peak();
+        }
+        if !self.tick_input_level() {
+            return;
+        }
+        let weak = weak.clone();
+        self.meter_timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(u64::from(meter::METER_POLL_MS)),
+            move || {
+                with_app(&weak, |app| {
+                    app.tick_input_level();
+                })
+            },
+        );
+    }
+
+    /// Moves the meter to the peak captured since the last tick, or hides
+    /// it while no input device is captured. Returns whether it shows.
+    fn tick_input_level(&self) -> bool {
+        if matches!(self.main_window_shows(), MainWindowShows::Not) {
+            self.meter_timer.stop();
+            self.meter_level.set(0.0);
+            self.main.set_input_level(0.0);
+            self.main.set_input_level_spoken(0);
+            return false;
+        }
+        let Some(peak) = self.backend.borrow_mut().input_peak() else {
+            self.meter_timer.stop();
+            self.meter_level.set(0.0);
+            self.main.set_input_level(0.0);
+            self.main.set_input_level_spoken(0);
+            self.main.set_input_meter_shown(false);
+            return false;
+        };
+        let level = meter::meter_level(self.meter_level.get(), peak);
+        self.meter_level.set(level);
+        self.main.set_input_level(level);
+        self.main
+            .set_input_level_spoken(meter::meter_spoken_percent(level) as i32);
+        self.main.set_input_meter_shown(true);
+        true
+    }
+
+    /// Lets the backend take in what happened on its own, and shows it.
+    fn poll(&self) {
+        // Kept before the backend's poll saves, so a crash or a kill keeps
+        // where the main window was.
+        self.remember_view();
+        let changed = self.backend.borrow_mut().poll();
+        if self.backend.borrow_mut().take_view_restored() {
+            let remote = self.ui.borrow().remote;
+            // The window keeps its frame.
+            self.restore_view(false);
+            if self.ui.borrow().remote != remote {
+                self.restore_remote_again();
+            }
+        }
+        if changed {
+            self.refresh();
+        } else if self.sync_now_playing() {
+            self.publish_remote(&self.snapshot());
+        }
+        self.read_none_found_network();
+        self.read_setup_network();
+        self.poll_remote();
+    }
+
+    /// Reads the media sessions for the Now Playing card while the main
+    /// window or the tray panel shows or the web remote listens, and shows
+    /// what changed in both. Returns whether the track changed.
+    fn sync_now_playing(&self) -> bool {
+        let window = self.main.window();
+        let shows = (window.is_visible() && !window.is_minimized())
+            || self.flyout.window().is_visible()
+            || self.remote_listening();
+        let source = self.now_playing_source.borrow().clone();
+        if !self.now_playing.borrow_mut().sync(source, shows) {
+            return false;
+        }
+        let card = self.now_playing.borrow();
+        let Some(track) = card.track() else {
+            // Slint leaves nothing focused when the focused button goes.
+            if self.main.get_now_playing_focused_button() >= 0 {
+                self.main.set_now_playing_focused_button(-1);
+                self.main.invoke_focus_source();
+            }
+            self.main.set_now_playing_shown(false);
+            self.flyout.set_now_playing_shown(false);
+            self.log
+                .log(|| "now playing card: the window hides the card".to_owned());
+            return true;
+        };
+        self.log.log(|| {
+            format!(
+                "now playing card: the window shows \"{}\" ({})",
+                track.title,
+                if track.playing { "playing" } else { "paused" }
+            )
+        });
+        self.main.set_now_playing_title(track.title.as_str().into());
+        #[cfg(any(windows, target_os = "linux"))]
+        self.main
+            .global::<Motion>()
+            .set_on(crate::platform::animation_effects());
+        self.main
+            .set_now_playing_subtitle(track.subtitle().as_str().into());
+        self.main.set_now_playing_playing(track.playing);
+        self.main
+            .set_now_playing_shuffle(track.modes.shuffle.map_or(-1, i32::from));
+        self.main.set_now_playing_repeat(match track.modes.repeat {
+            None => -1,
+            Some(Repeat::Off) => 0,
+            Some(Repeat::All) => 1,
+            Some(Repeat::One) => 2,
+        });
+        let artwork = track.artwork.as_ref().map(|artwork| {
+            let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                &artwork.rgba,
+                artwork.side,
+                artwork.side,
+            );
+            slint::Image::from_rgba8_premultiplied(pixels)
+        });
+        self.flyout
+            .set_now_playing_title(track.title.as_str().into());
+        self.flyout
+            .set_now_playing_subtitle(track.subtitle().as_str().into());
+        self.flyout.set_now_playing_has_artwork(artwork.is_some());
+        self.main.set_now_playing_has_artwork(artwork.is_some());
+        let artwork = artwork.unwrap_or_default();
+        self.flyout.set_now_playing_artwork(artwork.clone());
+        self.main.set_now_playing_artwork(artwork);
+        self.main.set_now_playing_shown(true);
+        self.flyout.set_now_playing_shown(true);
+        true
+    }
+
+    /// The master volume's speaker: mutes to 0, or brings back the last
+    /// level heard.
+    fn toggle_master_mute(&self) {
+        let muted = volume_waves(self.snapshot().master_volume) == 0;
+        let target = if muted { self.unmute_to.get() } else { 0.0 };
+        self.update(|b| b.set_master_volume(target));
+    }
+
+    /// A move of a master volume slider; under 0.5 is 0, so the muted
+    /// speaker never shows while a trace still plays.
+    fn move_master_volume(&self, volume: f32) {
+        let volume = if volume < 0.5 { 0.0 } else { volume.into() };
+        self.update(|b| b.set_master_volume(volume));
+    }
+
+    fn send_transport(&self, button: i32) {
+        let modes = self
+            .now_playing
+            .borrow()
+            .track()
+            .map(|track| track.modes)
+            .unwrap_or_default();
+        let command = match (button, modes.shuffle, modes.repeat) {
+            (0, ..) => Transport::Previous,
+            (1, ..) => Transport::PlayPause,
+            (3, Some(on), _) => Transport::Shuffle(!on),
+            (4, _, Some(repeat)) => Transport::Repeat(repeat.next()),
+            (3 | 4, ..) => return,
+            _ => Transport::Next,
+        };
+        self.log.log(|| format!("now playing: {command:?} pressed"));
+        let shown = self
+            .now_playing
+            .borrow()
+            .track()
+            .map(|track| (track.app_id.clone(), track.playing));
+        if let (Transport::PlayPause, Some((app, playing))) = (command, shown) {
+            self.backend.borrow_mut().play_pause_pressed(&app, playing);
+        }
+        self.now_playing.borrow_mut().send(command);
+    }
+
+    /// Shows the main window and brings it to the front.
+    pub fn show_main(&self) {
+        #[cfg(any(windows, target_os = "linux"))]
+        self.main
+            .global::<Motion>()
+            .set_on(crate::platform::animation_effects());
+        let window = self.main.window();
+        let position = window.position();
+        let size = window.size().to_logical(window.scale_factor());
+        let frame = WindowFrame {
+            x: position.x,
+            y: position.y,
+            width: f64::from(size.width),
+            height: f64::from(size.height),
+            maximized: window.is_maximized(),
+        };
+        let on_a_monitor = crate::platform::is_on_a_monitor(frame.x, frame.y);
+        let primary = crate::platform::monitor_at(0.0, 0.0);
+        if let Some(fitted) = place_to_show(
+            frame,
+            on_a_monitor,
+            window.is_minimized(),
+            window.is_visible(),
+            primary,
+        ) {
+            // Sizing a maximized window restores it, and the size is lost.
+            if !fitted.maximized && (fitted.width, fitted.height) != (frame.width, frame.height) {
+                window.set_size(slint::LogicalSize::new(
+                    fitted.width as f32,
+                    fitted.height as f32,
+                ));
+            }
+            window.set_position(slint::PhysicalPosition::new(fitted.x, fitted.y));
+            // Moving a maximized window restores it.
+            if fitted.maximized {
+                window.set_maximized(true);
+            }
+        }
+        if let Err(error) = self.main.show() {
+            self.show_window_error(&error);
+            return;
+        }
+        self.apply_frame(self.main.window(), "main window", Frame::Titled);
+        crate::platform::bring_to_front(self.main.window());
+    }
+
+    /// Shows every window in `appearance` at once: Match System as Windows
+    /// is set, following its changes, Light and Dark whatever Windows uses.
+    /// The theme preview uses it too, without saving.
+    pub fn apply_appearance(&self, appearance: ui_model::Appearance) {
+        use ui_model::Appearance;
+        self.appearance.set(appearance);
+        self.main.set_appearance(match appearance {
+            Appearance::System => crate::Appearance::System,
+            Appearance::Light => crate::Appearance::Light,
+            Appearance::Dark => crate::Appearance::Dark,
+        });
+        if appearance == Appearance::System && !self.themed_by_hand.get() {
+            return;
+        }
+        self.themed_by_hand.set(true);
+        self.follow_appearance();
+    }
+
+    /// View > Appearance.
+    fn choose_appearance(&self, choice: crate::Appearance) {
+        let appearance = match choice {
+            crate::Appearance::Light => ui_model::Appearance::Light,
+            crate::Appearance::Dark => ui_model::Appearance::Dark,
+            _ => ui_model::Appearance::System,
+        };
+        self.ui.borrow_mut().appearance = appearance;
+        self.apply_appearance(appearance);
+        self.remember_view();
+    }
+
+    /// Whether the windows show dark now.
+    fn shows_dark(&self) -> bool {
+        use slint::language::ColorScheme;
+        use slint::private_unstable_api::re_exports::WindowInner;
+        match self.appearance.get() {
+            ui_model::Appearance::Light => false,
+            ui_model::Appearance::Dark => true,
+            // Slint keeps the Windows setting here, read from each new
+            // window and on every theme change; winit never reports the
+            // theme a window was given, only the one Windows uses.
+            ui_model::Appearance::System => {
+                WindowInner::from_pub(self.main.window())
+                    .context()
+                    .color_scheme(None)
+                    == ColorScheme::Dark
+            }
+        }
+    }
+
+    /// Gives every window's palette, title bar and the main window's menu
+    /// bar the appearance.
+    fn follow_appearance(&self) {
+        use slint::language::ColorScheme;
+        let dark = self.shows_dark();
+        let scheme = if dark {
+            ColorScheme::Dark
+        } else {
+            ColorScheme::Light
+        };
+        self.main.global::<Palette>().set_color_scheme(scheme);
+        self.flyout.global::<Palette>().set_color_scheme(scheme);
+        self.equalizer.global::<Palette>().set_color_scheme(scheme);
+        self.zone_dialog
+            .global::<Palette>()
+            .set_color_scheme(scheme);
+        self.pin_dialog.global::<Palette>().set_color_scheme(scheme);
+        self.password_dialog
+            .global::<Palette>()
+            .set_color_scheme(scheme);
+        self.cast_address_dialog
+            .global::<Palette>()
+            .set_color_scheme(scheme);
+        self.about.global::<Palette>().set_color_scheme(scheme);
+        self.guide.global::<Palette>().set_color_scheme(scheme);
+        self.help.global::<Palette>().set_color_scheme(scheme);
+        self.remote_window
+            .global::<Palette>()
+            .set_color_scheme(scheme);
+        self.setup.global::<Palette>().set_color_scheme(scheme);
+        for window in [
+            self.main.window(),
+            self.flyout.window(),
+            self.equalizer.window(),
+            self.zone_dialog.window(),
+            self.pin_dialog.window(),
+            self.password_dialog.window(),
+            self.cast_address_dialog.window(),
+            self.about.window(),
+            self.guide.window(),
+            self.help.window(),
+            self.remote_window.window(),
+            self.setup.window(),
+        ] {
+            self.theme_frame(window);
+            if std::ptr::eq(window, self.main.window()) {
+                self.theme_menu_bar();
+            } else {
+                crate::platform::repaint_frame(window, false, dark);
+            }
+        }
+    }
+
+    /// Sends the main window's menu bar the appearance, unless that native
+    /// window already has it (`menu_bar_theme`).
+    fn theme_menu_bar(&self) {
+        let window = self.main.window();
+        let Some(id) = crate::platform::native_id(window) else {
+            return;
+        };
+        let dark = self.shows_dark();
+        if self.menu_bar_theme.due(id, dark) {
+            crate::platform::repaint_frame(window, true, dark);
+        }
+    }
+
+    /// With Light or Dark, gives every window the appearance again after
+    /// Windows switches between light and dark, which may repaint a title bar
+    /// or the menu bar in the Windows theme. Match System hears that switch
+    /// from winit (`follow_titled_frame`).
+    fn follow_windows_theme(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        crate::platform::set_on_color_set_change(Rc::new(move || {
+            with_app(&weak, |app| {
+                if !app.themed_by_hand.get() || app.appearance.get() == ui_model::Appearance::System
+                {
+                    return;
+                }
+                app.log.log(|| {
+                    "Windows switched light and dark; the appearance applied again".to_owned()
+                });
+                app.menu_bar_theme.forget();
+                app.follow_appearance();
+            });
+        }));
+    }
+
+    /// Gives a native window's title bar the appearance, once AudioSync
+    /// sets it (`themed_by_hand`).
+    fn theme_frame(&self, window: &slint::Window) {
+        use slint::winit_030::WinitWindowAccessor;
+        use slint::winit_030::winit::window::Theme;
+        if !self.themed_by_hand.get() {
+            return;
+        }
+        let theme = match self.appearance.get() {
+            ui_model::Appearance::System => None,
+            ui_model::Appearance::Light => Some(Theme::Light),
+            ui_model::Appearance::Dark => Some(Theme::Dark),
+        };
+        window.with_winit_window(|window| window.set_theme(theme));
+    }
+
+    /// Gives a window that is showing its Windows 11 frame (`backdrop`), and
+    /// logs whether DWM took it. `true` when it did.
+    pub fn apply_frame(&self, window: &slint::Window, name: &'static str, frame: Frame) -> bool {
+        self.use_brand_accent(window);
+        self.theme_frame(window);
+        crate::platform::follow_color_set(window);
+        // Slint gives the main window's menu bar the Windows theme when it
+        // creates it.
+        if self.themed_by_hand.get() && std::ptr::eq(window, self.main.window()) {
+            self.theme_menu_bar();
+        }
+        // Before the event loop runs there is no native window yet; the
+        // window's first focus (see `follow_frame`) tries again.
+        let Some(applied) = crate::backdrop::apply(window, frame) else {
+            return false;
+        };
+        // Only Windows 11 has these frames.
+        if self.frames.borrow_mut().insert(name, applied) != Some(applied) && cfg!(windows) {
+            self.log.log(|| {
+                let what = match frame {
+                    Frame::Titled => "Mica title bar",
+                    Frame::Flyout => "rounded corners",
+                };
+                let result = if applied { "on" } else { "not available" };
+                format!("{name}: {what} {result}")
+            });
+        }
+        applied
+    }
+
+    /// Gives the standard controls (buttons, sliders, switches, fields) the
+    /// brand teal for their accent instead of the Windows accent color. Slint
+    /// keeps one accent for the whole app and reads the Windows one again
+    /// whenever it creates a native window or the theme changes, so this runs
+    /// after each (`apply_frame`, `follow_frame`). The Fluent style keeps its
+    /// own lightness and takes only the hue: dark teal on light, mint on dark.
+    pub fn use_brand_accent(&self, window: &slint::Window) {
+        use slint::private_unstable_api::re_exports::WindowInner;
+        let teal = self.main.global::<Tokens>().get_teal();
+        WindowInner::from_pub(window)
+            .context()
+            .set_accent_color(teal);
+    }
+
+    /// Gives a titled window (every window but the flyout) its frame each
+    /// time it gains the focus, which covers a native window created after
+    /// `show` returned, and the brand accent again after a theme change.
+    fn follow_frame(self: &Rc<Self>, window: fn(&App) -> &slint::Window, name: &'static str) {
+        self.follow_titled_frame(window, name, Titled::Window);
+    }
+
+    /// `follow_frame` for a dialog, which also keeps only the close button
+    /// in its title bar, as Windows dialogs do.
+    fn follow_dialog_frame(
+        self: &Rc<Self>,
+        window: fn(&App) -> &slint::Window,
+        name: &'static str,
+    ) {
+        self.follow_titled_frame(window, name, Titled::Dialog);
+    }
+
+    fn follow_titled_frame(
+        self: &Rc<Self>,
+        window: fn(&App) -> &slint::Window,
+        name: &'static str,
+        kind: Titled,
+    ) {
+        use slint::winit_030::winit::event::WindowEvent;
+        use slint::winit_030::winit::window::WindowButtons;
+        use slint::winit_030::{EventResult, WinitWindowAccessor};
+
+        let weak = Rc::downgrade(self);
+        // The main window's first event comes once its native window exists,
+        // with or without the focus; outside this filter, as it resizes.
+        let min_held = std::cell::Cell::new(kind != Titled::Main);
+        window(self).on_winit_window_event(move |_, event| {
+            if !min_held.replace(true) {
+                let weak = weak.clone();
+                Timer::single_shot(Duration::ZERO, move || {
+                    with_app(&weak, |app| {
+                        keep_main_min_size(window(app));
+                    });
+                });
+            }
+            match event {
+                WindowEvent::Focused(true) => with_app(&weak, |app| {
+                    if kind == Titled::Main {
+                        keep_main_min_size(window(app));
+                    }
+                    if kind == Titled::Dialog {
+                        window(app).with_winit_window(|window| {
+                            window.set_enabled_buttons(WindowButtons::CLOSE);
+                        });
+                        // A PIN dialog opened before the event loop ran had
+                        // no native window to fit yet.
+                        app.fit_pin_dialog();
+                    }
+                    app.apply_frame(window(app), name, Frame::Titled);
+                }),
+                // Slint reads the Windows accent and theme after this filter
+                // returns, and gives the menu bar the Windows theme.
+                WindowEvent::ThemeChanged(_) => {
+                    let weak = weak.clone();
+                    Timer::single_shot(Duration::ZERO, move || {
+                        with_app(&weak, |app| {
+                            app.use_brand_accent(window(app));
+                            if app.themed_by_hand.get() {
+                                app.menu_bar_theme.forget();
+                                app.follow_appearance();
+                            }
+                        });
+                    });
+                }
+                _ => {}
+            }
+            EventResult::Propagate
+        });
+    }
+
+    fn attach_models(&self) {
+        let m = &self.models;
+        self.main.set_sources(ModelRc::from(m.sources.clone()));
+        self.main
+            .set_input_pairs(ModelRc::from(m.input_pairs.clone()));
+        self.main.set_mix_apps(ModelRc::from(m.mix_apps.clone()));
+        self.main.set_this_pc(ModelRc::from(m.this_pc.clone()));
+        self.main.set_connected(ModelRc::from(m.connected.clone()));
+        self.main
+            .set_this_pc_zoned(ModelRc::from(m.this_pc_zoned.clone()));
+        self.main
+            .set_connected_zoned(ModelRc::from(m.connected_zoned.clone()));
+        self.main.set_zones(ModelRc::from(m.zones.clone()));
+        self.main.set_notices(ModelRc::from(m.notices.clone()));
+        self.main
+            .set_presets(ModelRc::from(m.speaker_presets.clone()));
+        self.flyout
+            .set_presets(ModelRc::from(m.speaker_presets.clone()));
+        self.main
+            .set_calibrate_all_rows(ModelRc::from(m.calibration_rows.clone()));
+        self.main
+            .set_calibrate_all_left_out(ModelRc::from(m.calibration_left_out.clone()));
+        self.flyout.set_sources(ModelRc::from(m.sources.clone()));
+        self.flyout
+            .set_input_pairs(ModelRc::from(m.input_pairs.clone()));
+        self.flyout
+            .set_this_pc(ModelRc::from(m.flyout_this_pc.clone()));
+        self.flyout
+            .set_speakers(ModelRc::from(m.flyout_connected.clone()));
+        self.flyout.set_zones(ModelRc::from(m.flyout_zones.clone()));
+        self.flyout
+            .set_notices(ModelRc::from(m.flyout_notices.clone()));
+        self.equalizer.set_gains(ModelRc::from(m.gains.clone()));
+        self.equalizer
+            .set_preset_names(ModelRc::from(m.presets.clone()));
+        let band_hz: Vec<f32> = eq::BAND_CENTERS_HZ.iter().map(|&hz| hz as f32).collect();
+        self.equalizer
+            .set_band_hz(ModelRc::new(VecModel::from(band_hz)));
+        self.equalizer.set_max_gain(eq::MAX_GAIN_DB as f32);
+        self.guide
+            .set_steps(ModelRc::from(self.guide_steps.clone()));
+        self.about.set_version(env!("CARGO_PKG_VERSION").into());
+    }
+
+    /// Reads a snapshot and shows it in every window.
+    pub fn refresh(&self) {
+        // A speaker that went mid-rename takes its name along; back, it
+        // shows that name, its field closed. A deleted zone's field just
+        // goes.
+        let gone = {
+            let mut ui = self.ui.borrow_mut();
+            let open = ui.rename.as_ref().map(|(id, _)| id.clone());
+            let zone = ui.rename_place == RenamePlace::Zone;
+            let snapshot = self.backend.borrow().snapshot();
+            match open {
+                Some(id) if zone && !snapshot.zones.iter().any(|z| z.id == id) => {
+                    ui.rename = None;
+                    None
+                }
+                Some(id) if !zone && snapshot.speaker(&id).is_none() => ui.rename.take(),
+                _ => None,
+            }
+        };
+        if let Some((id, text)) = gone {
+            self.backend.borrow_mut().rename_speaker(&id, &text);
+        }
+        // The announcer keeps every notice's place in time, also one that
+        // dropped off, so the list doesn't take it for news when it is back.
+        let mut state = self.every_notice();
+        let strings = self.strings();
+        let became_mix = {
+            let mut ui = self.ui.borrow_mut();
+            let is_mix = state.source_id.starts_with("mix:");
+            let became_mix = is_mix && !ui.source_was_mix;
+            ui.source_was_mix = is_mix;
+            let show_virtual = ui.show_virtual;
+            ui.listed_virtual.note(&state, show_virtual);
+            // A speaker that went takes what was typed for it along: back,
+            // it shows its saved delay.
+            ui.delay_drafts
+                .retain(|id, _| state.speakers.iter().any(|s| s.id == *id));
+            ui.collapsed
+                .retain(|id| state.zones.iter().any(|zone| zone.id == *id));
+            ui.flyout_collapsed
+                .retain(|id| state.zones.iter().any(|zone| zone.id == *id));
+            became_mix
+        };
+        let move_zones = self.sync_move_zones(&state);
+        let move_zones_of = |zone_id: &str| move_zones.get(zone_id).cloned().unwrap_or_default();
+        let ui = self.ui.borrow();
+        let item = |speaker: &ui_model::Speaker, show_kind: bool| {
+            let draft = ui
+                .delay_drafts
+                .get(&speaker.id)
+                .and_then(|typed| typed.text(speaker.delay_ms));
+            let mut row = speaker_item(
+                &state,
+                speaker,
+                show_kind,
+                ui.sync_open.contains(&speaker.id),
+                draft,
+            );
+            // A Cast speaker's offset only holds the others back (spec C77).
+            let min = if speaker.cast.is_some() {
+                0.0
+            } else {
+                ui_model::MIN_DELAY_MS
+            };
+            row.delay_range_hint = range_hint(
+                &strings,
+                draft,
+                min,
+                ui_model::MAX_DELAY_MS,
+                format_offset_ms,
+            );
+            if let Some((_, text)) = ui
+                .rename
+                .as_ref()
+                .filter(|(id, _)| *id == speaker.id && ui.rename_place != RenamePlace::Zone)
+            {
+                row.renaming = true;
+                row.name_text = text.as_str().into();
+            }
+            row.calibration_status = calibration_status(&strings, &state, speaker);
+            row.calibration_left_out = speaker
+                .mic_left_out
+                .map_or_else(SharedString::default, |kind| {
+                    calibration_left_out(&strings, kind)
+                });
+            row.cast_group_note = cast_group_note(&strings, speaker);
+            row.group_note = group_note(&strings, speaker);
+            if let Some(zone) = state.zone_of(&speaker.id) {
+                row.zone_id = zone.id.as_str().into();
+                row.zone_name = zone.name.as_str().into();
+                if let Some(note) = state.zone_note(zone, ui_model::ZoneRow::Listed(speaker)) {
+                    row.zone_note = zone_note(&strings, note);
+                }
+            }
+            row.move_zones = move_zones_of(&row.zone_id);
+            row
+        };
+        let (this_pc, connected) = state.layout();
+        let lists = |s: &ui_model::Speaker| ui.listed_virtual.lists(s, ui.show_virtual);
+        let connected_virtual_hidden = only_virtual_outputs_hidden(&connected, lists);
+        let listed = |s: &&ui_model::Speaker| lists(s);
+        // A speaker in a zone shows under it, and keeps a compact row in its
+        // own section after the full rows.
+        let (this_pc, this_pc_zoned) =
+            state.split_zoned(this_pc.into_iter().filter(listed).collect());
+        let (connected, connected_zoned) =
+            state.split_zoned(connected.into_iter().filter(listed).collect());
+        // A zoned speaker's name field shows in the row it was asked from.
+        let in_zones = ui.rename_place == RenamePlace::InZones;
+        let compact = |s: &ui_model::Speaker, show_kind: bool| {
+            let mut row = item(s, show_kind);
+            row.renaming &= in_zones;
+            row
+        };
+        let this_pc_zoned: Vec<SpeakerItem> = this_pc_zoned
+            .iter()
+            .map(|(s, _)| compact(s, false))
+            .collect();
+        let connected_zoned: Vec<SpeakerItem> = connected_zoned
+            .iter()
+            .map(|(s, _)| compact(s, true))
+            .collect();
+        let this_pc: Vec<SpeakerItem> = this_pc.into_iter().map(|s| item(s, false)).collect();
+        let connected: Vec<SpeakerItem> = connected.into_iter().map(|s| item(s, true)).collect();
+        let zones: Vec<ZoneRowsBuilt> = state
+            .zones
+            .iter()
+            .map(|zone| {
+                let members: Vec<SpeakerItem> = state
+                    .zone_rows(zone)
+                    .into_iter()
+                    .map(|row| {
+                        let mut built = match row {
+                            ui_model::ZoneRow::Listed(s) => item(s, !s.kind.is_this_pc()),
+                            ui_model::ZoneRow::NotFound(id) => SpeakerItem {
+                                move_zones: move_zones_of(&zone.id),
+                                ..missing_item(&strings, &state, &zone.id, id)
+                            },
+                        };
+                        if let Some(note) = state.zone_note(zone, row) {
+                            built.zone_note = zone_note(&strings, note);
+                            built.zone_dimmed = zone_row_dimmed(row, note);
+                        }
+                        built.renaming &= !in_zones;
+                        built
+                    })
+                    .collect();
+                let targets = zone
+                    .members
+                    .iter()
+                    .filter_map(|id| {
+                        Some(ZoneTarget {
+                            member_id: id.as_str().into(),
+                            target: state.member_target(id)?.name.as_str().into(),
+                        })
+                    })
+                    .collect();
+                let counts = state.zone_counts(zone);
+                let renaming = ui
+                    .rename
+                    .as_ref()
+                    .filter(|(id, _)| *id == zone.id && ui.rename_place == RenamePlace::Zone);
+                ZoneRowsBuilt {
+                    item: ZoneItem {
+                        id: zone.id.as_str().into(),
+                        name: zone.name.as_str().into(),
+                        state: row_state(state.zone_state(zone)),
+                        on: count(counts.on),
+                        total: count(counts.total),
+                        waiting: count(counts.waiting),
+                        waiting_name: state.zone_waiter(zone).unwrap_or_default().into(),
+                        present: count(counts.present),
+                        in_pair: count(counts.in_pair),
+                        volume: zone.volume as f32,
+                        expanded: !ui.collapsed.contains(&zone.id),
+                        can_calibrate: state.offers_zone_run(zone),
+                        renaming: renaming.is_some(),
+                        name_text: renaming
+                            .map(|(_, text)| text.as_str().into())
+                            .unwrap_or_default(),
+                        ..ZoneItem::default()
+                    },
+                    flyout_expanded: !ui.flyout_collapsed.contains(&zone.id),
+                    members,
+                    targets,
+                }
+            })
+            .collect();
+        let show_virtual = ui.show_virtual;
+        let check_updates_automatically = ui.check_updates_automatically;
+        let keys_switch = ui.volume_keys;
+        let airplay_typed = ui
+            .airplay_delay_draft
+            .text(state.airplay_delay_ms)
+            .map(str::to_owned);
+        // No window call while `ui` is borrowed: showing a dialog runs Slint's
+        // pending change handlers, and the focus ones borrow `ui` mutably (UI
+        // Automation focuses and toggles in one turn).
+        drop(ui);
+        self.main
+            .set_connected_virtual_hidden(connected_virtual_hidden);
+        // Read before the flyout takes the new state, for `flyout_shown`.
+        let none_found_shown = self.flyout.get_airplay_none_found();
+        self.main.set_airplay_none_found(state.airplay_none_found);
+        self.flyout.set_airplay_none_found(state.airplay_none_found);
+        self.main.set_airplay_searching(state.airplay_searching);
+        self.flyout.set_airplay_searching(state.airplay_searching);
+        self.main.set_no_speaker_on(state.no_speaker_on);
+        self.flyout.set_no_speaker_on(state.no_speaker_on);
+        // Read before the flyout takes the new state, for `flyout_shown`.
+        let add_address_shown =
+            self.flyout.get_cast_by_address() && self.flyout.get_cast_list() == CastList::NoneFound;
+        self.main.set_cast_list(cast_list(state.cast_list));
+        self.flyout.set_cast_list(cast_list(state.cast_list));
+        self.watch_network(
+            state.airplay_none_found || state.cast_list == ui_model::CastList::NoneFound,
+        );
+        self.main.set_cast_by_address(state.cast_by_address);
+        self.flyout.set_cast_by_address(state.cast_by_address);
+        self.main.set_this_pc_all_hidden(state.hidden_in(true));
+        self.main.set_connected_all_hidden(state.hidden_in(false));
+        self.flyout.set_all_hidden(state.all_hidden());
+        self.flyout
+            .set_connected_all_hidden(state.connected_all_hidden());
+        self.main
+            .set_hidden_speakers(ModelRc::new(VecModel::from(hidden_items(
+                &self.main.global::<Strings>(),
+                &state,
+            ))));
+        sync_model(&self.models.speaker_presets, preset_items(&state));
+        self.main
+            .set_can_save_preset(state.presets.len() < MAX_PRESETS);
+        let current_preset: SharedString = current_preset_name(&state).into();
+        self.main.set_current_preset(current_preset.clone());
+        self.flyout.set_current_preset(current_preset);
+        let all: Vec<SpeakerItem> = this_pc
+            .iter()
+            .chain(&connected)
+            .cloned()
+            .chain(zones.iter().flat_map(|zone| zone.members.iter().cloned()))
+            .collect();
+        let rows_typed = all.iter().any(|row| row.delay_pending);
+        let mut out_of_range: Vec<(String, SharedString)> = all
+            .iter()
+            .filter(|row| !row.delay_range_hint.is_empty())
+            .map(|row| (row.id.to_string(), row.delay_range_hint.clone()))
+            .collect();
+        // Posted since the last refresh; none at launch.
+        let known = self.notice_announcer.borrow().posted.clone();
+        let closing = {
+            let mut closing = self.closing_notices.borrow_mut();
+            closing.retain(|(id, message)| {
+                state
+                    .notices
+                    .iter()
+                    .any(|n| n.id == *id && n.message == *message)
+            });
+            closing.iter().map(|(id, _)| *id).collect::<Vec<u64>>()
+        };
+        let mut notices: Vec<NoticeItem> = state
+            .notices
+            .iter()
+            .map(|n| NoticeItem {
+                fresh: known.as_ref().is_some_and(|ids| !ids.contains(&n.id)),
+                closing: closing.contains(&n.id),
+                ..notice_item(&strings, n)
+            })
+            .collect();
+        let listed: Vec<Listed> = state
+            .notices
+            .iter()
+            .zip(&notices)
+            .map(|(notice, item)| Listed {
+                id: notice.id,
+                subject: notice.subject.clone(),
+                title: item.title.clone(),
+                post: notice.post,
+            })
+            .collect();
+        let announcement = self.notice_announcer.borrow_mut().next(&listed);
+        // The window's own notices follow the backend's in the state;
+        // the post order puts every notice in time, newest first.
+        let posted = self.notice_announcer.borrow().posted().to_vec();
+        notices.sort_by_key(|n| {
+            std::cmp::Reverse(posted.iter().position(|&id| u64::try_from(n.id) == Ok(id)))
+        });
+        notices.truncate(MAX_NOTICES);
+        keep_newest_notices(&mut state.notices, &posted);
+        let mut notice_said = None;
+        match announcement {
+            Announcement::Say(title) => {
+                let said = strings.invoke_notice_announcement(title);
+                self.announce(said.clone());
+                notice_said = Some(said);
+            }
+            Announcement::Clear => self.clear_announcement(),
+            Announcement::Keep => {}
+        }
+        let ended = calibration_ended(
+            &mut self.calibration_announced.borrow_mut(),
+            &state.calibration,
+        );
+        let calibration_said = ended
+            .and_then(|id| all.iter().find(|row| row.id == id.as_str()))
+            .map(|row| row.calibration_status.clone())
+            .filter(|said| !said.is_empty());
+        if let Some(said) = calibration_said {
+            let said = match notice_said.take() {
+                Some(notice) => strings.invoke_announcements(notice, said),
+                None => said,
+            };
+            self.announce(said.clone());
+            notice_said = Some(said);
+        }
+        let card = calibrate_all_card(&strings, &state);
+        if self
+            .calibrate_all_announced
+            .replace(state.calibrate_all.endings)
+            != state.calibrate_all.endings
+        {
+            let said = card.said.clone();
+            if !said.is_empty() {
+                let said = match notice_said.take() {
+                    Some(notice) => strings.invoke_announcements(notice, said),
+                    None => said,
+                };
+                self.announce(said.clone());
+                notice_said = Some(said);
+            }
+        }
+        let measuring = match &state.calibrate_all.phase {
+            AllPhase::Running(AllProgress::Measuring { name, .. }) => Some(name.clone()),
+            AllPhase::Running(_) => self.calibrate_all_measuring.borrow().clone(),
+            _ => None,
+        };
+        let before = self.calibrate_all_measuring.replace(measuring.clone());
+        if measuring.is_some() && before != measuring {
+            let said = match notice_said.take() {
+                Some(notice) => strings.invoke_announcements(notice, card.status.clone()),
+                None => card.status.clone(),
+            };
+            self.announce(said.clone());
+            notice_said = Some(said);
+        }
+        let sources: Vec<SharedString> = state
+            .sources
+            .iter()
+            .map(|s| {
+                let name = s.shown(&strings.get_list_separator());
+                match s.kind {
+                    // The backend's name for it is English; the UI's is translated.
+                    SourceKind::System => strings.get_source_system(),
+                    SourceKind::Input if s.unplugged => {
+                        strings.invoke_source_not_connected(name.into())
+                    }
+                    SourceKind::App | SourceKind::Input => name.into(),
+                    SourceKind::AppsExcept => strings.invoke_source_all_except(name.into()),
+                }
+            })
+            .collect();
+        let source_index = state
+            .sources
+            .iter()
+            .position(|s| s.id == state.source_id)
+            .map_or(-1, |i| i as i32);
+        let (input_pairs, input_pair_index) = input_pair_choice(&state, |first, last| {
+            strings.invoke_input_channel_pair(first, last)
+        });
+        let status = strings.invoke_status(state.running, count(state.active_speakers()));
+        let flyout_notices = newest_notices(&notices, FLYOUT_NOTICE_LIMIT);
+
+        let m = &self.models;
+        let flyout_shown = FlyoutCounts {
+            notices: usize::try_from(self.flyout.get_notice_count()).unwrap_or(0),
+            listed_notices: m.flyout_notices.row_count(),
+            zones: m.zones.row_count(),
+            this_pc: m.flyout_this_pc.row_count(),
+            speakers: m.flyout_connected.row_count(),
+            zone_members: self.zone_shape_shown(),
+            add_address: add_address_shown,
+            network_settings: none_found_shown
+                && m.zones.row_count() == 0
+                && m.flyout_connected.row_count() == 0,
+        };
+        let flyout_removed = flyout_shown.removed_by(FlyoutCounts {
+            notices: notices.len(),
+            listed_notices: flyout_notices.len(),
+            zones: zones.len(),
+            this_pc: this_pc.len(),
+            speakers: connected.len(),
+            zone_members: zone_shape(
+                zones
+                    .iter()
+                    .map(|zone| listed_members(zone.flyout_expanded, zone.members.len())),
+            ),
+            add_address: state.cast_by_address && state.cast_list == ui_model::CastList::NoneFound,
+            network_settings: state.airplay_none_found && zones.is_empty() && connected.is_empty(),
+        });
+        let main_lists = MainLists {
+            notices: newest_notices(&notices, MAIN_NOTICE_LIMIT),
+            this_pc,
+            connected,
+            zones: zones
+                .iter()
+                .map(|zone| ZoneRows {
+                    id: zone.item.id.clone(),
+                    rows: if zone.item.expanded {
+                        zone.members.clone()
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect(),
+            this_pc_zoned,
+            connected_zoned,
+        };
+        let main_focus = self.main_focus_target(&main_lists);
+        let MainLists {
+            notices: main_notices,
+            this_pc,
+            connected,
+            this_pc_zoned,
+            connected_zoned,
+            ..
+        } = main_lists;
+        sync_model(&m.sources, sources);
+        sync_model(&m.input_pairs, input_pairs);
+        self.main.set_input_pair_index(input_pair_index);
+        self.flyout.set_input_pair_index(input_pair_index);
+        sync_model(
+            &m.mix_apps,
+            state
+                .mix_apps
+                .iter()
+                .map(|app| MixAppItem {
+                    name: if app.running {
+                        app.name.as_str().into()
+                    } else {
+                        strings.invoke_source_not_running(app.name.as_str().into())
+                    },
+                    checked: app.checked,
+                })
+                .collect(),
+        );
+        self.main.set_mix_all_except(state.mix_all_except);
+        // The list opens once as the source becomes a mix; folding it is
+        // the user's.
+        if became_mix {
+            self.main.set_mix_open(true);
+        }
+        sync_model(&m.flyout_this_pc, this_pc.clone());
+        sync_model(&m.flyout_connected, connected.clone());
+        sync_model(&m.this_pc, this_pc);
+        sync_model(&m.connected, connected);
+        sync_model(&m.this_pc_zoned, this_pc_zoned);
+        sync_model(&m.connected_zoned, connected_zoned);
+        self.sync_zones(zones);
+        self.main
+            .set_notices_staying(count(main_notices.iter().filter(|n| !n.closing).count()));
+        sync_model(&m.notices, main_notices);
+        sync_model(&m.flyout_notices, flyout_notices);
+        self.flyout.set_notice_count(count(notices.len()));
+        self.restore_flyout_focus(flyout_removed);
+        if main_focus == Some(MainFocusTarget::StreamingSwitch) {
+            self.main.invoke_focus_streaming_switch();
+        }
+        self.refresh_guide(&state);
+        self.refresh_help(&state);
+        self.refresh_setup(&state);
+        let every_time = state.pin_prompt.as_ref().is_some_and(|prompt| {
+            state
+                .speaker(&prompt.speaker_id)
+                .is_some_and(|speaker| speaker.code_every_time)
+        });
+        self.show_pin_prompt(state.pin_prompt.as_ref(), every_time);
+        self.show_password_prompt(state.password_prompt.as_ref());
+
+        let live_hint = match state.live_input_airplay_wait() {
+            Some(AirPlayWait::Tenths(tenths)) => {
+                strings.invoke_live_input_airplay(format!("{}.{}", tenths / 10, tenths % 10).into())
+            }
+            Some(AirPlayWait::Unknown) => strings.get_live_input_airplay_unknown(),
+            None => SharedString::new(),
+        };
+        if state.master_volume >= UNMUTE_FLOOR {
+            self.unmute_to.set(state.master_volume);
+        }
+        for window in [&self.main as &dyn WindowState, &self.flyout] {
+            window.show_state(&state, &status, source_index);
+            window.show_live_input_hint(&live_hint);
+        }
+        self.main.set_equalizer_on(state.equalizer.enabled);
+        self.main.set_show_virtual_devices(show_virtual);
+        self.main.set_launch_at_login(self.login.borrow().is_on());
+        self.main.set_updater_available(self.has_updater());
+        self.help.set_updater_available(self.has_updater());
+        self.main
+            .set_check_updates_automatically(check_updates_automatically);
+        self.main.set_volume_keys_available(cfg!(windows));
+        self.main.set_volume_keys(keys_switch);
+        self.take_volume_keys(volume_keys::keys_taken(
+            keys_switch,
+            state.running && !state.no_speaker_on,
+        ));
+        // As on the Mac, only while an AirPlay speaker is listed (S445).
+        let airplay_listed = state.speakers.iter().any(|s| {
+            matches!(
+                s.kind,
+                ui_model::SpeakerKind::AirPlay | ui_model::SpeakerKind::AirPlay2
+            )
+        });
+        self.main
+            .set_airplay_delay_shown(state.airplay_delay_ms.is_some() && airplay_listed);
+        let airplay_delay = format_ms(state.airplay_delay_ms.unwrap_or(0.0));
+        let typed = airplay_typed.as_deref();
+        let airplay_typed = is_draft(typed, &airplay_delay);
+        self.main.set_airplay_delay_pending(airplay_typed);
+        self.main.set_delay_typing(rows_typed || airplay_typed);
+        self.main
+            .set_airplay_delay_text(typed.map_or(airplay_delay, str::to_owned).into());
+        // The range the Mac's field takes too; the sender clamps the stored
+        // adjustment on its own.
+        let airplay_range_hint =
+            range_hint(&strings, typed, 0.0, ui_model::MAX_DELAY_MS, format_ms);
+        if !airplay_range_hint.is_empty() {
+            out_of_range.push((AIRPLAY_DELAY_FIELD.to_owned(), airplay_range_hint.clone()));
+        }
+        self.main.set_airplay_delay_range_hint(airplay_range_hint);
+        let alert = newly_out_of_range(&mut self.out_of_range.borrow_mut(), out_of_range);
+        if let Some(hint) = alert {
+            // Said alone, the range line would replace the notice's words.
+            self.announce(match notice_said {
+                Some(said) => strings.invoke_announcements(said, hint),
+                None => hint,
+            });
+        }
+
+        self.show_calibrate_all(card);
+        self.show_equalizer_state(&state);
+        *self.now_playing_source.borrow_mut() = CardSource::of(&state);
+        let _ = self.sync_now_playing();
+        self.publish_remote(&state);
+        if let Some(callback) = self.on_refresh.borrow().as_ref() {
+            callback(&state);
+        }
+    }
+
+    /// Hide Speaker in a row's menu. The backend keeps the kind the row
+    /// shows, for Hidden Speakers to name it while it isn't listed.
+    fn hide_speaker(&self, id: &str) {
+        let Some(speaker) = self.snapshot().speaker(id).cloned() else {
+            return;
+        };
+        let strings = self.main.global::<Strings>();
+        let kind = strings.invoke_speaker_kind(speaker_kind(speaker.kind));
+        self.main_focus.borrow_mut().hiding = Some(id.into());
+        self.update(|b| b.hide_speaker(id, &kind));
+        self.main_focus.borrow_mut().hiding = None;
+        if self.snapshot().speaker(id).is_none() {
+            self.announce(strings.invoke_speaker_hidden(speaker.name.as_str().into()));
+        }
+    }
+
+    /// An entry of Speakers > Hidden Speakers.
+    fn unhide_speaker(&self, id: &str) {
+        let state = self.snapshot();
+        let Some(hidden) = state.hidden.iter().find(|hidden| hidden.id == id) else {
+            return;
+        };
+        let said = self
+            .main
+            .global::<Strings>()
+            .invoke_speaker_shown(hidden.name.as_str().into());
+        self.update(|b| b.unhide_speaker(id));
+        self.announce(said);
+    }
+
+    /// Has Narrator say `text` without moving the focus, through the live
+    /// region of the window it can hear: the flyout while it is open (it
+    /// has the focus then), else the main window. Never both, so it is said
+    /// once. The live region empties again after a few seconds. The words
+    /// it already holds empty it first and come back
+    /// [`ANNOUNCEMENT_REPEAT_GAP`] later, so they are said again.
+    fn announce(&self, text: SharedString) {
+        let (main, flyout) = (self.main.as_weak(), self.flyout.as_weak());
+        let in_flyout = self.flyout.window().is_visible();
+        let held = if in_flyout {
+            self.flyout.get_notice_announcement()
+        } else {
+            self.main.get_notice_announcement()
+        };
+        if held == text {
+            clear_announcement(&main, &flyout);
+            let (main, flyout) = (main.clone(), flyout.clone());
+            self.repeat_timer
+                .start(TimerMode::SingleShot, ANNOUNCEMENT_REPEAT_GAP, move || {
+                    put_announcement(&main, &flyout, text.clone());
+                });
+        } else {
+            self.repeat_timer.stop();
+            put_announcement(&main, &flyout, text);
+        }
+        self.announcement_timer.start(
+            TimerMode::SingleShot,
+            ANNOUNCEMENT_CLEARS_AFTER,
+            move || clear_announcement(&main, &flyout),
+        );
+    }
+
+    fn show_calibrate_all(&self, card: CalibrateAllCard) {
+        let main = &self.main;
+        main.set_calibrate_all_running(card.running);
+        main.set_calibrate_all_can_start(card.can_start);
+        main.set_calibrate_all_status(card.status);
+        main.set_calibrate_all_status_is_hint(card.status_is_hint);
+        main.set_calibrate_all_privacy(card.privacy);
+        main.set_calibrate_all_results_shown(card.results_shown);
+        main.set_calibrate_all_airplay(card.airplay);
+        main.set_calibrate_all_zone(card.zone);
+        main.set_calibrate_all_outcome(card.outcome);
+        main.set_calibrate_all_can_apply(card.can_apply);
+        main.set_calibrate_all_applied(card.applied);
+        main.set_calibrate_all_can_undo(card.can_undo);
+        main.set_calibrate_all_volume(card.volume.0);
+        main.set_calibrate_all_volume_percent(card.volume.1);
+        main.set_calibrate_all_volume_id(card.volume.2);
+        main.set_calibrate_all_reference(card.reference);
+        sync_model(&self.models.calibration_rows, card.rows);
+        sync_model(&self.models.calibration_left_out, card.left_out);
+    }
+
+    /// Empties both live regions now.
+    fn clear_announcement(&self) {
+        self.announcement_timer.stop();
+        self.repeat_timer.stop();
+        clear_announcement(&self.main.as_weak(), &self.flyout.as_weak());
+    }
+
+    /// Puts each row's Move to Zone list, the zones other than the row's own
+    /// as on the Mac, into its kept model, by that zone ("" for none).
+    fn sync_move_zones(&self, state: &AppState) -> HashMap<String, ModelRc<ZoneChoice>> {
+        let mut kept = self.models.move_zones.borrow_mut();
+        kept.retain(|id, _| id.is_empty() || state.zones.iter().any(|zone| zone.id == *id));
+        std::iter::once("")
+            .chain(state.zones.iter().map(|zone| zone.id.as_str()))
+            .map(|current| {
+                let choices = state
+                    .zones
+                    .iter()
+                    .filter(|zone| zone.id != current)
+                    .map(|zone| ZoneChoice {
+                        id: zone.id.as_str().into(),
+                        name: zone.name.as_str().into(),
+                    })
+                    .collect();
+                let model = kept.entry(current.to_owned()).or_default();
+                sync_model(model, choices);
+                (current.to_owned(), ModelRc::from(model.clone()))
+            })
+            .collect()
+    }
+
+    /// Puts each zone's rows into its kept models, then the zones into theirs.
+    fn sync_zones(&self, zones: Vec<ZoneRowsBuilt>) {
+        let m = &self.models;
+        let mut flyout_items = Vec::new();
+        let items: Vec<ZoneItem> = {
+            let mut kept = m.zone_models.borrow_mut();
+            kept.retain(|id, _| zones.iter().any(|zone| zone.item.id == id.as_str()));
+            zones
+                .into_iter()
+                .map(|zone| {
+                    let models = kept.entry(zone.item.id.to_string()).or_default();
+                    sync_model(&models.members, zone.members);
+                    sync_model(&models.targets, zone.targets);
+                    let item = ZoneItem {
+                        members: ModelRc::from(models.members.clone()),
+                        targets: ModelRc::from(models.targets.clone()),
+                        ..zone.item
+                    };
+                    flyout_items.push(ZoneItem {
+                        expanded: zone.flyout_expanded,
+                        ..item.clone()
+                    });
+                    item
+                })
+                .collect()
+        };
+        sync_model(&m.zones, items);
+        sync_model(&m.flyout_zones, flyout_items);
+    }
+
+    /// The shape of the zones' member lists the flyout shows now.
+    fn zone_shape_shown(&self) -> u64 {
+        let kept = self.models.zone_models.borrow();
+        zone_shape(self.models.flyout_zones.iter().map(|zone| {
+            let members = kept
+                .get(zone.id.as_str())
+                .map_or(0, |models| models.members.row_count());
+            listed_members(zone.expanded, members)
+        }))
+    }
+
+    /// Gives the keyboard focus back to the open flyout when a refresh
+    /// removed the control that had it (a notice dismissed with the
+    /// keyboard, a speaker unplugged): Slint then leaves nothing focused,
+    /// and Escape would not close the flyout until Tab focused something.
+    fn restore_flyout_focus(&self, removed: FlyoutParts) {
+        let flyout = &self.flyout;
+        let focused = FlyoutParts {
+            notices: flyout.get_notice_focused(),
+            more_notices: flyout.get_more_notices_focused(),
+            zones: flyout.get_zone_focused(),
+            speakers: flyout.get_speaker_focused(),
+            add_address: flyout.get_add_address_focused(),
+            network_settings: flyout.get_network_settings_focused(),
+        };
+        if focused.overlaps(removed) && flyout.window().is_visible() {
+            flyout.invoke_take_focus();
+        }
+    }
+
+    /// Where the main window's keyboard focus goes when this refresh, to
+    /// `new`, rebuilds the list that has it: Slint then leaves nothing
+    /// focused. Asks the rebuilt row or notice to take it as it is built
+    /// (so before the models change); the streaming switch takes it after.
+    fn main_focus_target(&self, new: &MainLists) -> Option<MainFocusTarget> {
+        let m = &self.models;
+        let old = MainLists {
+            notices: m.notices.iter().collect(),
+            this_pc: m.this_pc.iter().collect(),
+            connected: m.connected.iter().collect(),
+            zones: m
+                .zones
+                .iter()
+                .map(|zone| ZoneRows {
+                    rows: if zone.expanded {
+                        zone.members.iter().collect()
+                    } else {
+                        Vec::new()
+                    },
+                    id: zone.id,
+                })
+                .collect(),
+            this_pc_zoned: m.this_pc_zoned.iter().collect(),
+            connected_zoned: m.connected_zoned.iter().collect(),
+        };
+        let mut focus = self.main_focus.borrow_mut();
+        let target = focus.target(&old, new)?;
+        let main = &self.main;
+        if !main.window().is_visible() {
+            *focus = MainFocus::default();
+            return None;
+        }
+        // What has it next. The row that takes it may report that before
+        // its own focus tracking starts, and so never report it.
+        *focus = match &target {
+            MainFocusTarget::Notice(index) => MainFocus {
+                notice: new.notices.get(*index).map(|n| n.id),
+                ..MainFocus::default()
+            },
+            MainFocusTarget::Speaker(id, part) => MainFocus {
+                speaker: Some((id.clone(), *part)),
+                ..MainFocus::default()
+            },
+            MainFocusTarget::Zone(id, part) => MainFocus {
+                zone: Some((id.clone(), *part)),
+                ..MainFocus::default()
+            },
+            MainFocusTarget::InZones(id, part) => MainFocus {
+                in_zones: Some((id.clone(), *part)),
+                ..MainFocus::default()
+            },
+            MainFocusTarget::StreamingSwitch => MainFocus::default(),
+        };
+        drop(focus);
+        main.set_focus_notice_index(-1);
+        main.set_focus_speaker_id(SharedString::new());
+        main.set_focus_zone_id(SharedString::new());
+        main.set_focus_in_zones_id(SharedString::new());
+        match &target {
+            MainFocusTarget::Notice(index) => main.set_focus_notice_index(count(*index)),
+            MainFocusTarget::Speaker(id, part) => {
+                main.set_focus_speaker_part(*part);
+                main.set_focus_speaker_id(id.clone());
+            }
+            MainFocusTarget::Zone(id, part) => {
+                main.set_focus_zone_part(*part);
+                main.set_focus_zone_id(id.clone());
+            }
+            MainFocusTarget::InZones(id, part) => {
+                main.set_focus_in_zones_part(*part);
+                main.set_focus_in_zones_id(id.clone());
+            }
+            MainFocusTarget::StreamingSwitch => {}
+        }
+        Some(target)
+    }
+
+    fn show_equalizer_state(&self, state: &AppState) {
+        let settings = &state.equalizer;
+        let strings = self.strings();
+        let names: Vec<SharedString> = eq::PRESETS
+            .iter()
+            .map(|p| strings.invoke_equalizer_preset(p.id.into()))
+            .chain(
+                state
+                    .equalizer_curves
+                    .iter()
+                    .map(|c| c.name.as_str().into()),
+            )
+            .collect();
+        let shown = self.shown_curve(state);
+        let preset_index = ui_model::picker_index(shown);
+        let curve_name = usize::try_from(preset_index)
+            .ok()
+            .and_then(|index| names.get(index).cloned())
+            .unwrap_or_else(|| strings.get_equalizer_custom());
+        sync_model(&self.models.presets, names);
+        self.main.set_equalizer_curve(curve_name);
+        self.equalizer
+            .set_saved_curve_shown(matches!(shown, Some(CurveMatch::User(_))));
+        sync_model(
+            &self.models.gains,
+            settings.gains_db.iter().map(|&g| g as f32).collect(),
+        );
+        self.equalizer.set_enabled(settings.enabled);
+        self.equalizer.set_preamp(settings.preamp_db as f32);
+        self.equalizer.set_preset_index(preset_index);
+    }
+
+    fn connect_main(self: &Rc<Self>) {
+        self.follow_titled_frame(|app| app.main.window(), "main window", Titled::Main);
+        self.follow_windows_theme();
+        let main = &self.main;
+        let weak = Rc::downgrade(self);
+
+        let w = weak.clone();
+        main.on_power_toggled(move |on| with_app(&w, |app| app.update(|b| b.set_running(on))));
+        let w = weak.clone();
+        main.on_source_selected(move |index| with_app(&w, |app| app.select_source(index)));
+        let w = weak.clone();
+        main.on_input_pair_selected(move |index| {
+            with_app(&w, |app| app.select_input_pair(index));
+        });
+        let w = weak.clone();
+        main.on_mix_app_toggled(move |index| with_app(&w, |app| app.toggle_mix_app(index)));
+        let w = weak.clone();
+        main.on_mix_mode_selected(move |on| {
+            with_app(&w, |app| app.update(|b| b.set_mix_all_except(on)));
+        });
+        let w = weak.clone();
+        main.on_switch_source_on_quit_toggled(move |on| {
+            let setting = if on {
+                WhenSourceQuits::SwitchToSystem
+            } else {
+                WhenSourceQuits::Stop
+            };
+            with_app(&w, |app| app.update(|b| b.set_when_source_quits(setting)))
+        });
+        let w = weak.clone();
+        main.on_master_volume_changed(move |volume| {
+            with_app(&w, |app| app.move_master_volume(volume))
+        });
+        let w = weak.clone();
+        main.on_master_mute_toggled(move || with_app(&w, App::toggle_master_mute));
+        let w = weak.clone();
+        main.on_equalizer_requested(move || with_app(&w, App::show_equalizer));
+        let w = weak.clone();
+        main.on_now_playing_transport(move |button| with_app(&w, |app| app.send_transport(button)));
+        let w = weak.clone();
+        main.on_now_playing_read(move || {
+            with_app(&w, |app| {
+                if app.sync_now_playing() {
+                    app.publish_remote(&app.snapshot());
+                }
+            })
+        });
+        let w = weak.clone();
+        main.on_speaker_toggled(move |id| with_app(&w, |app| app.toggle_speaker(&id)));
+        let w = weak.clone();
+        main.on_speaker_volume_changed(move |id, volume| {
+            with_app(&w, |app| {
+                app.update(|b| b.set_speaker_volume(&id, volume.into()))
+            })
+        });
+        let w = weak.clone();
+        main.on_speaker_volume_editing(move |id, on| {
+            // Nothing shown changes, so no refresh.
+            with_app(&w, |app| {
+                app.backend.borrow_mut().set_speaker_volume_editing(&id, on)
+            })
+        });
+        let w = weak.clone();
+        main.on_sync_toggled(move |id| with_app(&w, |app| app.toggle_sync(&id)));
+        let w = weak.clone();
+        main.on_delay_stepped(move |id, delta| with_app(&w, |app| app.step_delay(&id, delta)));
+        let w = weak.clone();
+        main.on_delay_edited(move |id, text| with_app(&w, |app| app.edit_delay(&id, &text)));
+        let w = weak.clone();
+        main.on_delay_committed(move |id| with_app(&w, |app| app.enter_delay(&id)));
+        let w = weak.clone();
+        main.on_delay_apply_requested(move || with_app(&w, |app| app.apply_delay_typing(None)));
+        let w = weak.clone();
+        main.on_delay_cancelled(move |_| with_app(&w, |app| app.end_delay_typing(false)));
+        let w = weak.clone();
+        main.on_airplay_delay_stepped(move |delta| {
+            with_app(&w, |app| app.step_airplay_delay(delta))
+        });
+        let w = weak.clone();
+        main.on_airplay_delay_edited(move |text| with_app(&w, |app| app.edit_airplay_delay(&text)));
+        let w = weak.clone();
+        main.on_airplay_delay_committed(move || with_app(&w, App::enter_airplay_delay));
+        let w = weak.clone();
+        main.on_airplay_delay_cancelled(move || with_app(&w, |app| app.end_delay_typing(false)));
+        let w = weak.clone();
+        main.on_blank_clicked(move || with_app(&w, App::blank_click));
+        main.global::<NameField>()
+            .on_fit(|text| speaker_names::fitting(&text).into());
+        main.global::<NameField>()
+            .set_double_click(crate::platform::double_click_ms());
+        let w = weak.clone();
+        main.on_speaker_rename_requested(move |id| {
+            with_app(&w, |app| app.start_rename(&id, RenamePlace::Row))
+        });
+        let w = weak.clone();
+        main.on_speaker_in_zones_rename_requested(move |id| {
+            with_app(&w, |app| app.start_rename(&id, RenamePlace::InZones))
+        });
+        let w = weak.clone();
+        main.on_speaker_rename_edited(move |id, text| {
+            with_app(&w, |app| app.edit_rename(&id, &text))
+        });
+        let w = weak.clone();
+        main.on_speaker_rename_committed(move |id| {
+            with_app(&w, |app| app.end_rename_in(&id, true))
+        });
+        let w = weak.clone();
+        main.on_speaker_rename_cancelled(move |id| {
+            with_app(&w, |app| app.end_rename_in(&id, false))
+        });
+        let w = weak.clone();
+        main.on_auto_connect_toggled(move |id, on| {
+            with_app(&w, |app| app.update(|b| b.set_auto_connect(&id, on)))
+        });
+        let w = weak.clone();
+        main.on_forget_pairing_requested(move |id| {
+            with_app(&w, |app| app.update(|b| b.forget_pairing(&id)))
+        });
+        let w = weak.clone();
+        main.on_device_volume_fix_requested(move |id| {
+            with_app(&w, |app| app.update(|b| b.fix_device_volume(&id)))
+        });
+        let w = weak.clone();
+        main.on_cast_muted_requested(move |id, muted| {
+            with_app(&w, |app| app.update(|b| b.set_speaker_muted(&id, muted)))
+        });
+        let w = weak.clone();
+        main.on_cast_resync_requested(move |id| {
+            with_app(&w, |app| app.update(|b| b.resync_speaker(&id)))
+        });
+        let w = weak.clone();
+        main.on_cast_add_address_requested(move || with_app(&w, App::ask_cast_address));
+        let w = weak.clone();
+        main.on_network_settings_requested(move || with_app(&w, App::open_network_settings));
+        let w = weak.clone();
+        main.on_cast_remove_requested(move |id| {
+            with_app(&w, |app| app.update(|b| b.remove_cast_address(&id)))
+        });
+        let w = weak.clone();
+        main.on_speaker_hide_requested(move |id| with_app(&w, |app| app.hide_speaker(&id)));
+        let w = weak.clone();
+        main.on_speaker_unhide_requested(move |id| with_app(&w, |app| app.unhide_speaker(&id)));
+        let w = weak.clone();
+        main.on_calibrate_requested(move |id| {
+            with_app(&w, |app| {
+                app.update(|b| b.start_calibration(&id));
+                app.follow_calibration(&w);
+            });
+        });
+        let w = weak.clone();
+        main.on_cancel_calibration_requested(move || {
+            with_app(&w, |app| app.update(|b| b.cancel_calibration()))
+        });
+        let w = weak.clone();
+        main.on_calibration_privacy_requested(move || with_app(&w, App::open_microphone_privacy));
+        let w = weak.clone();
+        main.on_calibrate_all_requested(move || {
+            with_app(&w, |app| {
+                app.update(|b| b.start_calibrate_all());
+                app.follow_calibration(&w);
+            });
+        });
+        let w = weak.clone();
+        main.on_cancel_calibrate_all_requested(move || {
+            with_app(&w, |app| app.update(|b| b.cancel_calibrate_all()))
+        });
+        let w = weak.clone();
+        main.on_calibrate_all_again_requested(move |row| {
+            with_app(&w, |app| {
+                if let Ok(row) = usize::try_from(row) {
+                    app.update(|b| b.measure_again(row));
+                    app.follow_calibration(&w);
+                }
+            });
+        });
+        let w = weak.clone();
+        main.on_calibrate_all_include_requested(move |id, included| {
+            with_app(&w, |app| {
+                let listed = app
+                    .snapshot()
+                    .calibrate_all
+                    .left_out
+                    .iter()
+                    .any(|left| left.id == id.as_str());
+                if listed {
+                    app.update(|b| b.include_in_calibration(&id, included));
+                }
+            });
+        });
+        let w = weak.clone();
+        main.on_calibrate_all_apply_requested(move || {
+            with_app(&w, |app| app.update(|b| b.apply_calibrate_all()))
+        });
+        let w = weak.clone();
+        main.on_calibrate_all_undo_requested(move || {
+            with_app(&w, |app| app.update(|b| b.undo_calibrate_all()))
+        });
+        let w = weak.clone();
+        main.on_calibrate_all_close_requested(move || {
+            with_app(&w, |app| app.update(|b| b.close_calibrate_all()))
+        });
+        let w = weak.clone();
+        main.on_zone_toggled(move |id| with_app(&w, |app| app.update(|b| b.toggle_zone(&id))));
+        let w = weak.clone();
+        main.on_zone_expanded_changed(move |id, open| {
+            with_app(&w, |app| {
+                // A click on the header of the zone being renamed only
+                // applies the name, as on a speaker's row.
+                if app.renaming(&id, RenamePlace::Zone) {
+                    app.blank_click();
+                } else {
+                    app.set_zone_expanded(&id, open, false);
+                }
+            })
+        });
+        let w = weak.clone();
+        main.on_zone_volume_changed(move |id, volume| {
+            with_app(&w, |app| {
+                app.update(|b| b.set_zone_volume(&id, volume.into()))
+            })
+        });
+        let w = weak.clone();
+        main.on_zone_rename_requested(move |id| {
+            with_app(&w, |app| app.start_rename(&id, RenamePlace::Zone))
+        });
+        let w = weak.clone();
+        main.on_zone_rename_edited(move |id, text| with_app(&w, |app| app.edit_rename(&id, &text)));
+        let w = weak.clone();
+        main.on_zone_rename_committed(move |id| with_app(&w, |app| app.end_rename_in(&id, true)));
+        let w = weak.clone();
+        main.on_zone_rename_cancelled(move |id| with_app(&w, |app| app.end_rename_in(&id, false)));
+        let w = weak.clone();
+        main.on_zone_deleted(move |id| with_app(&w, |app| app.delete_zone(&id)));
+        let w = weak.clone();
+        main.on_zone_calibrate_requested(move |id| {
+            with_app(&w, |app| {
+                app.update(|b| b.start_calibrate_zone(&id));
+                app.follow_calibration(&w);
+            });
+        });
+        let w = weak.clone();
+        main.on_zone_use_target_requested(move |member| {
+            with_app(&w, |app| app.update(|b| b.use_target_instead(&member)))
+        });
+        let w = weak.clone();
+        main.on_new_zone_requested(move || with_app(&w, App::ask_new_zone));
+        let w = weak.clone();
+        main.on_preset_recall_requested(move |id| with_app(&w, |app| app.recall_preset(&id)));
+        let w = weak.clone();
+        main.on_preset_rename_requested(move |id| with_app(&w, |app| app.ask_rename_preset(&id)));
+        let w = weak.clone();
+        main.on_preset_update_requested(move |id| with_app(&w, |app| app.update_preset(&id)));
+        let w = weak.clone();
+        main.on_preset_delete_requested(move |id| with_app(&w, |app| app.delete_preset(&id)));
+        let w = weak.clone();
+        main.on_save_preset_requested(move || with_app(&w, App::ask_save_preset));
+        let w = weak.clone();
+        self.equalizer
+            .on_preset_shortcut(move |n| with_app(&w, |app| app.recall_preset_at(n)));
+        let w = weak.clone();
+        self.help
+            .on_preset_shortcut(move |n| with_app(&w, |app| app.recall_preset_at(n)));
+        let w = weak.clone();
+        self.remote_window
+            .on_preset_shortcut(move |n| with_app(&w, |app| app.recall_preset_at(n)));
+        let w = weak.clone();
+        self.guide
+            .on_preset_shortcut(move |n| with_app(&w, |app| app.recall_preset_at(n)));
+        macro_rules! forward_menu_keys {
+            ($($window:expr),+) => {$(
+                let w = weak.clone();
+                $window.on_help_requested(move || with_app(&w, App::show_help));
+                let w = weak.clone();
+                $window.on_new_zone_requested(move || with_app(&w, App::ask_new_zone));
+                let w = weak.clone();
+                $window.on_refresh_devices(move || {
+                    with_app(&w, |app| app.update(|b| b.refresh_devices()))
+                });
+            )+};
+        }
+        forward_menu_keys!(self.equalizer, self.help, self.remote_window, self.guide);
+        let w = weak.clone();
+        main.on_speaker_move_to_zone_requested(move |id, zone| {
+            with_app(&w, |app| app.move_to_zone(&id, &zone))
+        });
+        let w = weak.clone();
+        main.on_speaker_new_zone_requested(move |id| {
+            with_app(&w, |app| app.ask_new_zone_with(&id))
+        });
+        let w = weak.clone();
+        main.on_speaker_remove_from_zone_requested(move |id| {
+            with_app(&w, |app| app.update(|b| b.remove_from_zone(&id)))
+        });
+        let w = weak.clone();
+        main.on_speaker_only_this_requested(move |id| {
+            with_app(&w, |app| app.update(|b| b.only_this_speaker(&id)))
+        });
+        let w = weak.clone();
+        main.on_refresh_devices(move || with_app(&w, |app| app.update(|b| b.refresh_devices())));
+        let w = weak.clone();
+        main.on_show_virtual_devices_toggled(move |on| {
+            with_app(&w, |app| app.show_virtual_devices(on))
+        });
+        let w = weak.clone();
+        main.on_appearance_chosen(move |choice| with_app(&w, |app| app.choose_appearance(choice)));
+        let w = weak.clone();
+        main.on_notice_dismissed(move |id| close_main_notices(&w, Some(id as u64)));
+        let w = weak.clone();
+        main.on_notices_dismissed_all(move || close_main_notices(&w, None));
+        let w = weak.clone();
+        main.on_launch_at_login_toggled(move |on| with_app(&w, |app| app.set_launch_at_login(on)));
+        let w = weak.clone();
+        main.on_check_updates_automatically_toggled(move |on| {
+            with_app(&w, |app| app.set_check_updates_automatically(on))
+        });
+        let w = weak.clone();
+        main.on_volume_keys_toggled(move |on| with_app(&w, |app| app.set_volume_keys(on)));
+        let w = weak.clone();
+        main.on_check_for_updates_requested(move || with_app(&w, App::check_for_updates));
+        let w = weak.clone();
+        main.on_notice_update_button_pressed(move |button| {
+            with_app(&w, |app| app.press_update_button(button))
+        });
+        let w = weak.clone();
+        main.on_notice_guide_requested(move |id| with_app(&w, |app| app.show_guide(id)));
+        let w = weak.clone();
+        main.on_notice_retry_requested(move |_| {
+            with_app(&w, |app| app.update(|b| b.retry_airplay()))
+        });
+        let w = weak.clone();
+        main.on_notice_privacy_requested(move |_| with_app(&w, App::open_microphone_privacy));
+        let w = weak.clone();
+        main.on_notice_focus_changed(move |id, focused| {
+            with_app(&w, |app| {
+                note_focus(&mut app.main_focus.borrow_mut().notice, id, focused);
+            });
+            apply_rename_left(&w);
+        });
+        let w = weak.clone();
+        main.on_dismiss_all_focus_changed(move |focused| {
+            with_app(&w, |app| {
+                app.main_focus.borrow_mut().dismiss_all = focused;
+            });
+            apply_rename_left(&w);
+        });
+        let w = weak.clone();
+        main.on_speaker_focus_changed(move |id, part| {
+            with_app(&w, |app| {
+                note_row_focus(&mut app.main_focus.borrow_mut().speaker, id, part);
+            });
+            apply_rename_left(&w);
+        });
+        let w = weak.clone();
+        main.on_zone_focus_changed(move |id, part| {
+            with_app(&w, |app| {
+                note_row_focus(&mut app.main_focus.borrow_mut().zone, id, part);
+            });
+            apply_rename_left(&w);
+        });
+        let w = weak.clone();
+        main.on_in_zones_focus_changed(move |id, part| {
+            with_app(&w, |app| {
+                note_row_focus(&mut app.main_focus.borrow_mut().in_zones, id, part);
+            });
+            apply_rename_left(&w);
+        });
+        let w = weak.clone();
+        main.on_control_focus_changed(move |control, focused| {
+            with_app(&w, |app| {
+                note_focus(&mut app.main_focus.borrow_mut().control, control, focused);
+            });
+            apply_rename_left(&w);
+        });
+        let w = weak.clone();
+        main.on_close_requested(move || with_app(&w, App::close_main));
+        main.on_exit_requested(|| {
+            let _ = slint::quit_event_loop();
+        });
+        // Ctrl+Q quits from the windows without a menu bar too, as
+        // Command-Q does from any window on the Mac.
+        let quit = || {
+            let _ = slint::quit_event_loop();
+        };
+        self.equalizer.on_exit_requested(quit);
+        self.help.on_exit_requested(quit);
+        self.guide.on_exit_requested(quit);
+        self.about.on_exit_requested(quit);
+        self.remote_window.on_exit_requested(quit);
+        let w = weak.clone();
+        main.on_about_requested(move || {
+            with_app(&w, |app| {
+                if let Err(error) = app.about.show() {
+                    app.show_window_error(&error);
+                    return;
+                }
+                app.about.invoke_take_focus();
+            })
+        });
+        let w = weak;
+        main.window().on_close_requested(move || {
+            with_app(&w, App::close_main);
+            slint::CloseRequestResponse::HideWindow
+        });
+
+        let about = self.about.as_weak();
+        self.about.on_closed(move || {
+            if let Some(about) = about.upgrade() {
+                // A window that fails to hide stays open; the user can still close it.
+                let _ = about.hide();
+            }
+        });
+    }
+
+    fn connect_flyout(self: &Rc<Self>) {
+        let flyout = &self.flyout;
+        let weak = Rc::downgrade(self);
+
+        let w = weak.clone();
+        flyout.on_power_toggled(move |on| with_app(&w, |app| app.update(|b| b.set_running(on))));
+        let w = weak.clone();
+        flyout.on_source_selected(move |index| with_app(&w, |app| app.select_source(index)));
+        let w = weak.clone();
+        flyout.on_several_apps_requested(move || {
+            with_app(&w, |app| {
+                app.hide_flyout();
+                app.show_main();
+                app.main.set_mix_open(true);
+            })
+        });
+        let w = weak.clone();
+        flyout.on_input_pair_selected(move |index| {
+            with_app(&w, |app| app.select_input_pair(index));
+        });
+        let w = weak.clone();
+        flyout.on_master_volume_changed(move |volume| {
+            with_app(&w, |app| app.move_master_volume(volume))
+        });
+        let w = weak.clone();
+        flyout.on_master_mute_toggled(move || with_app(&w, App::toggle_master_mute));
+        let w = weak.clone();
+        flyout.on_speaker_toggled(move |id| with_app(&w, |app| app.toggle_speaker(&id)));
+        let w = weak.clone();
+        flyout.on_zone_toggled(move |id| with_app(&w, |app| app.update(|b| b.toggle_zone(&id))));
+        let w = weak.clone();
+        flyout.on_zone_expanded_changed(move |id, open| {
+            with_app(&w, |app| app.set_zone_expanded(&id, open, true))
+        });
+        let w = weak.clone();
+        flyout.on_preset_recall_requested(move |id| with_app(&w, |app| app.recall_preset(&id)));
+        let w = weak.clone();
+        flyout.on_preset_shortcut(move |n| with_app(&w, |app| app.recall_preset_at(n)));
+        let w = weak.clone();
+        flyout.on_notice_dismissed(move |id| with_app(&w, |app| app.dismiss_notice(id as u64)));
+        let w = weak.clone();
+        flyout.on_notices_dismissed_all(move || with_app(&w, App::dismiss_all_notices));
+        let w = weak.clone();
+        flyout.on_notice_guide_requested(move |id| {
+            with_app(&w, |app| {
+                app.hide_flyout();
+                app.show_guide(id);
+            })
+        });
+        let w = weak.clone();
+        flyout.on_notice_retry_requested(move |_| {
+            with_app(&w, |app| app.update(|b| b.retry_airplay()))
+        });
+        let w = weak.clone();
+        flyout.on_notice_privacy_requested(move |_| with_app(&w, App::open_microphone_privacy));
+        let w = weak.clone();
+        flyout.on_network_settings_requested(move || with_app(&w, App::open_network_settings));
+        let w = weak.clone();
+        flyout.on_notice_update_button_pressed(move |button| {
+            with_app(&w, |app| app.press_update_button(button))
+        });
+        let w = weak.clone();
+        flyout.on_cast_add_address_requested(move || {
+            with_app(&w, |app| {
+                app.hide_flyout();
+                app.main.invoke_cast_add_address_requested();
+            })
+        });
+        let w = weak.clone();
+        flyout.on_open_app(move || {
+            with_app(&w, |app| {
+                app.hide_flyout();
+                app.show_main();
+            })
+        });
+        flyout.on_exit_app(|| {
+            let _ = slint::quit_event_loop();
+        });
+        let w = weak;
+        flyout.on_close_requested(move || with_app(&w, App::hide_flyout));
+    }
+
+    fn connect_equalizer(self: &Rc<Self>) {
+        self.follow_frame(|app| app.equalizer.window(), "equalizer");
+        let eq_window = &self.equalizer;
+        let weak = Rc::downgrade(self);
+        eq_window
+            .global::<NameField>()
+            .set_double_click(crate::platform::double_click_ms());
+
+        let w = weak.clone();
+        eq_window.on_enabled_toggled(move |on| {
+            with_app(&w, |app| app.change_equalizer(|s| s.enabled = on))
+        });
+        let w = weak.clone();
+        eq_window.on_preamp_changed(move |db| {
+            with_app(&w, |app| app.change_equalizer(|s| s.preamp_db = db.into()))
+        });
+        let w = weak.clone();
+        eq_window.on_gain_changed(move |band, db| {
+            with_app(&w, |app| {
+                app.change_equalizer(|s| {
+                    if let Some(gain) = usize::try_from(band)
+                        .ok()
+                        .and_then(|b| s.gains_db.get_mut(b))
+                    {
+                        *gain = db.into();
+                    }
+                });
+                app.forget_curve_left();
+            })
+        });
+        let w = weak.clone();
+        eq_window.on_preset_selected(move |index| {
+            with_app(&w, |app| {
+                let curves = app.snapshot().equalizer_curves;
+                let picked = ui_model::picked_curve(index, curves.len());
+                let gains_db = match picked {
+                    Some(CurveMatch::Preset(i)) => eq::PRESETS[i].gains_db,
+                    Some(CurveMatch::User(i)) => curves[i].gains_db,
+                    None => return,
+                };
+                app.ui.borrow_mut().chosen_curve = picked;
+                // Like the Mac: picking a curve turns the equalizer on.
+                app.change_equalizer(|s| {
+                    s.gains_db = gains_db;
+                    s.enabled = true;
+                });
+            })
+        });
+        let w = weak.clone();
+        eq_window.on_save_curve(move || with_app(&w, App::ask_save_curve));
+        let w = weak.clone();
+        eq_window.on_rename_curve(move || with_app(&w, App::ask_rename_curve));
+        let w = weak.clone();
+        eq_window.on_delete_curve(move || {
+            with_app(&w, |app| {
+                // A disabled button that kept the keyboard focus still clicks.
+                if app.dialog_already_open() {
+                    return;
+                }
+                let state = app.snapshot();
+                if let Some(CurveMatch::User(index)) = app.shown_curve(&state) {
+                    let mut curves = state.equalizer_curves;
+                    eq::delete_curve(&mut curves, index);
+                    app.ui.borrow_mut().chosen_curve = None;
+                    app.update(|b| b.set_equalizer_curves(curves));
+                }
+            })
+        });
+        let w = weak.clone();
+        eq_window.on_reset(move || {
+            with_app(&w, |app| {
+                // Preset 0 is Flat: Reset reads Flat even beside a saved flat curve.
+                app.ui.borrow_mut().chosen_curve = Some(CurveMatch::Preset(0));
+                app.change_equalizer(EqSettings::reset);
+            })
+        });
+        let w = weak;
+        eq_window.on_close_requested(move || {
+            with_app(&w, |app| {
+                let _ = app.equalizer.hide();
+            })
+        });
+    }
+
+    fn connect_dialogs(self: &Rc<Self>) {
+        self.follow_dialog_frame(|app| app.zone_dialog.window(), "zone name dialog");
+        self.follow_dialog_frame(|app| app.about.window(), "about dialog");
+        let weak = Rc::downgrade(self);
+        let w = weak.clone();
+        self.zone_dialog
+            .on_confirmed(move |name| with_app(&w, |app| app.confirm_dialog(&name)));
+        let w = weak.clone();
+        self.zone_dialog
+            .on_cancelled(move || with_app(&w, App::hide_dialog));
+        let w = weak.clone();
+        self.zone_dialog.window().on_close_requested(move || {
+            with_app(&w, |app| app.equalizer.set_name_dialog_open(false));
+            slint::CloseRequestResponse::HideWindow
+        });
+
+        self.follow_dialog_frame(|app| app.pin_dialog.window(), "PIN dialog");
+        let dialog = self.pin_dialog.as_weak();
+        self.pin_dialog.on_pin_edited(move |text| {
+            if let Some(dialog) = dialog.upgrade() {
+                let digits = pin_digits(&text);
+                if digits != text.as_str() {
+                    dialog.set_pin(digits.into());
+                }
+            }
+        });
+        let w = weak.clone();
+        self.pin_dialog
+            .on_confirmed(move |pin| with_app(&w, |app| app.confirm_pin(&pin)));
+        let w = weak.clone();
+        self.pin_dialog
+            .on_cancelled(move || with_app(&w, App::cancel_pin));
+        let w = weak;
+        self.pin_dialog.window().on_close_requested(move || {
+            with_app(&w, App::cancel_pin);
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    /// Opens, updates or closes the PIN dialog for the pairing that asks for
+    /// a PIN. It opens when the Apple TV first shows a PIN, stays open while
+    /// that pairing runs (a wrong PIN clears the field for the new one), and
+    /// closes when it ends.
+    fn show_pin_prompt(&self, prompt: Option<&PinPrompt>, every_time: bool) {
+        if self.pin_preview.get() {
+            return;
+        }
+        let dialog = &self.pin_dialog;
+        let Some(prompt) = prompt else {
+            if self.pin_for.borrow_mut().take().is_some() {
+                let _ = dialog.hide();
+                self.log.log(|| "PIN dialog: closed".to_owned());
+            }
+            return;
+        };
+        let opening = self.pin_for.borrow().as_deref() != Some(prompt.speaker_id.as_str());
+        let phase = pin_phase(prompt.phase);
+        let new_code = (prompt.wrong_pin && !dialog.get_wrong_pin())
+            || (phase == PinPhase::Ready && dialog.get_phase() != PinPhase::Ready);
+        dialog.set_speaker(prompt.name.as_str().into());
+        dialog.set_phase(phase);
+        dialog.set_wrong_pin(prompt.wrong_pin);
+        dialog.set_every_time(every_time);
+        if opening {
+            *self.pin_for.borrow_mut() = Some(prompt.speaker_id.clone());
+            dialog.set_pin(SharedString::new());
+            self.open_pin_dialog();
+            self.log
+                .log(|| format!("PIN dialog: opened for {}", prompt.name));
+        } else if new_code {
+            if prompt.wrong_pin {
+                dialog.set_pin(SharedString::new());
+            }
+            dialog.invoke_prepare();
+            self.fit_pin_dialog();
+        }
+    }
+
+    fn open_pin_dialog(&self) {
+        if let Err(error) = self.pin_dialog.show() {
+            self.show_window_error(&error);
+            return;
+        }
+        self.pin_dialog.invoke_prepare();
+        self.fit_pin_dialog();
+        crate::platform::bring_to_front(self.pin_dialog.window());
+    }
+
+    /// Grows the PIN dialog to its layout's lowest height at its width. The
+    /// window is made at the height the layout has before the message wraps,
+    /// and Windows doesn't grow it when the message gets longer (a wrong PIN).
+    fn fit_pin_dialog(&self) {
+        grow_to_fit(self.pin_dialog.window(), self.pin_dialog.get_fit_height());
+    }
+
+    /// Pair: the PIN goes to the pairing; the dialog stays open until it
+    /// ends.
+    fn confirm_pin(&self, pin: &str) {
+        if self.pin_preview.get() {
+            self.close_pin_preview();
+            return;
+        }
+        let id = self.pin_for.borrow().clone();
+        if let Some(id) = id {
+            self.update(|b| b.submit_pin(&id, pin));
+        }
+    }
+
+    /// Cancel, Escape or the close button: the pairing stops.
+    fn cancel_pin(&self) {
+        if self.pin_preview.get() {
+            self.close_pin_preview();
+            return;
+        }
+        let id = self.pin_for.borrow_mut().take();
+        let _ = self.pin_dialog.hide();
+        if let Some(id) = id {
+            self.update(|b| b.cancel_pairing(&id));
+        }
+    }
+
+    fn close_pin_preview(&self) {
+        self.pin_preview.set(false);
+        let _ = self.pin_dialog.hide();
+    }
+
+    /// Opens the PIN dialog for a made-up Apple TV, to look at it without
+    /// one: the PIN preview, debug only. `wrong`: as after a wrong PIN.
+    pub fn preview_pin(&self, wrong: bool) {
+        self.pin_preview.set(true);
+        let dialog = &self.pin_dialog;
+        dialog.set_speaker(self.strings().get_pin_preview_speaker());
+        dialog.set_phase(PinPhase::Ready);
+        dialog.set_wrong_pin(wrong);
+        dialog.set_pin(SharedString::new());
+        self.open_pin_dialog();
+    }
+
+    fn connect_guide(self: &Rc<Self>) {
+        self.follow_frame(|app| app.guide.window(), "guide");
+        let weak = Rc::downgrade(self);
+        let w = weak.clone();
+        self.guide
+            .on_page_requested(move |page| with_app(&w, |app| app.open_guide_page(page)));
+        let w = weak.clone();
+        self.guide
+            .on_close_requested(move || with_app(&w, App::close_guide));
+        let w = weak;
+        self.guide.window().on_close_requested(move || {
+            with_app(&w, App::close_guide);
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    fn close_guide(&self) {
+        self.guide_follows_notice.set(false);
+        let _ = self.guide.hide();
+    }
+
+    /// Opens the microphone privacy settings for the notice or the
+    /// calibration that asks.
+    fn open_microphone_privacy(&self) {
+        let uri = SettingsPage::MicrophonePrivacy.uri();
+        if !crate::platform::open_settings(uri) {
+            self.log
+                .log(|| format!("notice: the shell did not open {uri}"));
+        }
+    }
+
+    /// Opens the network settings for the note that no speakers were found.
+    fn open_network_settings(&self) {
+        let uri = SettingsPage::NetworkStatus.uri();
+        if !crate::platform::open_settings(uri) {
+            self.log
+                .log(|| format!("no speakers found: the shell did not open {uri}"));
+        }
+    }
+
+    /// Opens the Settings page a guide button asks for; only the pages the
+    /// guide names, nothing else. When the shell doesn't take it, the guide
+    /// says where to find the page.
+    fn open_guide_page(&self, page: GuidePage) {
+        let Some(page) = settings_page(page) else {
+            return;
+        };
+        let opened = crate::platform::open_settings(page.uri());
+        if !opened {
+            self.log
+                .log(|| format!("guide: the shell did not open {}", page.uri()));
+        }
+        self.guide.set_settings_failed(!opened);
+    }
+
+    /// Keeps an open guide in step with the double-audio notice it was
+    /// opened from: updated while that notice changes, closed once it is
+    /// gone (the app quit, streaming stopped, the routing was fixed).
+    fn refresh_guide(&self, state: &AppState) {
+        if !self.guide_follows_notice.get() {
+            return;
+        }
+        match guide::current(&state.notices) {
+            Some(guide) => self.fill_guide(&guide),
+            None => {
+                self.log
+                    .log(|| "guide: closed, its notice is gone".to_owned());
+                self.close_guide();
+            }
+        }
+    }
+
+    /// Shows `guide` in the guide window, row by row so a focused button
+    /// keeps its focus.
+    fn fill_guide(&self, guide: &Guide) {
+        let strings = self.strings();
+        self.guide.set_intro(guide_intro(&strings, guide));
+        let items: Vec<GuideStepItem> = guide
+            .steps
+            .iter()
+            .map(|step| GuideStepItem {
+                text: guide_step_text(&strings, step),
+                page: guide_page(step.page()),
+            })
+            .collect();
+        sync_model(&self.guide_steps, items);
+    }
+
+    /// Opens the guide of notice `id`, if it is still there and has one.
+    fn show_guide(&self, id: i32) {
+        let state = self.snapshot();
+        let Some(notice) = state
+            .notices
+            .iter()
+            .find(|notice| i32::try_from(notice.id).ok() == Some(id))
+        else {
+            return;
+        };
+        if self.show_guide_for(&notice.message) {
+            self.guide_follows_notice.set(true);
+        }
+    }
+
+    /// Opens the guide for a notice saying `message`, if it has one, and
+    /// brings it to the front. Returns whether it opened. A guide opened
+    /// this way stays as it is; one opened from a notice follows it.
+    pub fn show_guide_for(&self, message: &NoticeMessage) -> bool {
+        let Some(guide) = guide::guide(message) else {
+            return false;
+        };
+        self.guide_follows_notice.set(false);
+        self.fill_guide(&guide);
+        self.guide.set_settings_failed(false);
+        if let Err(error) = self.guide.show() {
+            self.show_window_error(&error);
+            return false;
+        }
+        self.guide.invoke_take_focus();
+        crate::platform::bring_to_front(self.guide.window());
+        true
+    }
+
+    fn toggle_mix_app(&self, index: i32) {
+        let state = self.snapshot();
+        if let Some(app) = usize::try_from(index)
+            .ok()
+            .and_then(|i| state.mix_apps.get(i))
+        {
+            self.update(|b| b.toggle_mix_app(&app.id));
+        }
+    }
+
+    fn select_source(&self, index: i32) {
+        let state = self.snapshot();
+        if let Some(source) = usize::try_from(index)
+            .ok()
+            .and_then(|i| state.sources.get(i))
+        {
+            self.update(|b| b.select_source(&source.id));
+        }
+    }
+
+    /// `index` is the pair's place in the list, which is its stored index.
+    fn select_input_pair(&self, index: i32) {
+        if let Ok(pair) = u16::try_from(index) {
+            self.update(|b| b.select_input_pair(pair));
+        }
+    }
+
+    fn toggle_speaker(&self, id: &str) {
+        let state = self.snapshot();
+        if let Some(speaker) = state.speaker(id) {
+            let on = state.row_click_turns_on(speaker);
+            self.update(|b| b.set_speaker_enabled(id, on));
+        }
+    }
+
+    /// Opens or closes a speaker's sync controls (its delay button, or a
+    /// click on its row). What was typed in the other delay fields applies
+    /// first, their controls staying open; closing applies its own typing.
+    /// A click on the window's blank space, or on the row being renamed.
+    fn blank_click(&self) {
+        self.end_rename(true);
+        self.end_delay_typing(true);
+    }
+
+    fn toggle_sync(&self, id: &str) {
+        let renaming_it = matches!(&self.ui.borrow().rename, Some((open, _)) if open == id);
+        if renaming_it {
+            self.blank_click();
+            return;
+        }
+        self.end_rename(true);
+        self.apply_delay_typing(Some(id));
+        let closed = {
+            let mut ui = self.ui.borrow_mut();
+            let closed = ui.sync_open.remove(id);
+            if !closed {
+                ui.sync_open.insert(id.to_string());
+                ui.delay_drafts.remove(id);
+            }
+            closed
+        };
+        if closed {
+            self.commit_delay(id);
+        } else {
+            self.refresh();
+        }
+    }
+
+    fn has_updater(&self) -> bool {
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        return self.updater.borrow().is_some();
+        #[cfg(not(any(windows, all(target_os = "linux", not(test)))))]
+        return false;
+    }
+
+    fn updater_notice(&self) -> Option<ui_model::Notice> {
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        return self.updater.borrow().as_ref().and_then(|updater| {
+            updater.notice().map(|notice| ui_model::Notice {
+                id: UPDATER_NOTICE_ID,
+                subject: "update".to_owned(),
+                message: NoticeMessage::Update(notice.clone()),
+                time: updater.notice_time().to_owned(),
+                post: updater.notice_post(),
+            })
+        });
+        #[cfg(not(any(windows, all(target_os = "linux", not(test)))))]
+        return None;
+    }
+
+    fn dismiss_updater_notice(&self, id: u64) -> bool {
+        if id != UPDATER_NOTICE_ID {
+            return false;
+        }
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        if let Some(updater) = self.updater.borrow_mut().as_mut() {
+            updater.dismiss();
+            return true;
+        }
+        false
+    }
+
+    /// The launch check (spec S305), once the saved settings are in.
+    fn launch_update_check(&self) {
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        {
+            let (automatic, last, record) = {
+                let ui = self.ui.borrow();
+                (
+                    ui.check_updates_automatically,
+                    ui.last_update_check,
+                    ui.update_record.clone(),
+                )
+            };
+            if let Some(updater) = self.updater.borrow_mut().as_mut() {
+                updater.set_record(record);
+                updater.launch_check(automatic, last, unix_now());
+            }
+        }
+    }
+
+    /// The updater's record of a version that didn't install (spec S316),
+    /// into the settings.
+    #[cfg(any(windows, all(target_os = "linux", not(test))))]
+    fn keep_update_record(&self) {
+        let record = match self.updater.borrow().as_ref() {
+            Some(updater) => updater.record().cloned(),
+            None => return,
+        };
+        self.ui.borrow_mut().update_record = record;
+        self.remember_view();
+    }
+
+    /// At quit, before the settings are saved: after a swap whose exe
+    /// Windows security removed, the old one comes back (spec S315).
+    pub fn updater_at_exit(&self) {
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        {
+            let changed = match self.updater.borrow_mut().as_mut() {
+                Some(updater) => updater.at_quit(),
+                None => return,
+            };
+            if changed {
+                self.keep_update_record();
+            }
+        }
+    }
+
+    /// Once the event loop has ended.
+    pub fn at_quit(&self) {
+        // The updater's step can wait 2 s, long enough for a phone to pair
+        // and get commands accepted that would never apply.
+        self.stop_remote_at_exit();
+        self.updater_at_exit();
+        // Changes since the last poll, and where the main window is.
+        self.save_settings();
+    }
+
+    /// When Windows ends the session or Linux sends an exit signal, which
+    /// ends the process before the event loop does. Returns whether no
+    /// change is left unsaved.
+    pub fn at_session_end(&self) -> bool {
+        self.stop_remote_at_exit();
+        self.updater_at_exit();
+        let saved = self.save_settings();
+        self.backend.borrow_mut().shut_down();
+        saved
+    }
+
+    /// Takes the updater worker's news; a check that read the appcast
+    /// stores its time. Then starts the daily check when due (spec S305).
+    fn poll_updater(&self) {
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        {
+            let polled = match self.updater.borrow_mut().as_mut() {
+                Some(updater) => updater.poll(),
+                None => return,
+            };
+            if polled.checked {
+                self.ui.borrow_mut().last_update_check = Some(unix_now());
+                self.remember_view();
+            }
+            if polled.record_changed {
+                self.keep_update_record();
+            }
+            if polled.quit {
+                // The quit path stops streaming and saves the settings.
+                let _ = slint::quit_event_loop();
+            }
+            if polled.changed {
+                self.refresh();
+            }
+            let (automatic, last) = {
+                let ui = self.ui.borrow();
+                (ui.check_updates_automatically, ui.last_update_check)
+            };
+            if let Some(updater) = self.updater.borrow_mut().as_mut() {
+                updater.periodic_check(automatic, last, unix_now());
+            }
+        }
+    }
+
+    /// Speakers > Volume Keys Control AudioSync (spec S429).
+    fn set_volume_keys(&self, on: bool) {
+        self.ui.borrow_mut().volume_keys = on;
+        self.log.log(|| {
+            format!(
+                "volume keys: Volume Keys Control AudioSync turned {}",
+                if on { "on" } else { "off" }
+            )
+        });
+        self.remember_view();
+        self.refresh();
+    }
+
+    /// Takes the volume keys from the system while `taken`, and gives them
+    /// back at once otherwise (spec S429).
+    fn take_volume_keys(&self, taken: bool) {
+        #[cfg(all(windows, not(test)))]
+        {
+            let mut hook = self.volume_key_hook.borrow_mut();
+            if !taken {
+                *hook = None;
+            } else if hook.is_none() {
+                *hook = crate::volume_keys::KeyHook::start(deliver_volume_key, self.log.clone());
+            }
+        }
+        #[cfg(not(all(windows, not(test))))]
+        let _ = taken;
+    }
+
+    /// A volume key the hook took: the master moves (spec S429) and the
+    /// level pop-up shows where it is.
+    #[cfg_attr(
+        all(not(windows), not(test)),
+        expect(dead_code, reason = "only the Windows keyboard hook takes the keys")
+    )]
+    fn volume_key(&self, key: VolumeKey) {
+        let master = self.snapshot().master_volume;
+        let level = volume_keys::master_after(key, master, self.unmute_to.get());
+        self.update(|b| b.set_master_volume(level));
+        #[cfg(all(windows, not(test)))]
+        crate::volume_keys::show_level(
+            level,
+            self.shows_dark(),
+            &self.main.global::<Strings>().get_volume_popup_name(),
+            &self
+                .main
+                .global::<Strings>()
+                .invoke_volume_popup_announcement(level.round() as i32),
+            crate::platform::animation_effects(),
+        );
+    }
+
+    fn set_check_updates_automatically(&self, on: bool) {
+        self.ui.borrow_mut().check_updates_automatically = on;
+        self.log.log(|| {
+            format!(
+                "updater: check for updates automatically turned {}",
+                if on { "on" } else { "off" }
+            )
+        });
+        self.remember_view();
+        self.refresh();
+    }
+
+    /// Help > Check for Updates…, whatever the switch and the time say.
+    fn check_for_updates(&self) {
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        if let Some(updater) = self.updater.borrow_mut().as_mut() {
+            updater.check(crate::updater::Trigger::Manual);
+        }
+        self.refresh();
+    }
+
+    fn press_update_button(&self, button: UpdateButton) {
+        #[cfg(any(windows, all(target_os = "linux", not(test))))]
+        {
+            use crate::updater::{Action, UpdaterButton};
+            let button = match button {
+                UpdateButton::Download => UpdaterButton::Download,
+                UpdateButton::NotNow => UpdaterButton::NotNow,
+                UpdateButton::SkipThisVersion => UpdaterButton::SkipThisVersion,
+                UpdateButton::Cancel => UpdaterButton::Cancel,
+                UpdateButton::TryAgain => UpdaterButton::TryAgain,
+                UpdateButton::OpenReleasePage => UpdaterButton::OpenReleasePage,
+                UpdateButton::RestartNow => UpdaterButton::RestartNow,
+            };
+            let action = match self.updater.borrow_mut().as_mut() {
+                Some(updater) => updater.press(button),
+                None => return,
+            };
+            if button == UpdaterButton::SkipThisVersion {
+                self.keep_update_record();
+            }
+            match action {
+                Action::Nothing => {}
+                Action::OpenReleasePage => {
+                    if !crate::platform::open_settings(crate::updater::RELEASE_PAGE) {
+                        self.log
+                            .log(|| "updater: the release page didn't open".to_owned());
+                    }
+                }
+            }
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", not(test)))))]
+        let _ = button;
+        self.refresh();
+    }
+
+    fn show_virtual_devices(&self, on: bool) {
+        {
+            let mut ui = self.ui.borrow_mut();
+            if ui.show_virtual != on {
+                ui.listed_virtual.forget();
+            }
+            ui.show_virtual = on;
+        }
+        self.remember_view();
+        self.refresh();
+    }
+
+    /// How the main window shows now, with its place and size.
+    fn main_window_shows(&self) -> MainWindowShows {
+        let window = self.main.window();
+        if !window.is_visible() || window.is_minimized() {
+            return MainWindowShows::Not;
+        }
+        let position = window.position();
+        let size = window.size().to_logical(window.scale_factor());
+        let frame = WindowFrame {
+            x: position.x,
+            y: position.y,
+            width: f64::from(size.width),
+            height: f64::from(size.height),
+            maximized: false,
+        };
+        if window.is_maximized() {
+            MainWindowShows::Maximized(frame)
+        } else {
+            MainWindowShows::Normal(frame)
+        }
+    }
+
+    /// Hands the windows' own settings to the backend, which saves them with
+    /// the rest: View > Show Virtual Devices, View > Appearance, and the main
+    /// window's frame (see [`ui_model::frame_to_keep`]).
+    fn remember_view(&self) {
+        let mut backend = self.backend.borrow_mut();
+        let saved = backend.view_settings();
+        let settings = ViewSettings {
+            show_virtual_devices: self.ui.borrow().show_virtual,
+            appearance: self.ui.borrow().appearance,
+            window: ui_model::frame_to_keep(self.main_window_shows(), saved.window),
+            remote: self.ui.borrow().remote,
+            check_updates_automatically: self.ui.borrow().check_updates_automatically,
+            volume_keys: self.ui.borrow().volume_keys,
+            last_update_check: self.ui.borrow().last_update_check,
+            update_record: self.ui.borrow().update_record.clone(),
+        };
+        if settings != saved {
+            backend.set_view_settings(settings);
+        }
+    }
+
+    /// Shows the windows with the settings saved last time: View > Show
+    /// Virtual Devices, View > Appearance, and the main window's size and
+    /// place, fitted to the monitor it opens on (the one at its saved place,
+    /// else the primary one, where it opens centered), maximized when it was.
+    /// Without `with_frame` the main window keeps its size and place.
+    fn restore_view(&self, with_frame: bool) {
+        let saved = self.backend.borrow().view_settings();
+        self.ui.borrow_mut().show_virtual = saved.show_virtual_devices;
+        self.ui.borrow_mut().appearance = saved.appearance;
+        self.ui.borrow_mut().remote = saved.remote;
+        self.ui.borrow_mut().check_updates_automatically = saved.check_updates_automatically;
+        self.ui.borrow_mut().volume_keys = saved.volume_keys;
+        self.ui.borrow_mut().last_update_check = saved.last_update_check;
+        self.ui.borrow_mut().update_record = saved.update_record.clone();
+        self.apply_appearance(saved.appearance);
+        let (true, Some(saved_frame)) = (with_frame, saved.window) else {
+            return;
+        };
+        let on_a_monitor = crate::platform::is_on_a_monitor(saved_frame.x, saved_frame.y);
+        // The primary monitor holds the point (0, 0).
+        let (x, y) = if on_a_monitor {
+            (saved_frame.x, saved_frame.y)
+        } else {
+            (0, 0)
+        };
+        let monitor = crate::platform::monitor_at(f64::from(x), f64::from(y));
+        let frame = monitor.map_or(saved_frame, |(work_area, scale)| {
+            fitted_main_frame(saved_frame, work_area, scale, on_a_monitor)
+        });
+        let window = self.main.window();
+        let size = slint::LogicalSize::new(frame.width as f32, frame.height as f32);
+        window.set_size(size);
+        // The native menu bar is attached when the native window is created
+        // and takes its height out of a size set before that, so the window
+        // would shrink by the menu bar at every restart: set the size again
+        // once the native window exists (and maximize it after that).
+        set_size_once_native(
+            self.main.as_weak(),
+            size,
+            frame.maximized,
+            NATIVE_WINDOW_TRIES,
+        );
+        if on_a_monitor || monitor.is_some() {
+            window.set_position(slint::PhysicalPosition::new(frame.x, frame.y));
+        }
+        let maximized = if frame.maximized { ", maximized" } else { "" };
+        if frame == saved_frame {
+            self.log.log(|| {
+                format!(
+                    "main window: {} x {} as last time{maximized}",
+                    frame.width, frame.height
+                )
+            });
+        } else {
+            self.log.log(|| {
+                format!(
+                    "main window: {} x {}, fitted to the monitor (saved {} x {}){maximized}",
+                    frame.width, frame.height, saved_frame.width, saved_frame.height
+                )
+            });
+        }
+    }
+
+    /// Saves the settings now, with the main window's frame: the app is
+    /// about to quit. Returns whether no change is left unsaved.
+    pub fn save_settings(&self) -> bool {
+        // Quit drops a typed delay that wasn't applied and applies an open
+        // rename, so a focus loss as the window goes applies nothing more.
+        let rename = {
+            let mut ui = self.ui.borrow_mut();
+            ui.delay_drafts.clear();
+            ui.airplay_delay_draft.cancel();
+            ui.rename.take().map(|open| (open, ui.rename_place))
+        };
+        match rename {
+            Some(((id, text), RenamePlace::Zone)) => {
+                self.backend.borrow_mut().rename_zone(&id, &text)
+            }
+            Some(((id, text), _)) => self.backend.borrow_mut().rename_speaker(&id, &text),
+            None => {}
+        }
+        self.remember_view();
+        self.backend.borrow_mut().save_settings()
+    }
+
+    fn step_delay(&self, id: &str, delta: i32) {
+        let state = self.snapshot();
+        let Some(speaker) = state.speaker(id) else {
+            return;
+        };
+        let Some(current) = speaker.delay_ms else {
+            return;
+        };
+        let typed = self.ui.borrow_mut().delay_drafts.remove(id);
+        let mut base = typed
+            .as_ref()
+            .and_then(|typed| typed.text(Some(current)))
+            .and_then(ui_model::parse_delay_ms)
+            .unwrap_or(current);
+        if speaker.kind == ui_model::SpeakerKind::Cast {
+            // A Cast offset can't go below 0, so the step starts from there.
+            base = base.max(0.0);
+        }
+        self.update(|b| b.set_speaker_delay(id, base + f64::from(delta)));
+        if self.snapshot().speaker(id).and_then(|s| s.delay_ms) != Some(current) {
+            self.say_delay_set(id);
+        }
+    }
+
+    /// Keeps what is typed in a speaker's delay field ("+150", "−250");
+    /// nothing applies until Enter, its delay button or a click outside
+    /// every control (see [`TypedDelay`]).
+    fn edit_delay(&self, id: &str, text: &str) {
+        let shown = self.snapshot().speaker(id).and_then(|s| s.delay_ms);
+        let taken = self
+            .ui
+            .borrow_mut()
+            .delay_drafts
+            .entry(id.to_string())
+            .or_insert_with(|| TypedDelay {
+                survives: true,
+                ..TypedDelay::default()
+            })
+            .edit(text, shown);
+        self.refresh();
+        if !taken {
+            self.announce(self.strings().get_delay_field_takes());
+        }
+    }
+
+    /// Enter in a speaker's delay field: applies what was typed and
+    /// keeps its sync controls open, the focus in the field, to try the next
+    /// value; other rows' stay open with their typing.
+    fn enter_delay(&self, id: &str) {
+        if self.commit_delay(id) {
+            self.say_delay_set(id);
+        }
+        self.main.set_focus_speaker_part(RowPart::Sync);
+        self.main.set_focus_speaker_id(id.into());
+    }
+
+    /// Has Narrator say the delay a step or Enter applied, as VoiceOver
+    /// does on the Mac; Ctrl+S and leaving the field stay quiet.
+    fn say_delay_set(&self, id: &str) {
+        let state = self.snapshot();
+        let Some(speaker) = state.speaker(id) else {
+            return;
+        };
+        let Some(ms) = speaker.delay_ms else {
+            return;
+        };
+        let strings = self.strings();
+        let label = strings.invoke_delay_of(speaker.name.as_str().into());
+        let value = strings.invoke_delay_value(ms.round() as i32);
+        self.announce(strings.invoke_delay_set(label, value));
+    }
+
+    /// A click on the window outside every control (`apply`), or Escape in
+    /// a delay field: every typed delay applies, or none does, and every
+    /// sync control closes. Unreadable text applies nothing.
+    fn end_delay_typing(&self, apply: bool) {
+        let idle = {
+            let ui = self.ui.borrow();
+            ui.sync_open.is_empty()
+                && ui.delay_drafts.is_empty()
+                && ui.airplay_delay_draft.draft.is_none()
+        };
+        if idle {
+            return;
+        }
+        let focused = match &self.main_focus.borrow().speaker {
+            Some((id, RowPart::Sync)) => Some(id.clone()),
+            _ => None,
+        };
+        if apply {
+            let typed: Vec<String> = self.ui.borrow().delay_drafts.keys().cloned().collect();
+            for id in typed {
+                self.commit_delay(&id);
+            }
+            self.commit_airplay_delay();
+        }
+        {
+            let mut ui = self.ui.borrow_mut();
+            ui.sync_open.clear();
+            ui.delay_drafts.clear();
+            ui.airplay_delay_draft.cancel();
+        }
+        self.refresh();
+        if let Some(id) = focused {
+            self.focus_delay_button(&id);
+        }
+    }
+
+    /// Rename… in a speaker's or zone's menu, F2, or a double-click on a
+    /// name: that row or zone header shows a name field with the focus. A
+    /// rename open elsewhere applies first; one open in this place keeps its
+    /// typing.
+    fn start_rename(&self, id: &str, place: RenamePlace) {
+        if !self.renaming(id, place) {
+            self.end_rename(true);
+            let state = self.snapshot();
+            let name = match place {
+                RenamePlace::Zone => state
+                    .zones
+                    .iter()
+                    .find(|z| z.id == id)
+                    .map(|z| z.name.clone()),
+                RenamePlace::Row | RenamePlace::InZones => {
+                    state.speaker(id).map(|s| s.name.clone())
+                }
+            };
+            let Some(name) = name else {
+                return;
+            };
+            {
+                let mut ui = self.ui.borrow_mut();
+                ui.rename = Some((id.to_owned(), name));
+                ui.rename_place = place;
+                ui.rename_focused = false;
+            }
+            // The field takes the focus; a control that went while it had
+            // the focus never reported losing it.
+            self.main_focus.borrow_mut().control = None;
+            self.refresh();
+        }
+        // After the menu that asked for it has closed and given the focus
+        // back to the control that had it, as on the Mac.
+        let main = self.main.as_weak();
+        let id = SharedString::from(id);
+        Timer::single_shot(Duration::ZERO, move || {
+            if let Some(main) = main.upgrade() {
+                focus_row(&main, place, id, RowPart::Name);
+            }
+        });
+    }
+
+    /// Whether `id`'s name is being edited in `place`.
+    fn renaming(&self, id: &str, place: RenamePlace) -> bool {
+        let ui = self.ui.borrow();
+        ui.rename_place == place && matches!(&ui.rename, Some((open, _)) if open == id)
+    }
+
+    fn edit_rename(&self, id: &str, text: &str) {
+        if let Some((open, typed)) = self.ui.borrow_mut().rename.as_mut()
+            && open == id
+        {
+            *typed = text.to_owned();
+        }
+    }
+
+    /// Ends the rename only if it is open in row `id`: a field that loses
+    /// the focus as it closes, after another row's rename began, must not
+    /// end that one.
+    fn end_rename_in(&self, id: &str, apply: bool) {
+        let open = matches!(&self.ui.borrow().rename, Some((open, _)) if open.as_str() == id);
+        if open {
+            self.end_rename(apply);
+        }
+    }
+
+    /// Ends the rename open in a row or zone header, if any: Enter, the
+    /// field losing the focus or a click outside it applies the name
+    /// (`apply`), Escape keeps the old one. The keyboard focus, when it was
+    /// in the field, goes to the row's or header's toggle, which Narrator
+    /// reads with the name.
+    fn end_rename(&self, apply: bool) {
+        let Some((id, text)) = self.ui.borrow_mut().rename.take() else {
+            return;
+        };
+        let place = {
+            let mut ui = self.ui.borrow_mut();
+            ui.rename_focused = false;
+            std::mem::take(&mut ui.rename_place)
+        };
+        let focused = self.main_focus.borrow().holds_name(place, &id);
+        match (apply, place) {
+            (true, RenamePlace::Zone) => self.update(|b| b.rename_zone(&id, &text)),
+            (true, _) => self.update(|b| b.rename_speaker(&id, &text)),
+            (false, _) => self.refresh(),
+        }
+        if focused {
+            focus_row(&self.main, place, id.as_str().into(), RowPart::Toggle);
+        }
+    }
+
+    /// The speaker or zone whose rename to apply, once the focus has left
+    /// its name field for another control, as on the Mac. Losing the focus
+    /// to another window or a popup, which give it back, applies nothing.
+    fn focus_left_rename(&self) -> Option<String> {
+        let mut ui = self.ui.borrow_mut();
+        let id = ui.rename.as_ref()?.0.clone();
+        let focus = self.main_focus.borrow();
+        if focus.holds_name(ui.rename_place, &id) {
+            ui.rename_focused = true;
+            return None;
+        }
+        let elsewhere = focus.speaker.is_some()
+            || focus.zone.is_some()
+            || focus.in_zones.is_some()
+            || focus.notice.is_some()
+            || focus.dismiss_all
+            || focus.control.is_some();
+        (ui.rename_focused && elsewhere).then_some(id)
+    }
+
+    /// The speaker's sync controls closed under the keyboard focus: its
+    /// delay button takes it, so Narrator and Tab carry on from there.
+    fn focus_delay_button(&self, id: &str) {
+        self.main.set_focus_speaker_part(RowPart::Delay);
+        self.main.set_focus_speaker_id(id.into());
+    }
+
+    /// Applies the typed offset (Enter, the delay button, a click outside
+    /// every control). Unreadable text applies nothing and the field shows
+    /// the applied value again; out of range, it shows the value that was
+    /// applied.
+    /// Applies what was typed in every delay field but `except`'s, in a
+    /// fixed order; every sync control stays open. Ctrl+S passes `None`.
+    fn apply_delay_typing(&self, except: Option<&str>) {
+        let mut typed: Vec<String> = self
+            .ui
+            .borrow()
+            .delay_drafts
+            .keys()
+            .filter(|id| Some(id.as_str()) != except)
+            .cloned()
+            .collect();
+        typed.sort();
+        for id in typed {
+            self.commit_delay(&id);
+        }
+        self.commit_airplay_delay();
+    }
+
+    /// Applies what was typed in a speaker's delay field, and says whether
+    /// it did.
+    fn commit_delay(&self, id: &str) -> bool {
+        let shown = self.snapshot().speaker(id).and_then(|s| s.delay_ms);
+        let typed = self.ui.borrow_mut().delay_drafts.remove(id);
+        let ms = typed
+            .as_ref()
+            .and_then(|typed| typed.text(shown))
+            .and_then(ui_model::parse_delay_ms);
+        match ms {
+            Some(ms) => self.update(|b| b.set_speaker_delay(id, ms)),
+            None => self.refresh(),
+        }
+        ms.is_some()
+    }
+
+    fn step_airplay_delay(&self, delta: i32) {
+        let Some(current) = self.snapshot().airplay_delay_ms else {
+            return;
+        };
+        let typed = self
+            .ui
+            .borrow_mut()
+            .airplay_delay_draft
+            .commit(Some(current));
+        let base = typed.map_or(current, |ms| ms.clamp(0.0, ui_model::MAX_DELAY_MS));
+        let ms = (base + f64::from(delta)).clamp(0.0, ui_model::MAX_DELAY_MS);
+        if ms == current {
+            self.refresh();
+        } else {
+            self.update(|b| b.set_airplay_delay(ms));
+            self.say_airplay_delay_set();
+        }
+    }
+
+    /// Keeps what is typed in the AirPlay delay field; nothing applies until
+    /// Enter or a click outside every control (see [`TypedDelay`]).
+    fn edit_airplay_delay(&self, text: &str) {
+        let shown = self.snapshot().airplay_delay_ms;
+        let taken = self.ui.borrow_mut().airplay_delay_draft.edit(text, shown);
+        self.refresh();
+        if !taken {
+            self.announce(self.strings().get_delay_field_takes());
+        }
+    }
+
+    /// Applies the typed AirPlay delay (Enter, a click outside every
+    /// control), and says whether it did. Clamped, the field shows the
+    /// value that was applied.
+    fn commit_airplay_delay(&self) -> bool {
+        let shown = self.snapshot().airplay_delay_ms;
+        let typed = self.ui.borrow_mut().airplay_delay_draft.commit(shown);
+        match typed {
+            Some(ms) => self.update(|b| b.set_airplay_delay(ms.clamp(0.0, ui_model::MAX_DELAY_MS))),
+            None => self.refresh(),
+        }
+        typed.is_some()
+    }
+
+    fn enter_airplay_delay(&self) {
+        if self.commit_airplay_delay() {
+            self.say_airplay_delay_set();
+        }
+    }
+
+    /// The AirPlay delay's [`App::say_delay_set`].
+    fn say_airplay_delay_set(&self) {
+        let Some(ms) = self.snapshot().airplay_delay_ms else {
+            return;
+        };
+        let strings = self.strings();
+        let value = strings.invoke_airplay_delay_value(ms.round() as i32);
+        self.announce(strings.invoke_delay_set(strings.get_airplay_delay_title(), value));
+    }
+
+    fn shown_curve(&self, state: &AppState) -> Option<CurveMatch> {
+        ui_model::shown_curve(state, self.ui.borrow().chosen_curve)
+    }
+
+    /// Forgets the picked curve once the stored (quantized) gains have left
+    /// it, so it stays forgotten when they come back (S270).
+    fn forget_curve_left(&self) {
+        let state = self.snapshot();
+        let chosen = self.ui.borrow().chosen_curve;
+        if self.shown_curve(&state) != chosen {
+            self.ui.borrow_mut().chosen_curve = None;
+        }
+    }
+
+    fn change_equalizer(&self, change: impl FnOnce(&mut EqSettings)) {
+        let mut settings = self.snapshot().equalizer;
+        change(&mut settings);
+        self.update(|b| b.set_equalizer(settings));
+    }
+
+    pub fn show_equalizer(&self) {
+        if let Err(error) = self.equalizer.show() {
+            self.show_window_error(&error);
+            return;
+        }
+        self.apply_frame(self.equalizer.window(), "equalizer", Frame::Titled);
+        self.equalizer.invoke_take_focus();
+        crate::platform::bring_to_front(self.equalizer.window());
+    }
+
+    /// Speakers > New Zone from Active Speakers… (Ctrl+N): a name for a
+    /// zone of the speakers that are on, or why none can be made yet.
+    fn ask_new_zone(&self) {
+        if self.dialog_already_open() {
+            return;
+        }
+        let strings = self.strings();
+        let dialog = &self.zone_dialog;
+        if self.snapshot().active_speakers() == 0 {
+            *self.dialog_purpose.borrow_mut() = DialogPurpose::Message;
+            dialog.set_heading(strings.get_new_zone_title());
+            dialog.set_message(strings.get_new_zone_needs_speakers());
+            dialog.set_show_field(false);
+            dialog.set_confirm_label(strings.get_ok());
+        } else {
+            *self.dialog_purpose.borrow_mut() = DialogPurpose::NewZone;
+            dialog.set_heading(strings.get_new_zone_title());
+            dialog.set_message(strings.get_new_zone_message());
+            self.ask_zone_name(&strings);
+        }
+        self.open_dialog();
+    }
+
+    /// New Zone… in a speaker's menu: a name for a zone of that speaker.
+    fn ask_new_zone_with(&self, speaker_id: &str) {
+        if self.dialog_already_open() {
+            return;
+        }
+        let Some(speaker) = self.snapshot().speaker(speaker_id).cloned() else {
+            return;
+        };
+        let strings = self.strings();
+        let dialog = &self.zone_dialog;
+        *self.dialog_purpose.borrow_mut() = DialogPurpose::NewZoneWith(speaker_id.to_owned());
+        dialog.set_heading(strings.get_new_zone_title());
+        dialog.set_message(strings.invoke_new_zone_for_speaker(speaker.name.as_str().into()));
+        self.ask_zone_name(&strings);
+        self.open_dialog();
+    }
+
+    fn ask_zone_name(&self, strings: &Strings<'_>) {
+        let dialog = &self.zone_dialog;
+        dialog.set_placeholder(strings.get_new_zone_placeholder());
+        dialog.set_field_label(strings.get_new_zone_field_label());
+        dialog.set_name(SharedString::new());
+        dialog.set_show_field(true);
+        dialog.set_confirm_label(strings.get_create());
+    }
+
+    fn ask_save_curve(&self) {
+        if self.dialog_already_open() {
+            return;
+        }
+        let state = self.snapshot();
+        let strings = self.strings();
+        let dialog = &self.zone_dialog;
+        let shown = match self.shown_curve(&state) {
+            Some(CurveMatch::User(index)) => Some(&state.equalizer_curves[index]),
+            _ => None,
+        };
+        let name = shown.map_or_else(
+            || strings.invoke_numbered_curve(count(state.equalizer_curves.len() + 1)),
+            |curve| curve.name.as_str().into(),
+        );
+        *self.dialog_purpose.borrow_mut() = DialogPurpose::SaveCurve;
+        self.ui.borrow_mut().save_curve_gains = state.equalizer.gains_db;
+        dialog.set_heading(strings.get_save_curve_title());
+        dialog.set_message(strings.get_save_curve_message());
+        dialog.set_placeholder(strings.get_curve_name_field_label());
+        dialog.set_field_label(strings.get_curve_name_field_label());
+        dialog.set_name(name);
+        dialog.set_show_field(true);
+        dialog.set_confirm_label(strings.get_save());
+        self.open_dialog();
+    }
+
+    fn ask_rename_curve(&self) {
+        if self.dialog_already_open() {
+            return;
+        }
+        let state = self.snapshot();
+        let Some(CurveMatch::User(index)) = self.shown_curve(&state) else {
+            return;
+        };
+        let name = state.equalizer_curves[index].name.as_str();
+        let strings = self.strings();
+        let dialog = &self.zone_dialog;
+        *self.dialog_purpose.borrow_mut() = DialogPurpose::RenameCurve(name.to_owned());
+        dialog.set_heading(strings.get_rename_curve_title());
+        dialog.set_message(strings.invoke_rename_message(name.into()));
+        dialog.set_placeholder(strings.get_curve_name_field_label());
+        dialog.set_field_label(strings.get_curve_name_field_label());
+        dialog.set_name(name.into());
+        dialog.set_show_field(true);
+        dialog.set_confirm_label(strings.get_rename());
+        self.open_dialog();
+    }
+
+    /// Shows `message` in the name dialog, without a field. While the
+    /// dialog is open, a notice and Narrator say it instead, so a name being
+    /// typed stays.
+    fn show_dialog_message(&self, heading: SharedString, message: SharedString) {
+        if self.zone_dialog.window().is_visible() {
+            self.ui.borrow_mut().dialog_notice = Some(ui_model::Notice {
+                id: DIALOG_NOTICE_ID,
+                subject: "dialog".to_owned(),
+                message: NoticeMessage::DialogMessage {
+                    title: heading.to_string(),
+                    text: message.to_string(),
+                },
+                time: crate::platform::notice_time(),
+                post: ui_model::next_post(),
+            });
+            self.refresh();
+            self.announce(message);
+            return;
+        }
+        let dialog = &self.zone_dialog;
+        *self.dialog_purpose.borrow_mut() = DialogPurpose::Message;
+        dialog.set_heading(heading);
+        dialog.set_message(message);
+        dialog.set_show_field(false);
+        dialog.set_confirm_label(self.strings().get_ok());
+        self.open_dialog();
+    }
+
+    /// A new zone's name: what was typed, else the first "Zone n" no zone
+    /// has, counting on from the zones there are.
+    fn new_zone_name(&self, typed: &str) -> String {
+        if !typed.trim().is_empty() {
+            return typed.to_owned();
+        }
+        let zones = self.snapshot().zones;
+        let strings = self.strings();
+        (zones.len() + 1..)
+            .map(|n| strings.invoke_numbered_zone(count(n)).to_string())
+            .find(|name| zones.iter().all(|zone| zone.name != *name))
+            .unwrap_or_default()
+    }
+
+    /// The arrow of zone `id`, or Left and Right on its header, in the
+    /// flyout or the main window.
+    pub fn set_zone_expanded(&self, id: &str, open: bool, in_flyout: bool) {
+        let changed = {
+            let mut ui = self.ui.borrow_mut();
+            let collapsed = if in_flyout {
+                &mut ui.flyout_collapsed
+            } else {
+                &mut ui.collapsed
+            };
+            if open {
+                collapsed.remove(id)
+            } else {
+                collapsed.insert(id.to_owned())
+            }
+        };
+        if changed {
+            self.refresh();
+        }
+    }
+
+    /// Delete Zone: its speakers go back to the plain lists; Narrator says
+    /// it went, since its header did.
+    fn delete_zone(&self, id: &str) {
+        let Some(zone) = self.snapshot().zones.into_iter().find(|z| z.id == id) else {
+            return;
+        };
+        self.update(|b| b.delete_zone(id));
+        let said = self
+            .strings()
+            .invoke_zone_deleted(zone.name.as_str().into());
+        self.announce(said);
+    }
+
+    /// Move to Zone in a speaker's menu; Narrator says where it went.
+    fn move_to_zone(&self, speaker_id: &str, zone_id: &str) {
+        let state = self.snapshot();
+        let (Some(speaker), Some(zone)) = (
+            state.speaker(speaker_id),
+            state.zones.iter().find(|z| z.id == zone_id),
+        ) else {
+            return;
+        };
+        let said = self
+            .strings()
+            .invoke_speaker_moved_to_zone(speaker.name.as_str().into(), zone.name.as_str().into());
+        self.update(|b| b.move_to_zone(speaker_id, zone_id));
+        self.announce(said);
+    }
+
+    /// Recalls preset `id` (spec S265) from any path; it opens, raises and
+    /// focuses nothing (S266).
+    fn recall_preset(&self, id: &str) {
+        self.update(|b| b.recall_preset(id));
+        self.forget_curve_left();
+    }
+
+    /// Ctrl+`n`: the `n`th preset in list order; nothing without one.
+    fn recall_preset_at(&self, n: i32) {
+        let Some(index) = usize::try_from(n).ok().and_then(|n| n.checked_sub(1)) else {
+            return;
+        };
+        if let Some(preset) = self.snapshot().presets.get(index) {
+            self.recall_preset(&preset.id);
+        }
+    }
+
+    fn ask_save_preset(&self) {
+        if self.dialog_already_open() {
+            return;
+        }
+        let strings = self.strings();
+        let state = self.snapshot();
+        if state.presets.len() >= MAX_PRESETS {
+            self.show_dialog_message(strings.get_save_preset_title(), strings.get_presets_full());
+            return;
+        }
+        if ui_model::speakers_on_now(&state).is_empty() {
+            self.show_dialog_message(
+                strings.get_save_preset_title(),
+                strings.get_save_preset_needs_speakers(),
+            );
+            return;
+        }
+        let dialog = &self.zone_dialog;
+        *self.dialog_purpose.borrow_mut() = DialogPurpose::SavePreset;
+        dialog.set_heading(strings.get_save_preset_title());
+        dialog.set_message(strings.get_save_preset_message());
+        dialog.set_placeholder(strings.get_preset_placeholder());
+        dialog.set_field_label(strings.get_preset_field_label());
+        dialog.set_name(SharedString::new());
+        dialog.set_show_field(true);
+        dialog.set_confirm_label(strings.get_save());
+        self.open_dialog();
+    }
+
+    fn ask_rename_preset(&self, id: &str) {
+        if self.dialog_already_open() {
+            return;
+        }
+        let Some(preset) = self.snapshot().presets.into_iter().find(|p| p.id == id) else {
+            return;
+        };
+        let strings = self.strings();
+        let dialog = &self.zone_dialog;
+        *self.dialog_purpose.borrow_mut() = DialogPurpose::RenamePreset(id.to_owned());
+        dialog.set_heading(strings.get_rename_preset_title());
+        dialog.set_message(strings.invoke_rename_message(preset.name.as_str().into()));
+        dialog.set_placeholder(strings.get_preset_placeholder());
+        dialog.set_field_label(strings.get_preset_field_label());
+        dialog.set_name(preset.name.as_str().into());
+        dialog.set_show_field(true);
+        dialog.set_confirm_label(strings.get_rename());
+        self.open_dialog();
+    }
+
+    /// Save in the Save Preset dialog: a blank name becomes "Preset n".
+    fn save_preset(&self, typed: &str) {
+        let names: Vec<String> = self
+            .snapshot()
+            .presets
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        let strings = self.strings();
+        let name = new_preset_name(typed, &names, |n| {
+            strings.invoke_numbered_preset(count(n)).to_string()
+        });
+        let saved = self.backend.borrow_mut().save_preset(&name);
+        self.refresh();
+        match saved {
+            Ok(()) => self.announce(strings.invoke_preset_saved(name.as_str().into())),
+            Err(PresetError::Full) => self
+                .show_dialog_message(strings.get_save_preset_title(), strings.get_presets_full()),
+            // The last speaker went off while the dialog was open.
+            Err(PresetError::NoSpeakerOn) => self.show_dialog_message(
+                strings.get_save_preset_title(),
+                strings.get_save_preset_needs_speakers(),
+            ),
+        }
+    }
+
+    /// Update to Current Settings; it asks nothing (spec S262).
+    fn update_preset(&self, id: &str) {
+        let Some(preset) = self.snapshot().presets.into_iter().find(|p| p.id == id) else {
+            return;
+        };
+        let updated = self.backend.borrow_mut().update_preset(id);
+        self.refresh();
+        let strings = self.strings();
+        match updated {
+            Ok(()) => self.announce(strings.invoke_preset_updated(preset.name.as_str().into())),
+            Err(_) => self.show_dialog_message(
+                strings.get_update_preset(),
+                strings.get_save_preset_needs_speakers(),
+            ),
+        }
+    }
+
+    /// Delete; it asks nothing (spec S262). The focus goes back to the
+    /// Presets row (S267).
+    fn delete_preset(&self, id: &str) {
+        let presets = self.snapshot().presets;
+        let Some(index) = presets.iter().position(|p| p.id == id) else {
+            return;
+        };
+        self.update(|b| b.delete_preset(id));
+        self.main.set_focus_presets(true);
+        let said = self
+            .strings()
+            .invoke_preset_deleted(presets[index].name.as_str().into());
+        self.announce(said);
+    }
+
+    /// Brings the name dialog to the front while it is open: one dialog
+    /// serves every name, so a second request would drop the typed one.
+    fn dialog_already_open(&self) -> bool {
+        let open = self.zone_dialog.window().is_visible();
+        if open {
+            crate::platform::bring_to_front(self.zone_dialog.window());
+        }
+        open
+    }
+
+    fn open_dialog(&self) {
+        if let Err(error) = self.zone_dialog.show() {
+            self.show_window_error(&error);
+            return;
+        }
+        self.zone_dialog.invoke_prepare();
+        grow_to_fit(self.zone_dialog.window(), self.zone_dialog.get_fit_height());
+        self.equalizer.set_name_dialog_open(true);
+        crate::platform::bring_to_front(self.zone_dialog.window());
+    }
+
+    fn hide_dialog(&self) {
+        let _ = self.zone_dialog.hide();
+        self.equalizer.set_name_dialog_open(false);
+    }
+
+    fn confirm_dialog(&self, name: &str) {
+        let purpose = self.dialog_purpose.borrow().clone();
+        self.hide_dialog();
+        match purpose {
+            DialogPurpose::NewZone => {
+                let name = self.new_zone_name(name);
+                // The dialog only offers a name while a speaker is on; if the
+                // last one went off meanwhile, nothing is made.
+                let _ = self.backend.borrow_mut().new_zone(&name);
+                self.refresh();
+            }
+            DialogPurpose::NewZoneWith(id) => {
+                let name = self.new_zone_name(name);
+                self.update(|b| b.new_zone_with(&id, &name));
+            }
+            DialogPurpose::Message => {}
+            DialogPurpose::SavePreset => self.save_preset(name),
+            DialogPurpose::RenamePreset(id) => self.update(|b| b.rename_preset(&id, name)),
+            DialogPurpose::SaveCurve => {
+                let mut curves = self.snapshot().equalizer_curves;
+                // An empty name saves nothing (spec S270).
+                if eq::curve_name(name).is_none() {
+                    return;
+                }
+                let gains_db = self.ui.borrow().save_curve_gains;
+                if let Some(index) = eq::save_curve(&mut curves, name, &gains_db) {
+                    self.ui.borrow_mut().chosen_curve = Some(CurveMatch::User(index));
+                    self.update(|b| b.set_equalizer_curves(curves));
+                } else {
+                    let strings = self.strings();
+                    self.show_dialog_message(
+                        strings.get_save_curve_title(),
+                        strings.invoke_curves_full(count(eq::MAX_USER_CURVES)),
+                    );
+                }
+            }
+            DialogPurpose::RenameCurve(old) => {
+                let mut curves = self.snapshot().equalizer_curves;
+                let Some(index) = curves.iter().position(|curve| curve.name == old) else {
+                    return;
+                };
+                if eq::rename_curve(&mut curves, index, name) {
+                    self.update(|b| b.set_equalizer_curves(curves));
+                } else if let Some(taken) = eq::curve_name(name) {
+                    let strings = self.strings();
+                    self.show_dialog_message(
+                        strings.get_rename_curve_title(),
+                        strings.invoke_curve_name_taken(taken.as_str().into()),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Closing the main window keeps AudioSync running in the tray, like the
+    /// Mac app in the menu bar. Without a tray icon, it quits.
+    fn close_main(&self) {
+        // With a tray this is a click outside the controls, so what was typed
+        // applies; without one it quits, and a quit drops it.
+        self.end_rename(self.tray_available.get());
+        self.end_delay_typing(self.tray_available.get());
+        self.remember_view();
+        let _ = self.main.hide();
+        if !self.tray_available.get() {
+            let _ = slint::quit_event_loop();
+        }
+    }
+
+    fn show_window_error(&self, error: &slint::PlatformError) {
+        let text = self.window_error_text(error);
+        // The box is modal: on the UI thread it would stop the poll timer until closed.
+        std::thread::spawn(move || crate::platform::show_error(&text));
+    }
+
+    fn window_error_text(&self, error: &slint::PlatformError) -> String {
+        self.log.log(|| format!("a window didn't open: {error}"));
+        self.strings().get_window_failed().into()
+    }
+
+    /// While a note says no speaker was found, watches the networks'
+    /// profiles, which `poll` takes in; once the note goes, it names no
+    /// Public network until a new reading.
+    fn watch_network(&self, none_found: bool) {
+        let mut watch = self.network_watch.borrow_mut();
+        if !none_found {
+            if watch.take().is_some() {
+                self.strings().set_public_network(false);
+            }
+            return;
+        }
+        if watch.is_none() {
+            let profiles = self.remote.borrow().profiles.clone();
+            *watch = profiles.map(|source| Watch::start(source, remote_window::PROFILE_CHECK));
+        }
+    }
+
+    /// Takes the newest reading for the note that no speaker was found, on
+    /// every poll: a quiet backend refreshes nothing that would.
+    fn read_none_found_network(&self) {
+        let reading = self.network_watch.borrow().as_ref().and_then(Watch::latest);
+        if let Some(Some(connected)) = reading {
+            self.strings()
+                .set_public_network(network_profile::suggests_private(&connected));
+        }
+    }
+
+    /// Puts the flyout's content where its opening starts: below its place
+    /// for the slide, or in place at once while Windows' Animation effects
+    /// are off.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn prepare_flyout_open(&self, animate: bool) {
+        self.flyout.set_revealed(!animate);
+        self.flyout.global::<Motion>().set_on(animate);
+    }
+
+    pub fn hide_flyout(&self) {
+        let _ = self.flyout.hide();
+    }
+
+    /// Sizes the flyout to show every part down to its buttons, at most
+    /// `room` logical pixels high, and returns that height. Windows makes it
+    /// at Slint's preferred height, which counts a wrapped notice as one line
+    /// and cut the buttons off. On a screen too short for it all, the zones
+    /// and speakers list gets less room and scrolls; when that is not enough,
+    /// everything between the header and the buttons scrolls.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn fit_flyout(&self, room: f32) -> f32 {
+        let flyout = &self.flyout;
+        let set_list_cut = |cut: f32| {
+            if flyout.get_list_cut() != cut {
+                flyout.set_list_cut(cut);
+            }
+        };
+        let set_body_cut = |cut: f32| {
+            if flyout.get_body_cut() != cut {
+                flyout.set_body_cut(cut);
+            }
+        };
+        let cut = flyout.get_list_cut() > 0.0 || flyout.get_body_cut() > 0.0;
+        let mut height = flyout.get_fit_height();
+        if !flyout_fit_holds(height, room, cut) {
+            set_list_cut(0.0);
+            set_body_cut(0.0);
+            height = flyout.get_fit_height();
+            if height > room {
+                set_list_cut(height - room);
+                height = flyout.get_fit_height();
+            }
+            if height > room {
+                set_body_cut(height - room);
+                height = flyout.get_fit_height();
+            }
+        }
+        let height = height.min(room);
+        let window = flyout.window();
+        let size = window.size().to_logical(window.scale_factor());
+        if (size.height - height).abs() >= 0.5 {
+            window.set_size(slint::LogicalSize::new(size.width, height));
+        }
+        height
+    }
+}
+
+/// Grows a dialog to `fit`, its layout's lowest height at its width. X11
+/// shows it at the height before its message wraps, and no window manager
+/// grows it.
+fn grow_to_fit(window: &slint::Window, fit: f32) {
+    let size = window.size().to_logical(window.scale_factor());
+    // Before the native window exists there is no width to fit to.
+    if size.width > 0.0 && size.height < fit {
+        window.set_size(slint::LogicalSize::new(size.width, fit));
+    }
+}
+
+/// Whether the flyout's cuts still fit its content in `room`, so the
+/// refresh every 500 ms makes no layout pass: with a cut it fills the room
+/// exactly, without one it fits.
+fn flyout_fit_holds(fit: f32, room: f32, cut: bool) -> bool {
+    if cut {
+        (fit - room).abs() < 0.5
+    } else {
+        fit <= room
+    }
+}
+
+/// The properties the main window and the flyout share.
+trait WindowState {
+    fn show_state(&self, state: &AppState, status: &SharedString, source_index: i32);
+    fn show_live_input_hint(&self, hint: &SharedString);
+}
+
+impl WindowState for MainWindow {
+    fn show_state(&self, state: &AppState, status: &SharedString, source_index: i32) {
+        self.set_running(state.running);
+        self.set_status(status.clone());
+        self.set_source_index(source_index);
+        self.set_source_is_input(
+            state
+                .sources
+                .iter()
+                .any(|s| s.id == state.source_id && s.kind == SourceKind::Input),
+        );
+        self.set_master_volume(state.master_volume as f32);
+        self.set_master_volume_waves(volume_waves(state.master_volume));
+        self.set_switch_source_on_quit(state.when_source_quits == WhenSourceQuits::SwitchToSystem);
+    }
+
+    fn show_live_input_hint(&self, hint: &SharedString) {
+        self.set_live_input_hint(hint.clone());
+    }
+}
+
+impl WindowState for TrayFlyout {
+    fn show_state(&self, state: &AppState, status: &SharedString, source_index: i32) {
+        self.set_running(state.running);
+        self.set_status(status.clone());
+        self.set_source_index(source_index);
+        self.set_master_volume(state.master_volume as f32);
+        self.set_master_volume_waves(volume_waves(state.master_volume));
+    }
+
+    fn show_live_input_hint(&self, hint: &SharedString) {
+        self.set_live_input_hint(hint.clone());
+    }
+}
+
+/// The channel pairs the chosen input device offers, labeled by `label`
+/// (first and last channel, from 1), and the place of the one it plays: a
+/// saved pair the device no longer has plays 1-2, so 1-2 shows.
+fn input_pair_choice(
+    state: &AppState,
+    label: impl Fn(i32, i32) -> SharedString,
+) -> (Vec<SharedString>, i32) {
+    let channels = state
+        .sources
+        .iter()
+        .find(|source| source.id == state.source_id && source.kind == SourceKind::Input)
+        .map_or(0, |source| source.channels);
+    let labels = InputPair::offered(channels)
+        .into_iter()
+        .map(|pair| label(i32::from(pair.left) + 1, i32::from(pair.right) + 1))
+        .collect();
+    let (playing, _) = InputPair::resolve(state.input_pair, channels);
+    (labels, i32::from(playing.index))
+}
+
+/// Keeps the newest [`MAX_NOTICES`] of `notices`, in their order. The older
+/// ones drop off without their dismiss action, so a dropped download goes
+/// on. `posted` is [`NoticeAnnouncer::posted`]; a notice missing from it was
+/// posted since, and ranks newest, by id.
+fn keep_newest_notices(notices: &mut Vec<ui_model::Notice>, posted: &[u64]) {
+    let posted_at = |n: &ui_model::Notice| {
+        let at = posted.iter().position(|&id| id == n.id);
+        (at.unwrap_or(usize::MAX), n.id)
+    };
+    let mut times: Vec<_> = notices.iter().map(posted_at).collect();
+    times.sort_unstable();
+    if let Some(&oldest_kept) = times.iter().rev().nth(MAX_NOTICES - 1) {
+        notices.retain(|n| posted_at(n) >= oldest_kept);
+    }
+}
+
+/// The newest `limit` notices: what a window lists. A window that shows
+/// fewer than all of them says how many more there are instead.
+fn newest_notices<T: Clone>(notices: &[T], limit: usize) -> Vec<T> {
+    notices.iter().take(limit).cloned().collect()
+}
+
+/// Replaces the rows that changed; the whole list only when its length did.
+fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, items: Vec<T>) {
+    if model.row_count() == items.len() {
+        for (row, item) in items.into_iter().enumerate() {
+            if model.row_data(row).as_ref() != Some(&item) {
+                model.set_row_data(row, item);
+            }
+        }
+    } else {
+        model.set_vec(items);
+    }
+}
+
+fn count(n: usize) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// Puts `text` in the flyout's live region while the flyout shows, else in
+/// the main window's, and empties the other.
+fn put_announcement(
+    main: &slint::Weak<MainWindow>,
+    flyout: &slint::Weak<TrayFlyout>,
+    text: SharedString,
+) {
+    let in_flyout = flyout
+        .upgrade()
+        .is_some_and(|flyout| flyout.window().is_visible());
+    let (said, quiet) = if in_flyout {
+        (text, SharedString::new())
+    } else {
+        (SharedString::new(), text)
+    };
+    if let Some(main) = main.upgrade() {
+        main.set_notice_announcement(quiet);
+    }
+    if let Some(flyout) = flyout.upgrade() {
+        flyout.set_notice_announcement(said);
+    }
+}
+
+/// Empties the notice live regions of the windows still there.
+fn clear_announcement(main: &slint::Weak<MainWindow>, flyout: &slint::Weak<TrayFlyout>) {
+    if let Some(main) = main.upgrade() {
+        main.set_notice_announcement(SharedString::new());
+    }
+    if let Some(flyout) = flyout.upgrade() {
+        flyout.set_notice_announcement(SharedString::new());
+    }
+}
+
+/// The tray icon's tooltip: AudioSync, streaming on or off, the speakers on
+/// and the notices, then the newest notice's title on a second line while
+/// there is a notice, so Narrator
+/// reads it on the tray icon even with every window closed. `posted` is
+/// [`App::notices_posted`]; notices missing from it rank below listed
+/// ones, by id.
+#[cfg(any(windows, target_os = "linux", test))]
+pub fn tray_tooltip(strings: &Strings<'_>, state: &AppState, posted: &[u64]) -> String {
+    let speakers = count(state.active_speakers());
+    let notices = count(state.notices.len());
+    let newest = state
+        .notices
+        .iter()
+        .max_by_key(|n| (posted.iter().position(|id| *id == n.id), n.id));
+    let text = match newest {
+        Some(notice) => strings.invoke_tray_tooltip_notice(
+            state.running,
+            speakers,
+            notices,
+            notice_title(strings, &notice.message),
+        ),
+        None => strings.invoke_tray_tooltip(state.running, speakers, notices),
+    };
+    fit_tooltip(&text)
+}
+
+/// `text` cut to what a tray tooltip holds, ending in "…" when cut.
+#[cfg(any(windows, target_os = "linux", test))]
+fn fit_tooltip(text: &str) -> String {
+    if text.encode_utf16().count() <= TOOLTIP_MAX_UNITS {
+        return text.to_owned();
+    }
+    let room = TOOLTIP_MAX_UNITS - '…'.len_utf16();
+    let mut fitted = String::new();
+    let mut units = 0;
+    for c in text.chars() {
+        units += c.len_utf16();
+        if units > room {
+            break;
+        }
+        fitted.push(c);
+    }
+    fitted.push('…');
+    fitted
+}
+
+fn format_ms(ms: f64) -> String {
+    format!("{}", ms.round() as i64)
+}
+
+/// The AirPlay delay field's key among the fields out of range (no speaker
+/// id has this form).
+const AIRPLAY_DELAY_FIELD: &str = "airplay-delay";
+
+/// The range line to announce: that of a field whose number has just gone
+/// out of range. A field that stays out of range as more is typed isn't
+/// announced again; `fields` becomes the fields out of range now.
+fn newly_out_of_range(
+    fields: &mut HashSet<String>,
+    now: Vec<(String, SharedString)>,
+) -> Option<SharedString> {
+    let alert = now
+        .iter()
+        .find(|(id, _)| !fields.contains(id))
+        .map(|(_, hint)| hint.clone());
+    *fields = now.into_iter().map(|(id, _)| id).collect();
+    alert
+}
+
+/// What a delay field says under it while it holds a number outside
+/// `min..=max`: the range and the value Enter applies instead. Empty
+/// otherwise, which also takes the field's red outline away.
+fn range_hint(
+    strings: &Strings,
+    typed: Option<&str>,
+    min: f64,
+    max: f64,
+    format: fn(f64) -> String,
+) -> SharedString {
+    match typed.and_then(ui_model::parse_ms) {
+        Some(ms) if !(min..=max).contains(&ms) => strings.invoke_delay_out_of_range(
+            format(min).into(),
+            format(max).into(),
+            format(ms.clamp(min, max)).into(),
+        ),
+        _ => SharedString::default(),
+    }
+}
+
+/// An offset as its field shows it, with its sign: "+150", "−250", "0".
+fn format_offset_ms(ms: f64) -> String {
+    match ms.round() as i64 {
+        whole if whole > 0 => format!("+{whole}"),
+        whole if whole < 0 => format!("\u{2212}{}", whole.unsigned_abs()),
+        _ => "0".to_owned(),
+    }
+}
+
+pub fn row_state(state: SpeakerState) -> RowState {
+    match state {
+        SpeakerState::Off => RowState::Off,
+        SpeakerState::WillPlay => RowState::WillPlay,
+        SpeakerState::Playing => RowState::Playing,
+        SpeakerState::Waiting(ui_model::Waiting::ForDevice) => RowState::WaitingForDevice,
+        SpeakerState::Waiting(ui_model::Waiting::Reconnecting) => RowState::Reconnecting,
+        SpeakerState::Waiting(ui_model::Waiting::ForAirPlay2Slot) => RowState::WaitingForAirplay2,
+        SpeakerState::Waiting(ui_model::Waiting::ForPtp) => RowState::WaitingForPtp,
+        SpeakerState::Waiting(ui_model::Waiting::NotOnNetwork) => RowState::NotOnNetwork,
+        SpeakerState::Waiting(ui_model::Waiting::ForPassword) => RowState::WaitingForPassword,
+        SpeakerState::Waiting(ui_model::Waiting::ForPin) => RowState::WaitingForPin,
+    }
+}
+
+pub fn speaker_kind(kind: ui_model::SpeakerKind) -> SpeakerKind {
+    use ui_model::SpeakerKind as K;
+    match kind {
+        K::AirPlay => SpeakerKind::Airplay,
+        K::AirPlay2 => SpeakerKind::Airplay2,
+        K::Cast => SpeakerKind::Cast,
+        K::BuiltIn => SpeakerKind::BuiltIn,
+        K::Headphones => SpeakerKind::Headphones,
+        K::Bluetooth => SpeakerKind::Bluetooth,
+        K::Usb => SpeakerKind::Usb,
+        K::UsbHeadphones => SpeakerKind::UsbHeadphones,
+        K::UsbSpeakers => SpeakerKind::UsbSpeakers,
+        K::Hdmi => SpeakerKind::Hdmi,
+        K::DisplayPort => SpeakerKind::DisplayPort,
+        K::Virtual => SpeakerKind::Virtual,
+        K::Other => SpeakerKind::Other,
+    }
+}
+
+fn availability(a: ui_model::Availability) -> Availability {
+    match a {
+        ui_model::Availability::Open => Availability::Open,
+        ui_model::Availability::NeedsCode => Availability::NeedsCode,
+        ui_model::Availability::Pairing => Availability::Pairing,
+        ui_model::Availability::WaitingToPair => Availability::WaitingToPair,
+        ui_model::Availability::PairingNotYet => Availability::PairingNotYet,
+        ui_model::Availability::AirPlay2NotYet => Availability::Airplay2NotYet,
+        ui_model::Availability::Unsupported => Availability::Unsupported,
+    }
+}
+
+fn airplay_problem(problem: ui_model::AirPlayProblem) -> AirPlayProblem {
+    use ui_model::AirPlayProblem as P;
+    match problem {
+        P::NotResponding => AirPlayProblem::NotResponding,
+        P::ConnectionLost => AirPlayProblem::ConnectionLost,
+        P::Busy => AirPlayProblem::Busy,
+        P::Refused => AirPlayProblem::Refused,
+        P::NeedsPassword => AirPlayProblem::NeedsPassword,
+        P::NeedsPin => AirPlayProblem::NeedsPin,
+        P::StillNeedsCode => AirPlayProblem::StillNeedsCode,
+        P::NotAccepted => AirPlayProblem::NotAccepted,
+        P::PairingFailed => AirPlayProblem::PairingFailed,
+        P::PairingNotYet => AirPlayProblem::PairingNotYet,
+        P::AirPlay2NotYet => AirPlayProblem::Airplay2NotYet,
+        P::TimingUnavailable => AirPlayProblem::TimingUnavailable,
+        P::TooManyAirPlay2Speakers => AirPlayProblem::TooManyAirplay2Speakers,
+        P::PtpOtherNetwork => AirPlayProblem::PtpOtherNetwork,
+        P::PlaysThroughSpeakers => AirPlayProblem::PlaysThroughSpeakers,
+        P::ReceiverUnverified => AirPlayProblem::ReceiverUnverified,
+        P::AppleTvPlays => AirPlayProblem::AppleTvPlays,
+        P::PlaysInGroup => AirPlayProblem::PlaysInGroup,
+        P::Unsupported => AirPlayProblem::Unsupported,
+    }
+}
+
+fn cast_problem(problem: ui_model::CastProblem) -> CastProblem {
+    use ui_model::CastProblem as P;
+    match problem {
+        P::Busy => CastProblem::Busy,
+        P::NotResponding => CastProblem::NotResponding,
+        P::Refused => CastProblem::Refused,
+        P::Blocked => CastProblem::Blocked,
+        P::TakenOver => CastProblem::TakenOver,
+        P::ConnectionLost => CastProblem::ConnectionLost,
+        P::SearchStopped => CastProblem::SearchStopped,
+        P::NotGenuine => CastProblem::NotGenuine,
+        P::Unauthenticated => CastProblem::Unauthenticated,
+    }
+}
+
+fn cast_state(state: ui_model::CastState) -> CastState {
+    use ui_model::CastState as S;
+    match state {
+        S::Idle => CastState::Idle,
+        S::Connecting => CastState::Connecting,
+        S::Playing => CastState::Playing,
+        S::Paused => CastState::Paused,
+        S::Reconnecting => CastState::Reconnecting,
+    }
+}
+
+fn cast_list(list: ui_model::CastList) -> CastList {
+    use ui_model::CastList as L;
+    match list {
+        L::Quiet => CastList::Quiet,
+        L::Searching => CastList::Searching,
+        L::NoneFound => CastList::NoneFound,
+        L::Failed => CastList::Failed,
+    }
+}
+
+/// A device-volume hint as a row shows it, with the whole percent it names
+/// (spec S198, S199).
+fn device_volume_hint(hint: Option<Hint>) -> (DeviceVolumeHint, i32) {
+    let percent = |percent: u32| i32::try_from(percent).unwrap_or(i32::MAX);
+    match hint {
+        None => (DeviceVolumeHint::None, 0),
+        Some(Hint::Low { percent: n }) => (DeviceVolumeHint::Low, percent(n)),
+        Some(Hint::Muted) => (DeviceVolumeHint::Muted, 0),
+        Some(Hint::MutedAndLow { percent: n }) => (DeviceVolumeHint::MutedLow, percent(n)),
+    }
+}
+
+/// The reference's device-volume hint under Calibrate All's "Before you
+/// start", with the speaker ID its fix goes to (spec S197).
+pub fn calibrate_all_volume(state: &AppState) -> (DeviceVolumeHint, i32, SharedString) {
+    let all = &state.calibrate_all;
+    let before = !matches!(all.phase, AllPhase::Running(_)) && all.sheet.is_none();
+    match state.speakers.iter().find(|speaker| speaker.is_reference()) {
+        Some(reference) if before => {
+            let (hint, percent) = device_volume_hint(reference.device_volume);
+            (hint, percent, reference.id.as_str().into())
+        }
+        _ => (DeviceVolumeHint::None, 0, SharedString::default()),
+    }
+}
+
+fn pin_phase(phase: ui_model::PinPhase) -> PinPhase {
+    match phase {
+        ui_model::PinPhase::Starting => PinPhase::Starting,
+        ui_model::PinPhase::Ready => PinPhase::Ready,
+        ui_model::PinPhase::Checking => PinPhase::Checking,
+    }
+}
+
+/// A speaker as a row shows it. `draft`: what is typed in its delay field.
+pub fn speaker_item(
+    state: &AppState,
+    speaker: &ui_model::Speaker,
+    show_kind: bool,
+    sync_open: bool,
+    draft: Option<&str>,
+) -> SpeakerItem {
+    let delay = format_offset_ms(speaker.delay_ms.unwrap_or(0.0));
+    let (device_volume, device_volume_percent) = device_volume_hint(speaker.device_volume);
+    let renamed = speaker.name != speaker.system_name;
+    SpeakerItem {
+        id: speaker.id.as_str().into(),
+        name: speaker.name.as_str().into(),
+        system_name: if renamed {
+            speaker.system_name.as_str().into()
+        } else {
+            SharedString::default()
+        },
+        device_name: speaker.system_name.as_str().into(),
+        // Set by the caller while the name is edited (`App::refresh`).
+        renaming: false,
+        name_text: SharedString::default(),
+        kind: speaker_kind(speaker.kind),
+        show_kind,
+        state: row_state(state.speaker_state(speaker)),
+        plays: state.speaker_state(speaker) == SpeakerState::Playing
+            && speaker
+                .cast
+                .as_ref()
+                .is_none_or(|cast| cast.state != ui_model::CastState::Paused),
+        volume: speaker.volume as f32,
+        has_delay: speaker.delay_ms.is_some(),
+        delay_ms: speaker.delay_ms.unwrap_or(0.0).round() as i32,
+        delay_pending: is_draft(draft, &delay),
+        delay_text: draft.map_or(delay, str::to_string).into(),
+        // Needs the strings: set by the caller (`App::refresh`).
+        delay_range_hint: SharedString::default(),
+        reference_name: state.reference_name.as_deref().unwrap_or_default().into(),
+        sync_open: sync_open && speaker.delay_ms.is_some(),
+        calibratable: is_calibratable(speaker),
+        calibrating: state.calibration.speaker_id.as_deref() == Some(speaker.id.as_str())
+            && state.calibration.phase.is_running(),
+        calibration_enabled: !state.calibration.busy
+            && calibration::unavailable(
+                state.running,
+                state.reference_name.is_some(),
+                speaker.enabled,
+            )
+            .is_none(),
+        // Needs the strings: set by the caller (`App::refresh`).
+        calibration_status: SharedString::default(),
+        calibration_privacy: offers_privacy(
+            state.calibration.speaker_id.as_deref() == Some(speaker.id.as_str())
+                && state.calibration.phase == Phase::Failed(Failure::MicrophoneDenied),
+            crate::platform::can_open_settings,
+        ),
+        // Needs the strings: set by the caller (`App::refresh`).
+        calibration_left_out: SharedString::default(),
+        auto_connect: speaker.auto_connect,
+        availability: availability(speaker.availability),
+        paired: speaker.paired,
+        holds_password: speaker.holds_password,
+        holds_credentials: speaker.holds_credentials,
+        code_every_time: speaker.code_every_time,
+        device_volume,
+        device_volume_percent,
+        cast: speaker.cast.is_some(),
+        cast_state: speaker
+            .cast
+            .as_ref()
+            .map_or(CastState::Idle, |cast| cast_state(cast.state)),
+        muted: speaker.cast.as_ref().is_some_and(|cast| cast.muted),
+        volume_fixed: speaker.cast.as_ref().is_some_and(|cast| cast.volume_fixed),
+        volume_step: speaker.cast.as_ref().map_or(1.0, |cast| cast.volume_step) as f32,
+        cast_group: cast_group(speaker).is_some(),
+        cast_added_by_address: speaker
+            .cast
+            .as_ref()
+            .is_some_and(|cast| cast.added_by_address),
+        hideable: !speaker.is_reference(),
+        // Needs the strings: set by the caller (`App::refresh`).
+        cast_group_note: SharedString::default(),
+        group_note: SharedString::default(),
+        zone_id: SharedString::default(),
+        zone_name: SharedString::default(),
+        zone_movable: speaker.in_target.is_none(),
+        // Needs the zones: set by the caller (`App::refresh`).
+        move_zones: ModelRc::default(),
+        // Needs the zone: set by the caller (`App::refresh`).
+        zone_note: SharedString::default(),
+        zone_dimmed: false,
+        missing: false,
+    }
+}
+
+/// The row of zone member `id` while it isn't listed: its name and kind as
+/// last known, and a menu that can still move it or take it out.
+fn missing_item(strings: &Strings<'_>, state: &AppState, zone_id: &str, id: &str) -> SpeakerItem {
+    let absent = state.absent_member(id);
+    let name = absent
+        .map(|member| member.name.as_str())
+        .filter(|name| !name.is_empty())
+        .map_or_else(|| strings.get_unknown_device(), SharedString::from);
+    let kind = absent.map_or(ui_model::SpeakerKind::Other, |member| member.kind);
+    SpeakerItem {
+        id: id.into(),
+        device_name: name.clone(),
+        name,
+        kind: speaker_kind(kind),
+        show_kind: !kind.is_this_pc(),
+        state: RowState::Off,
+        availability: Availability::Open,
+        volume_step: 1.0,
+        zone_id: zone_id.into(),
+        zone_movable: true,
+        missing: true,
+        ..SpeakerItem::default()
+    }
+}
+
+/// Whether a zone member's row is dimmed: as on the Mac, one that can't
+/// play with its zone, whether it is listed or not.
+fn zone_row_dimmed(row: ui_model::ZoneRow<'_>, note: ui_model::ZoneNote<'_>) -> bool {
+    matches!(row, ui_model::ZoneRow::NotFound(_))
+        || matches!(
+            note,
+            ui_model::ZoneNote::InTarget(_) | ui_model::ZoneNote::NeedsAirPlay2
+        )
+}
+
+/// The words of a zone member's note.
+fn zone_note(strings: &Strings<'_>, note: ui_model::ZoneNote<'_>) -> SharedString {
+    match note {
+        ui_model::ZoneNote::NeedsAirPlay2 => strings.get_needs_airplay2(),
+        ui_model::ZoneNote::InTarget(target) => strings.invoke_zone_member_in_target(target.into()),
+        ui_model::ZoneNote::NotFound => strings.get_zone_member_not_found(),
+        ui_model::ZoneNote::CastStayedOff => strings.get_cast_stayed_off(),
+    }
+}
+
+/// The entries of Speakers > Hidden Speakers.
+fn hidden_items(strings: &Strings<'_>, state: &AppState) -> Vec<HiddenItem> {
+    state
+        .hidden
+        .iter()
+        .map(|hidden| HiddenItem {
+            id: hidden.id.as_str().into(),
+            name: hidden.name.as_str().into(),
+            kind: hidden.present.map_or_else(
+                || hidden.kind_text.as_str().into(),
+                |kind| strings.invoke_speaker_kind(speaker_kind(kind)),
+            ),
+            present: hidden.present.is_some(),
+        })
+        .collect()
+}
+
+fn cast_group(speaker: &ui_model::Speaker) -> Option<&ui_model::CastGroup> {
+    speaker.cast.as_ref()?.group.as_ref()
+}
+
+/// The note under a Cast group's name, which Narrator reads too: what it
+/// is and its members as far as its session named them (spec C94). Empty
+/// for any other speaker.
+fn cast_group_note(strings: &Strings<'_>, speaker: &ui_model::Speaker) -> SharedString {
+    let Some(group) = cast_group(speaker) else {
+        return SharedString::default();
+    };
+    let (members, unknown) = match &group.members {
+        ui_model::CastMembers::NotReported => (SharedString::default(), false),
+        ui_model::CastMembers::Unknown => (SharedString::default(), true),
+        ui_model::CastMembers::Known(names) => (joined(strings, names), names.is_empty()),
+    };
+    strings.invoke_cast_group_note(members, unknown)
+}
+
+/// The line a stereo pair or home theater group row shows after its kind,
+/// which Narrator reads too: what it is and its members, or which member is
+/// missing (spec P176, P181). Empty for any other row.
+fn group_note(strings: &Strings<'_>, speaker: &ui_model::Speaker) -> SharedString {
+    let Some(group) = &speaker.group else {
+        return SharedString::default();
+    };
+    let kind = match group.kind {
+        AirPlayGroupKind::StereoPair => SpeakerGroup::StereoPair,
+        AirPlayGroupKind::HomeTheater => SpeakerGroup::HomeTheater,
+    };
+    strings.invoke_group_note(
+        kind,
+        joined(strings, &group.members),
+        joined(strings, &group.missing),
+        group.incomplete,
+    )
+}
+
+/// A local output with an offset (not the reference, AirPlay or Cast) that
+/// a microphone can hear: it can be calibrated with the microphone.
+fn is_calibratable(speaker: &ui_model::Speaker) -> bool {
+    speaker.delay_ms.is_some()
+        && speaker.cast.is_none()
+        && speaker.mic_left_out.is_none()
+        && !matches!(
+            speaker.kind,
+            ui_model::SpeakerKind::AirPlay
+                | ui_model::SpeakerKind::AirPlay2
+                | ui_model::SpeakerKind::Cast
+        )
+}
+
+/// What a calibration needs that is off, in the order streaming, `speaker`,
+/// the reference; all three when `missing` names none.
+fn calibration_needs(
+    strings: &Strings<'_>,
+    reference: &str,
+    missing: Missing,
+    speaker: SharedString,
+) -> SharedString {
+    let missing = if missing.is_empty() {
+        Missing::ALL
+    } else {
+        missing
+    };
+    let reference = if reference.is_empty() {
+        strings.get_calibration_own_speakers()
+    } else {
+        reference.into()
+    };
+    strings.invoke_calibration_needs(
+        missing.streaming,
+        if missing.speaker {
+            speaker
+        } else {
+            SharedString::default()
+        },
+        if missing.reference {
+            reference
+        } else {
+            SharedString::default()
+        },
+    )
+}
+
+/// Why a calibration of one speaker, or of all of them, can't start.
+fn calibration_turn_on(strings: &Strings<'_>, reference: &str, missing: Missing) -> SharedString {
+    let missing = if missing.is_empty() {
+        Missing::ALL
+    } else {
+        missing
+    };
+    let needs = calibration_needs(
+        strings,
+        reference,
+        missing,
+        strings.get_calibration_this_speaker(),
+    );
+    strings.invoke_calibration_turn_on(needs, missing.speaker)
+}
+
+/// The line under a speaker's Calibrate button: what its calibration does,
+/// how it ended, or why one can't start; empty when there is nothing to say.
+fn calibration_status(
+    strings: &Strings<'_>,
+    state: &AppState,
+    speaker: &ui_model::Speaker,
+) -> SharedString {
+    if !is_calibratable(speaker) {
+        return SharedString::default();
+    }
+    let reference = state.reference_name.as_deref().unwrap_or_default();
+    let shown = if state.calibration.speaker_id.as_deref() == Some(speaker.id.as_str()) {
+        state.calibration.phase
+    } else {
+        Phase::Idle
+    };
+    match shown {
+        Phase::Idle => calibration::unavailable(
+            state.running,
+            state.reference_name.is_some(),
+            speaker.enabled,
+        )
+        .map_or_else(
+            || {
+                let own = state.calibration.own_run_holds
+                    && state.calibration.speaker_id.as_deref() == Some(speaker.id.as_str());
+                if state.calibration.busy && !own {
+                    strings.get_calibrate_all_busy()
+                } else {
+                    SharedString::default()
+                }
+            },
+            |failure| calibration_failure(strings, reference, failure),
+        ),
+        Phase::Running(Step::Preparing) => strings.get_calibration_preparing(),
+        Phase::Running(Step::Measuring(Which::Reference)) => {
+            strings.invoke_calibration_listening(reference.into())
+        }
+        Phase::Running(Step::Measuring(Which::Chosen)) => {
+            strings.get_calibration_listening_chosen()
+        }
+        Phase::Running(Step::Estimating) => strings.get_calibration_estimating(),
+        Phase::Done { offset_ms, clamped } => {
+            let ms = offset_ms.round() as i32;
+            if clamped {
+                strings.invoke_calibration_done_clamped(ms)
+            } else {
+                strings.invoke_calibration_done(ms)
+            }
+        }
+        Phase::Cancelled => strings.get_calibration_cancelled(),
+        Phase::Failed(failure) => {
+            strings.invoke_calibration_failed(calibration_failure(strings, reference, failure))
+        }
+    }
+}
+
+/// Why microphone calibration leaves an output out, in its delay controls.
+fn calibration_left_out(strings: &Strings<'_>, kind: ui_model::MicKind) -> SharedString {
+    match kind {
+        ui_model::MicKind::Virtual => strings.get_calibration_left_out_virtual(),
+        _ => strings.get_calibration_left_out_headphones(),
+    }
+}
+
+/// Why Calibrate All leaves an output out, or that it is included anyway.
+fn left_out_reason(strings: &Strings<'_>, row: &LeftOutRow) -> SharedString {
+    match (row.included, row.kind) {
+        (true, _) => strings.get_calibrate_all_included(),
+        (false, kind) => calibration_left_out(strings, kind),
+    }
+}
+
+/// The speaker whose calibration just ended, once per ending, so Narrator
+/// hears how it ended without the focus moving to its line.
+fn calibration_ended(
+    announced: &mut Option<(String, Phase)>,
+    calibration: &ui_model::CalibrationState,
+) -> Option<String> {
+    let ended = matches!(
+        calibration.phase,
+        Phase::Done { .. } | Phase::Failed(_) | Phase::Cancelled
+    );
+    let now = calibration
+        .speaker_id
+        .clone()
+        .filter(|_| ended)
+        .map(|id| (id, calibration.phase));
+    if now == *announced {
+        return None;
+    }
+    announced.clone_from(&now);
+    now.map(|(id, _)| id)
+}
+
+/// What the Calibrate All card shows.
+struct CalibrateAllCard {
+    running: bool,
+    can_start: bool,
+    status: SharedString,
+    /// The status only says what a run does, so it is the row's tooltip.
+    status_is_hint: bool,
+    privacy: bool,
+    results_shown: bool,
+    rows: Vec<CalibrationRowItem>,
+    left_out: Vec<LeftOutItem>,
+    airplay: SharedString,
+    /// For a Calibrate Zone run: where to bring the PC.
+    zone: SharedString,
+    outcome: SharedString,
+    can_apply: bool,
+    /// Apply set the new delays: Close reads Done, as on the Mac.
+    applied: bool,
+    can_undo: bool,
+    /// What Narrator hears when the run, Apply or Undo ends.
+    said: SharedString,
+    /// The reference's hint under "Before you start" and its fix's speaker ID.
+    volume: (DeviceVolumeHint, i32, SharedString),
+    reference: SharedString,
+}
+
+/// Whether a calibration the microphone refused (`denied`) offers Open
+/// Privacy Settings: only where something can open that page (`can_open`,
+/// [`crate::platform::can_open_settings`]), which Linux can't.
+fn offers_privacy(denied: bool, can_open: impl Fn(&str) -> bool) -> bool {
+    denied && can_open(SettingsPage::MicrophonePrivacy.uri())
+}
+
+fn calibrate_all_card(strings: &Strings<'_>, state: &AppState) -> CalibrateAllCard {
+    let all = &state.calibrate_all;
+    let busy = state.calibration.busy;
+    let reference = state.reference_name.as_deref().unwrap_or_default();
+    let status = match &all.phase {
+        AllPhase::Running(progress) => all_progress_text(strings, progress),
+        AllPhase::Failed(Failure::NothingToMeasure) if all.zone.is_some() => {
+            let zone = all.zone.as_ref().map_or("", |zone| zone.name.as_str());
+            strings.invoke_calibrate_all_stopped(strings.invoke_calibrate_zone_nothing(zone.into()))
+        }
+        AllPhase::Failed(failure) => {
+            strings.invoke_calibrate_all_stopped(calibration_failure(strings, reference, *failure))
+        }
+        AllPhase::Stale => strings.get_calibrate_all_stale(),
+        AllPhase::Ended(reason) => {
+            strings.invoke_calibrate_all_stopped(ended_text(strings, *reason))
+        }
+        AllPhase::CannotMeasureAgain(name, missing) => strings.invoke_calibrate_all_cannot_again(
+            calibration_needs(strings, reference, *missing, name.as_str().into()),
+        ),
+        AllPhase::Idle if all.other_running => strings.get_calibrate_all_busy(),
+        AllPhase::Idle => match all.blocked {
+            Some(Failure::NoReference) => strings.get_calibration_no_reference(),
+            Some(Failure::NothingToMeasure) => {
+                strings.invoke_calibrate_all_nothing(reference.into())
+            }
+            Some(Failure::OnlyLeftOut) => strings.get_calibrate_all_only_left_out(),
+            Some(failure) => calibration_failure(strings, reference, failure),
+            None => strings.invoke_calibrate_all_hint(reference.into()),
+        },
+    };
+    let failed = matches!(
+        all.phase,
+        AllPhase::Failed(_) | AllPhase::Stale | AllPhase::CannotMeasureAgain(..)
+    );
+    let sheet = all.sheet.as_ref();
+    let outcome = sheet.map_or_else(SharedString::default, |sheet| {
+        sheet_outcome(strings, reference, sheet)
+    });
+    let said = if failed || outcome.is_empty() {
+        status.clone()
+    } else {
+        outcome.clone()
+    };
+    CalibrateAllCard {
+        status_is_hint: all.phase == AllPhase::Idle && !all.other_running && all.blocked.is_none(),
+        running: matches!(all.phase, AllPhase::Running(_)),
+        can_start: !busy && all.blocked.is_none(),
+        privacy: offers_privacy(
+            all.phase == AllPhase::Failed(Failure::MicrophoneDenied)
+                || sheet.is_some_and(|sheet| sheet.failure == Some(Failure::MicrophoneDenied)),
+            crate::platform::can_open_settings,
+        ),
+        results_shown: sheet.is_some(),
+        left_out: all
+            .left_out
+            .iter()
+            .map(|row| LeftOutItem {
+                id: row.id.as_str().into(),
+                name: row.name.as_str().into(),
+                reason: left_out_reason(strings, row),
+                help: match row.kind {
+                    ui_model::MicKind::Virtual => strings.get_include_anyway_help_virtual(),
+                    _ => strings.get_include_anyway_help_headphones(),
+                },
+                included: row.included,
+            })
+            .collect(),
+        rows: sheet.map_or_else(Vec::new, |sheet| {
+            let off = all.zone.as_ref().map_or(&[][..], |zone| &zone.off_rows);
+            sheet
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| CalibrationRowItem {
+                    name: row.name.as_str().into(),
+                    detail: if off.contains(&index) {
+                        strings.get_calibrate_all_off()
+                    } else {
+                        row_detail(strings, reference, row)
+                    },
+                    can_measure_again: row.can_measure_again && !busy,
+                })
+                .collect()
+        }),
+        airplay: sheet.and_then(|sheet| sheet.airplay.as_ref()).map_or_else(
+            SharedString::default,
+            |shared| {
+                let line = airplay_line(strings, shared);
+                match all
+                    .zone
+                    .as_ref()
+                    .and_then(|zone| airplay_moves_line(strings, &zone.airplay_moves))
+                {
+                    Some(moves) => format!("{line} {moves}").into(),
+                    None => line,
+                }
+            },
+        ),
+        zone: all
+            .zone
+            .as_ref()
+            .map_or_else(SharedString::default, |zone| {
+                strings.invoke_calibrate_zone_bring(zone.name.as_str().into())
+            }),
+        outcome,
+        can_apply: sheet.is_some_and(|sheet| sheet.can_apply),
+        applied: sheet.is_some_and(|sheet| sheet.applied),
+        can_undo: sheet.is_some_and(|sheet| sheet.can_undo),
+        status,
+        said,
+        volume: calibrate_all_volume(state),
+        reference: reference.into(),
+    }
+}
+
+fn all_progress_text(strings: &Strings<'_>, progress: &AllProgress) -> SharedString {
+    match progress {
+        AllProgress::Preparing => strings.get_calibration_preparing(),
+        AllProgress::Measuring {
+            name,
+            reference: true,
+            ..
+        } => strings.invoke_calibration_listening(name.as_str().into()),
+        AllProgress::Measuring {
+            name,
+            searching: true,
+            ..
+        } => strings.invoke_calibrate_all_searching(name.as_str().into()),
+        AllProgress::Measuring { name, take, .. } => strings
+            .invoke_calibrate_all_sweep(name.as_str().into(), i32::try_from(*take).unwrap_or(1)),
+        AllProgress::Estimating => strings.get_calibrate_all_estimating(),
+    }
+}
+
+fn ended_text(strings: &Strings<'_>, reason: EndReason) -> SharedString {
+    match reason {
+        EndReason::Cancelled => strings.get_calibrate_all_ended_cancelled(),
+        EndReason::SpeakersChanged => strings.get_calibrate_all_ended_speakers(),
+        EndReason::SpeakerTurnedOff => strings.get_calibrate_all_ended_off(),
+        EndReason::SourceChanged => strings.get_calibrate_all_ended_source(),
+        EndReason::DelaysChanged => strings.get_calibrate_all_ended_delays(),
+    }
+}
+
+/// The line under the results: how the run, Apply, Undo or the last
+/// Measure Again ended.
+fn sheet_outcome(strings: &Strings<'_>, reference: &str, sheet: &SheetState) -> SharedString {
+    if let Some(failure) = sheet.failure {
+        return strings
+            .invoke_calibrate_all_stopped(calibration_failure(strings, reference, failure));
+    }
+    if let Some(reason) = sheet.ended {
+        return strings.invoke_calibrate_all_stopped(ended_text(strings, reason));
+    }
+    if sheet.undone {
+        return strings.get_calibrate_all_undone();
+    }
+    if sheet.applied {
+        return strings.get_calibrate_all_applied();
+    }
+    if let Some(reason) = sheet.again_ended {
+        return strings.invoke_calibrate_all_again_stopped(ended_text(strings, reason));
+    }
+    let measured = sheet
+        .rows
+        .iter()
+        .filter(|row| row.state != SheetRowState::Reference);
+    let clear = measured
+        .clone()
+        .filter(|row| row.state.is_certain())
+        .count();
+    if clear == 0 {
+        return strings.get_calibrate_all_nothing_certain();
+    }
+    strings.invoke_calibrate_all_finished(count(clear), count(measured.count()))
+}
+
+/// A delay as its field shows it: a local speaker's relative to the
+/// reference, with its sign; a Cast or AirPlay delay as is.
+fn sheet_ms(strings: &Strings<'_>, class: Class, ms: f64) -> SharedString {
+    let ms = ms.round() as i32;
+    match class {
+        Class::Local => strings.invoke_delay_value(ms),
+        Class::Cast | Class::AirPlay => strings.invoke_calibrate_all_ms(ms),
+    }
+}
+
+fn row_detail(strings: &Strings<'_>, reference: &str, row: &SheetRow) -> SharedString {
+    let old = row.old_ms.map_or_else(
+        || strings.get_calibrate_all_none(),
+        |ms| sheet_ms(strings, row.class, ms),
+    );
+    let measured = |m: &Measurement| {
+        (
+            old.clone(),
+            sheet_ms(strings, row.class, m.new_ms),
+            m.uncertainty_ms.ceil().max(1.0) as i32,
+        )
+    };
+    match &row.state {
+        SheetRowState::Reference => strings.get_calibrate_all_reference(),
+        SheetRowState::NotMeasured => strings.get_calibrate_all_not_measured(),
+        SheetRowState::Certain(m) => {
+            let (old, new, uncertainty) = measured(m);
+            if m.clamped {
+                strings.invoke_calibrate_all_clamped(old, new, uncertainty)
+            } else {
+                strings.invoke_calibrate_all_certain(old, new, uncertainty)
+            }
+        }
+        SheetRowState::Uncertain(m) => {
+            let (old, new, uncertainty) = measured(m);
+            strings.invoke_calibrate_all_uncertain(old, new, uncertainty)
+        }
+        SheetRowState::Refused(refused) => match calibration::outcome(&Err(*refused)) {
+            calibration::Outcome::Refuse(failure) => strings
+                .invoke_calibrate_all_refused(calibration_failure(strings, reference, failure)),
+            calibration::Outcome::Commit { .. } => strings.get_calibrate_all_not_measured(),
+        },
+    }
+}
+
+fn airplay_line(strings: &Strings<'_>, shared: &AirPlayShared) -> SharedString {
+    let old = shared.old_ms.map_or_else(
+        || strings.get_calibrate_all_none(),
+        |ms| sheet_ms(strings, Class::AirPlay, ms),
+    );
+    let new = shared.new_ms.unwrap_or(0.0).round() as i32;
+    let spread = shared.spread_ms.round() as i32;
+    let set = if shared.certain_rows == 1 {
+        strings.invoke_calibrate_all_airplay_one(old.clone(), new)
+    } else {
+        strings.invoke_calibrate_all_airplay_median(
+            old.clone(),
+            new,
+            count(shared.certain_rows),
+            spread,
+        )
+    };
+    match shared.state {
+        SharedState::NoneCertain => strings.invoke_calibrate_all_airplay_none(old),
+        SharedState::Certain => set,
+        SharedState::Spread => {
+            let differ = strings.invoke_calibrate_all_airplay_spread(spread);
+            format!("{set} {differ}").into()
+        }
+    }
+}
+
+/// Under a zone run's AirPlay line: the other zones the shared delay moves,
+/// and the speakers in no zone (spec S255); `None` when it moves no other.
+fn airplay_moves_line(strings: &Strings<'_>, moves: &AirPlayMoves) -> Option<SharedString> {
+    let quoted: Vec<String> = moves
+        .zones
+        .iter()
+        .map(|name| strings.invoke_zone_quoted(name.as_str().into()).into())
+        .collect();
+    let named = (!quoted.is_empty()).then(|| joined(strings, &quoted));
+    match (named, moves.no_zone) {
+        (None, false) => None,
+        (None, true) => Some(strings.get_calibrate_zone_airplay_no_zone()),
+        (Some(named), false) => Some(strings.invoke_calibrate_zone_airplay_zones(named)),
+        (Some(named), true) => Some(strings.invoke_calibrate_zone_airplay_both(named)),
+    }
+}
+
+fn calibration_failure(strings: &Strings<'_>, reference: &str, failure: Failure) -> SharedString {
+    let subject = |which: Option<Which>| -> SharedString {
+        match which {
+            Some(Which::Reference) if !reference.is_empty() => reference.into(),
+            Some(Which::Chosen) => strings.get_calibration_this_speaker(),
+            _ => strings.get_calibration_a_speaker(),
+        }
+    };
+    match failure {
+        Failure::NoReference => strings.get_calibration_no_reference(),
+        Failure::NotPlaying(missing) => calibration_turn_on(strings, reference, missing),
+        Failure::MicrophoneDenied => strings.get_calibration_microphone_denied(),
+        Failure::NoMicrophone => strings.get_calibration_no_microphone(),
+        Failure::UnsupportedRate => strings.get_calibration_unsupported_rate(),
+        Failure::SourceSilent => strings.get_calibration_source_silent(),
+        Failure::Interrupted => strings.get_calibration_interrupted(),
+        Failure::DelayChanged => strings.get_calibration_delay_changed(),
+        Failure::MicrophoneChanged => strings.get_calibration_microphone_changed(),
+        Failure::MicrophoneSkipped => strings.get_calibration_microphone_skipped(),
+        Failure::HandsFreeMicrophone => strings.get_calibration_hands_free(),
+        Failure::MicrophoneInUse => strings.get_calibration_microphone_in_use(),
+        Failure::Unfinished => strings.get_calibration_unfinished(),
+        Failure::NothingToMeasure => strings.invoke_calibrate_all_nothing(reference.into()),
+        Failure::OnlyLeftOut => strings.get_calibrate_all_only_left_out(),
+        Failure::TooShort(_) => strings.get_calibration_too_short(),
+        Failure::TooLong(_) => strings.get_calibration_too_long(),
+        Failure::Clipped(which) => strings.invoke_calibration_clipped(subject(which)),
+        Failure::TooQuiet(which) => strings.invoke_calibration_too_quiet(subject(which)),
+        Failure::AmbiguousEcho(which) => strings.invoke_calibration_echo(subject(which)),
+        Failure::Implausible => strings.get_calibration_implausible(),
+    }
+}
+
+pub fn notice_item(strings: &Strings<'_>, notice: &ui_model::Notice) -> NoticeItem {
+    NoticeItem {
+        id: i32::try_from(notice.id).unwrap_or(i32::MAX),
+        message: notice_text(strings, &notice.message),
+        title: notice_title(strings, &notice.message),
+        time: notice.time.as_str().into(),
+        has_guide: guide::guide(&notice.message).is_some(),
+        has_retry: notice.message == NoticeMessage::AirPlayStopped,
+        has_privacy: matches!(notice.message, NoticeMessage::MicrophoneBlocked { .. }),
+        update_buttons: update_buttons(&notice.message),
+        info: notice.message.reports_a_change(),
+        fresh: false,
+        closing: false,
+    }
+}
+
+/// Names as one list, "A, B and C": `separator` between all but the last
+/// two, then `and` (the UI's words for "head and last").
+fn join_names(names: &[String], separator: &str, and: impl FnOnce(&str, &str) -> String) -> String {
+    match names {
+        [] => String::new(),
+        [only] => only.clone(),
+        [head @ .., last] => and(&head.join(separator), last),
+    }
+}
+
+/// A source in the UI's words, as the source picker names it: the notices
+/// about the chosen source and the double-audio guide use it.
+fn source_name(strings: &Strings<'_>, source: &SourceName) -> SharedString {
+    match source {
+        SourceName::Named(name) => name.as_str().into(),
+        SourceName::Apps(names) => joined(strings, names),
+        SourceName::AllAppsExcept(names) => {
+            strings.invoke_source_all_except(joined(strings, names))
+        }
+    }
+}
+
+/// `source_name` for the middle of a sentence.
+fn inline_source_name(strings: &Strings<'_>, source: &SourceName) -> SharedString {
+    match source {
+        SourceName::AllAppsExcept(names) => {
+            strings.invoke_source_all_except_inline(joined(strings, names))
+        }
+        _ => source_name(strings, source),
+    }
+}
+
+/// A source or channel pair as the source picker names it.
+fn switch_name(strings: &Strings<'_>, name: &SwitchName) -> SharedString {
+    match name {
+        SwitchName::System => strings.get_source_system(),
+        SwitchName::Source(source) => source_name(strings, source),
+        SwitchName::Channels { first, last } => {
+            strings.invoke_input_channel_pair(i32::from(*first), i32::from(*last))
+        }
+    }
+}
+
+/// Output names as one list in the UI's words: what every notice and the
+/// guide name outputs with.
+fn joined(strings: &Strings<'_>, names: &[String]) -> SharedString {
+    join_names(names, &strings.get_list_separator(), |head, last| {
+        strings
+            .invoke_list_and(head.into(), last.into())
+            .to_string()
+    })
+    .into()
+}
+
+/// The guide's first paragraph, in the UI's words.
+fn guide_intro(strings: &Strings<'_>, guide: &Guide) -> SharedString {
+    let outputs = joined(strings, &guide.outputs);
+    match &guide.source {
+        Some(source) => strings.invoke_guide_intro_app(source_name(strings, source), outputs),
+        None => strings.invoke_guide_intro_system(outputs),
+    }
+}
+
+/// A guide step in the UI's words.
+fn guide_step_text(strings: &Strings<'_>, step: &GuideStep) -> SharedString {
+    match step {
+        GuideStep::RouteApp {
+            app: SourceName::AllAppsExcept(names),
+        } => strings.invoke_guide_route_all_except(joined(strings, names)),
+        GuideStep::RouteApp { app } => strings.invoke_guide_route_app(source_name(strings, app)),
+        GuideStep::ChangeDefault { current } => {
+            strings.invoke_guide_change_default(current.as_str().into())
+        }
+        GuideStep::RouteOtherApps { outputs } => {
+            strings.invoke_guide_route_other_apps(joined(strings, outputs))
+        }
+        GuideStep::MuteOutputs { outputs } => {
+            strings.invoke_guide_mute_outputs(joined(strings, outputs), count(outputs.len()))
+        }
+        GuideStep::SharedOutputs { outputs } => {
+            strings.invoke_guide_shared_outputs(joined(strings, outputs))
+        }
+        GuideStep::KeepAppUnmuted {
+            app: SourceName::AllAppsExcept(names),
+        } => strings.invoke_guide_keep_all_except_unmuted(joined(strings, names)),
+        GuideStep::KeepAppUnmuted { app } => {
+            strings.invoke_guide_keep_app_unmuted(source_name(strings, app))
+        }
+    }
+}
+
+/// The UI's name of a step's Settings page; none when nothing installed
+/// could show it, so the step has no button.
+fn guide_page(page: Option<SettingsPage>) -> GuidePage {
+    if page.is_some_and(|page| !crate::platform::can_open_settings(page.uri())) {
+        return GuidePage::None;
+    }
+    match page {
+        None | Some(SettingsPage::MicrophonePrivacy | SettingsPage::NetworkStatus) => {
+            GuidePage::None
+        }
+        Some(SettingsPage::VolumeMixer) => GuidePage::VolumeMixer,
+        Some(SettingsPage::Sound) => GuidePage::Sound,
+    }
+}
+
+/// The Settings page a step's button asks for.
+fn settings_page(page: GuidePage) -> Option<SettingsPage> {
+    match page {
+        GuidePage::None => None,
+        GuidePage::VolumeMixer => Some(SettingsPage::VolumeMixer),
+        GuidePage::Sound => Some(SettingsPage::Sound),
+    }
+}
+
+/// A notice in the UI's words.
+fn notice_text(strings: &Strings<'_>, message: &NoticeMessage) -> SharedString {
+    match message {
+        NoticeMessage::NoSpeaker => strings.get_notice_no_speaker(),
+        NoticeMessage::SourceQuit { source } => {
+            strings.invoke_notice_source_quit(source_name(strings, source))
+        }
+        NoticeMessage::SourceSwitched { source } => {
+            strings.invoke_notice_source_switched(source_name(strings, source))
+        }
+        NoticeMessage::SwitchFailed { new, old } => strings
+            .invoke_notice_switch_failed(switch_name(strings, new), switch_name(strings, old)),
+        NoticeMessage::SourceNotRunning {
+            source: SourceName::Apps(names),
+        } if names.len() > 1 => strings.invoke_notice_sources_not_running(joined(strings, names)),
+        NoticeMessage::SourceNotRunning { source } => {
+            strings.invoke_notice_source_not_running(source_name(strings, source))
+        }
+        NoticeMessage::SourceRefused { source } => {
+            strings.invoke_notice_source_refused(inline_source_name(strings, source))
+        }
+        NoticeMessage::InputNotConnected { source } => {
+            strings.invoke_notice_input_not_connected(name_or_unknown(strings, source))
+        }
+        NoticeMessage::InputHandsFree => strings.get_notice_input_hands_free(),
+        NoticeMessage::InputDisconnected { source } => {
+            strings.invoke_notice_input_disconnected(name_or_unknown(strings, source))
+        }
+        NoticeMessage::MicrophoneBlocked { source } => {
+            strings.invoke_notice_microphone_blocked(name_or_unknown(strings, source))
+        }
+        NoticeMessage::CaptureFailed => strings.get_notice_capture_failed(),
+        NoticeMessage::CaptureLost => strings.get_notice_capture_lost(),
+        NoticeMessage::WaitingForAudio { app: Some(app) } => {
+            strings.invoke_notice_waiting_for_audio_from(app.as_str().into())
+        }
+        NoticeMessage::WaitingForAudio { app: None } => strings.get_notice_waiting_for_audio(),
+        NoticeMessage::SpeakerFailed { speaker } => {
+            strings.invoke_notice_speaker_failed(speaker.as_str().into())
+        }
+        NoticeMessage::SpeakerLost { speaker } => {
+            strings.invoke_notice_speaker_lost(speaker.as_str().into())
+        }
+        NoticeMessage::SpeakerBusy { speaker } => {
+            strings.invoke_notice_speaker_busy(speaker.as_str().into())
+        }
+        NoticeMessage::SpeakerStruggling { speaker } => {
+            strings.invoke_notice_speaker_struggling(speaker.as_str().into())
+        }
+        NoticeMessage::PairFirst { speaker } => {
+            strings.invoke_notice_pair_first(name_or_unknown(strings, speaker))
+        }
+        NoticeMessage::AirPlayCantPlay {
+            speaker,
+            problem: ui_model::AirPlayProblem::Refused,
+        } => strings.invoke_notice_airplay_refused_off(speaker.as_str().into()),
+        NoticeMessage::AirPlayCantPlay {
+            speaker,
+            problem:
+                ui_model::AirPlayProblem::NotResponding | ui_model::AirPlayProblem::ConnectionLost,
+        } => strings.invoke_notice_airplay_unreachable_off(speaker.as_str().into()),
+        NoticeMessage::AirPlayCantPlay {
+            speaker,
+            problem: ui_model::AirPlayProblem::Busy,
+        } => strings.invoke_notice_airplay_busy_off(speaker.as_str().into()),
+        NoticeMessage::AirPlayRetrying { speaker, problem }
+        | NoticeMessage::AirPlayCantPlay { speaker, problem } => {
+            strings.invoke_notice_airplay(airplay_problem(*problem), speaker.as_str().into())
+        }
+        NoticeMessage::AirPlayPlaysInGroup { speaker, target } => strings
+            .invoke_notice_airplay_plays_in_group(speaker.as_str().into(), target.as_str().into()),
+        NoticeMessage::AirPlayMemberNeedsPassword { target, member } => strings
+            .invoke_notice_airplay_member_password(member.as_str().into(), target.as_str().into()),
+        NoticeMessage::CastCantPlay { speaker, problem } => {
+            strings.invoke_notice_cast(cast_problem(*problem), speaker.as_str().into())
+        }
+        NoticeMessage::AirPlayAheadOfCast { speaker, tenths } => {
+            let seconds = format!("{}.{}", tenths / 10, tenths % 10);
+            strings.invoke_notice_airplay_ahead(seconds.into(), speaker.as_str().into())
+        }
+        NoticeMessage::AirPlayStopped => strings.get_notice_airplay_stopped(),
+        NoticeMessage::AirPlayPtpPortsTaken => strings.get_notice_airplay_ptp_ports_taken(),
+        NoticeMessage::SettingsNotSaved => strings.get_notice_settings_not_saved(),
+        NoticeMessage::PairingsNotSaved => strings.get_notice_pairings_not_saved(),
+        NoticeMessage::SettingsKeptAside { file, newer: false } => {
+            strings.invoke_notice_settings_kept_aside(file.as_str().into())
+        }
+        NoticeMessage::SettingsKeptAside { file, newer: true } => {
+            strings.invoke_notice_settings_from_newer(file.as_str().into())
+        }
+        NoticeMessage::PairingsKeptAside { file } => {
+            strings.invoke_notice_pairings_kept_aside(file.as_str().into())
+        }
+        NoticeMessage::NoSoundOutput => strings.get_notice_no_sound_output(),
+        NoticeMessage::LaunchAtLoginFailed => strings.get_notice_launch_at_login_failed(),
+        NoticeMessage::LaunchAtLoginNotRemoved => strings.get_notice_launch_at_login_not_removed(),
+        NoticeMessage::LaunchAtLoginOffInSettings => {
+            strings.get_notice_launch_at_login_off_in_settings()
+        }
+        NoticeMessage::RemoteOnPublicNetwork => strings.get_remote_public_network(),
+        NoticeMessage::GroupsBecameZones => strings.get_notice_groups_became_zones(),
+        NoticeMessage::Update(notice) => update_notice_text(strings, notice),
+        NoticeMessage::DialogMessage { text, .. } => text.as_str().into(),
+        NoticeMessage::PresetLeftOff {
+            preset,
+            left_off,
+            nothing_changed,
+        } => {
+            let members: Vec<String> = left_off
+                .iter()
+                .map(|(name, reason)| {
+                    strings
+                        .invoke_preset_member_left_off(
+                            name_or_unknown(strings, name),
+                            preset_left_off(strings, reason),
+                        )
+                        .to_string()
+                })
+                .collect();
+            // Commas only, as on the Mac: each item already ends in its reason.
+            let list: SharedString = members.join(&strings.get_list_separator()).into();
+            if *nothing_changed {
+                strings.invoke_preset_nothing_changed(preset.as_str().into(), list)
+            } else {
+                strings.invoke_preset_left_off(preset.as_str().into(), list)
+            }
+        }
+        NoticeMessage::HeardTwice {
+            source,
+            mute,
+            shared,
+            ..
+        } => {
+            let mute = joined(strings, mute);
+            let shared = joined(strings, shared);
+            match source {
+                Some(source) => strings.invoke_notice_heard_twice_app(
+                    source_name(strings, source),
+                    mute,
+                    shared,
+                ),
+                None => strings.invoke_notice_heard_twice_system(mute, shared),
+            }
+        }
+    }
+}
+
+/// A recalled member AudioSync never learned a name for reads "Unknown device".
+fn name_or_unknown(strings: &Strings<'_>, name: &str) -> SharedString {
+    match name {
+        "" => strings.get_unknown_device(),
+        name => name.into(),
+    }
+}
+
+/// Why a preset's member stayed off, as the preset notice says it.
+fn preset_left_off(strings: &Strings<'_>, reason: &PresetLeftOff) -> SharedString {
+    match reason {
+        PresetLeftOff::NotFound => strings.get_zone_member_not_found(),
+        PresetLeftOff::Hidden => strings.get_preset_hidden(),
+        PresetLeftOff::NeedsAirPlay2 => strings.get_needs_airplay2(),
+        PresetLeftOff::InTarget(target) => {
+            strings.invoke_zone_member_in_target(target.as_str().into())
+        }
+        PresetLeftOff::Busy => strings.get_preset_busy(),
+        PresetLeftOff::Offline => strings.get_preset_offline(),
+        PresetLeftOff::CantPlay => strings.get_preset_cant_play(),
+    }
+}
+
+/// The presets as the Presets card, View > Presets and the flyout list them.
+fn preset_items(state: &AppState) -> Vec<PresetItem> {
+    state
+        .presets
+        .iter()
+        .map(|preset| PresetItem {
+            id: preset.id.as_str().into(),
+            name: preset.name.as_str().into(),
+            current: state.current_preset.as_deref() == Some(preset.id.as_str()),
+        })
+        .collect()
+}
+
+/// The current preset's name; empty while none is current.
+fn current_preset_name(state: &AppState) -> &str {
+    state
+        .presets
+        .iter()
+        .find(|preset| state.current_preset.as_deref() == Some(preset.id.as_str()))
+        .map_or("", |preset| preset.name.as_str())
+}
+
+/// A few words that name a notice, for its dismiss button.
+fn notice_title(strings: &Strings<'_>, message: &NoticeMessage) -> SharedString {
+    let (kind, name) = match message {
+        NoticeMessage::NoSpeaker => (NoticeKind::NoSpeaker, ""),
+        NoticeMessage::SourceQuit { source } => {
+            return strings
+                .invoke_notice_title(NoticeKind::SourceQuit, source_name(strings, source));
+        }
+        NoticeMessage::SourceSwitched { source } => {
+            return strings
+                .invoke_notice_title(NoticeKind::SourceSwitched, source_name(strings, source));
+        }
+        NoticeMessage::SwitchFailed { new, .. } => {
+            return strings
+                .invoke_notice_title(NoticeKind::SwitchFailed, switch_name(strings, new));
+        }
+        NoticeMessage::SourceNotRunning { source } => {
+            return strings
+                .invoke_notice_title(NoticeKind::SourceNotRunning, source_name(strings, source));
+        }
+        NoticeMessage::SourceRefused { source } => {
+            return strings.invoke_notice_title(
+                NoticeKind::SourceRefused,
+                inline_source_name(strings, source),
+            );
+        }
+        NoticeMessage::InputNotConnected { source } => {
+            return strings.invoke_notice_title(
+                NoticeKind::InputNotConnected,
+                name_or_unknown(strings, source),
+            );
+        }
+        NoticeMessage::InputDisconnected { source } => {
+            return strings.invoke_notice_title(
+                NoticeKind::InputDisconnected,
+                name_or_unknown(strings, source),
+            );
+        }
+        NoticeMessage::InputHandsFree => (NoticeKind::InputHandsFree, ""),
+        NoticeMessage::MicrophoneBlocked { .. } => (NoticeKind::MicrophoneBlocked, ""),
+        NoticeMessage::CaptureFailed => (NoticeKind::CaptureFailed, ""),
+        NoticeMessage::CaptureLost => (NoticeKind::CaptureLost, ""),
+        NoticeMessage::WaitingForAudio { .. } => (NoticeKind::WaitingForAudio, ""),
+        NoticeMessage::SpeakerFailed { speaker } => (NoticeKind::SpeakerFailed, speaker.as_str()),
+        NoticeMessage::SpeakerLost { speaker } => (NoticeKind::SpeakerLost, speaker.as_str()),
+        NoticeMessage::SpeakerBusy { speaker } => (NoticeKind::SpeakerBusy, speaker.as_str()),
+        NoticeMessage::SpeakerStruggling { speaker } => {
+            (NoticeKind::SpeakerStruggling, speaker.as_str())
+        }
+        NoticeMessage::PairFirst { speaker } => (NoticeKind::PairFirst, speaker.as_str()),
+        NoticeMessage::AirPlayRetrying {
+            speaker,
+            problem:
+                ui_model::AirPlayProblem::TooManyAirPlay2Speakers
+                | ui_model::AirPlayProblem::PtpOtherNetwork,
+        } => (NoticeKind::AirplayWaiting, speaker.as_str()),
+        NoticeMessage::AirPlayRetrying { speaker, .. } => {
+            (NoticeKind::AirplayRetrying, speaker.as_str())
+        }
+        NoticeMessage::AirPlayCantPlay { speaker, .. } => {
+            (NoticeKind::AirplayCantPlay, speaker.as_str())
+        }
+        NoticeMessage::AirPlayMemberNeedsPassword { target, .. } => {
+            (NoticeKind::AirplayCantPlay, target.as_str())
+        }
+        NoticeMessage::AirPlayPlaysInGroup { speaker, .. } => {
+            (NoticeKind::AirplayCantPlay, speaker.as_str())
+        }
+        NoticeMessage::CastCantPlay { speaker, .. } => (NoticeKind::CastCantPlay, speaker.as_str()),
+        NoticeMessage::AirPlayAheadOfCast { speaker, .. } => {
+            (NoticeKind::AirplayAheadOfCast, speaker.as_str())
+        }
+        NoticeMessage::AirPlayStopped => (NoticeKind::AirplayStopped, ""),
+        NoticeMessage::AirPlayPtpPortsTaken => (NoticeKind::AirplayPtpPortsTaken, ""),
+        NoticeMessage::SettingsNotSaved => (NoticeKind::SettingsNotSaved, ""),
+        NoticeMessage::PairingsNotSaved => (NoticeKind::PairingsNotSaved, ""),
+        NoticeMessage::SettingsKeptAside { newer: false, .. } => {
+            (NoticeKind::SettingsKeptAside, "")
+        }
+        NoticeMessage::SettingsKeptAside { newer: true, .. } => (NoticeKind::SettingsFromNewer, ""),
+        NoticeMessage::PairingsKeptAside { .. } => (NoticeKind::PairingsKeptAside, ""),
+        NoticeMessage::NoSoundOutput => (NoticeKind::NoSoundOutput, ""),
+        NoticeMessage::LaunchAtLoginFailed => (NoticeKind::LaunchAtLoginFailed, ""),
+        NoticeMessage::LaunchAtLoginNotRemoved => (NoticeKind::LaunchAtLoginNotRemoved, ""),
+        NoticeMessage::LaunchAtLoginOffInSettings => (NoticeKind::LaunchAtLoginOffInSettings, ""),
+        NoticeMessage::RemoteOnPublicNetwork => (NoticeKind::RemotePublicNetwork, ""),
+        NoticeMessage::GroupsBecameZones => (NoticeKind::GroupsBecameZones, ""),
+        NoticeMessage::Update(_) => (NoticeKind::Update, ""),
+        NoticeMessage::DialogMessage { title, .. } => return title.as_str().into(),
+        NoticeMessage::PresetLeftOff {
+            nothing_changed: true,
+            ..
+        } => (NoticeKind::PresetsNothingChanged, ""),
+        NoticeMessage::PresetLeftOff { .. } => (NoticeKind::PresetsLeftOff, ""),
+        NoticeMessage::HeardTwice { .. } => (NoticeKind::HeardTwice, ""),
+    };
+    strings.invoke_notice_title(kind, name.into())
+}
+
+/// The updater's notice in the UI's words (spec S308).
+fn update_notice_text(strings: &Strings<'_>, notice: &ui_model::UpdaterNotice) -> SharedString {
+    use ui_model::UpdaterNotice as N;
+    match notice {
+        N::Available {
+            new,
+            running,
+            last: None | Some(ui_model::UpdateRecordReason::Skipped),
+        } => strings.invoke_notice_update_available(new.into(), running.into()),
+        N::Available {
+            new,
+            running,
+            last: Some(ui_model::UpdateRecordReason::Blocked),
+        } => strings.invoke_notice_update_available_blocked_before(new.into(), running.into()),
+        N::Available {
+            new,
+            running,
+            last: Some(ui_model::UpdateRecordReason::FailedStart),
+        } => strings.invoke_notice_update_available_failed_before(new.into(), running.into()),
+        N::Downloading {
+            percent: Some(percent),
+        } => strings.invoke_notice_update_downloading(percent.to_string().into()),
+        N::Checking => strings.get_notice_update_checking(),
+        N::Downloading { percent: None } => strings.get_notice_update_downloading_started(),
+        N::Installed { version } => strings.invoke_notice_update_installed(version.into()),
+        N::UpToDate { running } => strings.invoke_notice_update_up_to_date(running.into()),
+        N::Unreachable => strings.get_notice_update_unreachable(),
+        N::Unreadable => strings.get_notice_update_unreadable(),
+        N::DownloadFailed => strings.get_notice_update_download_failed(),
+        N::BadSignature => strings.get_notice_update_bad_signature(),
+        N::BrokenDownload => strings.get_notice_update_broken(),
+        N::DiskFull => strings.get_notice_update_disk_full(),
+        N::ReadOnly => strings.get_notice_update_read_only(),
+        N::InUse => strings.get_notice_update_in_use(),
+        N::Failed => strings.get_notice_update_failed(),
+        N::RestoreFailed { renames } => {
+            let renames: Vec<String> = renames
+                .iter()
+                .map(|(bak, live)| {
+                    strings
+                        .invoke_notice_update_rename(bak.into(), live.into())
+                        .to_string()
+                })
+                .collect();
+            strings.invoke_notice_update_restore_failed(joined(strings, &renames))
+        }
+        N::RelaunchFailed => strings.get_notice_update_relaunch_failed(),
+        N::Blocked => strings.get_notice_update_blocked(),
+        N::NotAppImage => strings.get_notice_update_not_appimage(),
+    }
+}
+
+/// The updater's notice's buttons as the UI names them.
+fn update_buttons(message: &NoticeMessage) -> ModelRc<UpdateButton> {
+    use ui_model::UpdaterButton as B;
+    let NoticeMessage::Update(notice) = message else {
+        return ModelRc::default();
+    };
+    let buttons: Vec<UpdateButton> = notice
+        .buttons()
+        .iter()
+        .map(|button| match button {
+            B::Download => UpdateButton::Download,
+            B::NotNow => UpdateButton::NotNow,
+            B::SkipThisVersion => UpdateButton::SkipThisVersion,
+            B::Cancel => UpdateButton::Cancel,
+            B::TryAgain => UpdateButton::TryAgain,
+            B::OpenReleasePage => UpdateButton::OpenReleasePage,
+            B::RestartNow => UpdateButton::RestartNow,
+        })
+        .collect();
+    ModelRc::new(VecModel::from(buttons))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui_model::{MOCK_CAST_HOLD, MockBackend};
+    use std::sync::PoisonError;
+
+    use slint::platform::software_renderer::{MinimalSoftwareWindow, Rgb565Pixel};
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+
+    #[test]
+    fn the_menu_bar_hears_a_theme_once_per_native_window() {
+        let theme = MenuBarTheme::default();
+        assert!(theme.due(7, true), "the first theme is sent");
+        // The focus muda's activation toggle brings back must not send it again.
+        assert!(!theme.due(7, true));
+        assert!(!theme.due(7, true));
+        assert!(theme.due(7, false), "a new appearance is sent");
+        assert!(theme.due(8, false), "a new native window gets it too");
+        assert!(!theme.due(8, false));
+        theme.forget();
+        assert!(theme.due(8, false), "after Windows repainted the menu bar");
+    }
+
+    /// A platform without native windows, so a test can build the whole App
+    /// and drive it through the windows' callbacks or keys.
+    struct Headless;
+
+    thread_local! {
+        /// The windows the headless platform made on this thread.
+        static HEADLESS_WINDOWS: RefCell<Vec<Weak<MinimalSoftwareWindow>>> =
+            RefCell::default();
+        /// Slint's time on this thread once the test holds its clock.
+        static HELD_CLOCK: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+
+    static CLOCK_START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+
+    impl slint::platform::Platform for Headless {
+        fn create_window_adapter(
+            &self,
+        ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+            let window = MinimalSoftwareWindow::new(Default::default());
+            HEADLESS_WINDOWS.with(|windows| windows.borrow_mut().push(Rc::downgrade(&window)));
+            Ok(window)
+        }
+
+        fn duration_since_start(&self) -> Duration {
+            HELD_CLOCK
+                .with(Cell::get)
+                .unwrap_or_else(|| CLOCK_START.elapsed())
+        }
+    }
+
+    /// Stops Slint's clock on this thread for the rest of the test: the
+    /// double-click timers then see two clicks as one double-click however
+    /// long a loaded machine takes between them.
+    pub(super) fn hold_clock() {
+        HELD_CLOCK.with(|clock| clock.set(Some(CLOCK_START.elapsed())));
+    }
+
+    /// Moves the clock [`hold_clock`] stopped on by `by`.
+    fn advance_clock(by: Duration) {
+        HELD_CLOCK.with(|clock| clock.set(clock.get().map(|now| now + by)));
+    }
+
+    /// Draws a frame of every headless window, as the event loop would after
+    /// an event: lists are laid out then, and their new rows built.
+    pub(super) fn draw_frames() {
+        slint::platform::update_timers_and_animations();
+        let windows: Vec<_> = HEADLESS_WINDOWS
+            .with(|windows| windows.borrow().iter().filter_map(Weak::upgrade).collect());
+        for window in windows {
+            window.set_size(slint::PhysicalSize::new(1000, 720));
+            window.draw_if_needed(|renderer| {
+                let mut pixels = vec![Rgb565Pixel::default(); 1000 * 720];
+                renderer.render(&mut pixels, 1000);
+            });
+        }
+        slint::platform::update_timers_and_animations();
+    }
+
+    /// Presses and releases `key` in `window`, then draws a frame.
+    pub(super) fn press(window: &slint::Window, key: impl Into<SharedString>) {
+        let text: SharedString = key.into();
+        window.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        window.dispatch_event(WindowEvent::KeyReleased { text });
+        draw_frames();
+    }
+
+    /// Clicks `window` at `x`, `y` (logical pixels), then draws a frame.
+    fn click(window: &slint::Window, x: f32, y: f32) {
+        let position = slint::LogicalPosition::new(x, y);
+        let button = PointerEventButton::Left;
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        draw_frames();
+    }
+
+    /// Turns the mouse wheel over `x`, `y` by `delta_y` logical pixels
+    /// (negative scrolls down), then draws a frame.
+    fn scroll(window: &slint::Window, x: f32, y: f32, delta_y: f32) {
+        let position = slint::LogicalPosition::new(x, y);
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerScrolled {
+            position,
+            delta_x: 0.0,
+            delta_y,
+        });
+        draw_frames();
+    }
+
+    /// Presses Tab `times` times in `window`.
+    pub(super) fn tab(window: &slint::Window, times: usize) {
+        for _ in 0..times {
+            press(window, Key::Tab);
+        }
+    }
+
+    /// The App over `backend`, with headless windows.
+    pub(super) fn app_over(backend: impl Backend + 'static) -> Rc<App> {
+        app_logging(backend, DebugLog::new(None))
+    }
+
+    /// [`app_over`] writing to `log`.
+    pub(super) fn app_logging(backend: impl Backend + 'static, log: DebugLog) -> Rc<App> {
+        // The platform is set per thread: a thread that already built an
+        // App has it, which is fine.
+        let _ = slint::platform::set_platform(Box::new(Headless));
+        App::new(Box::new(backend), log).expect("the windows build headless")
+    }
+
+    /// Saves the main window, the tray flyout and the equalizer (on, two
+    /// bands moved, the first one focused) over the mock backend as
+    /// main-window.png, flyout.png and equalizer.png in AUDIOSYNC_SHOT_DIR,
+    /// and dark with a -dark suffix, to compare a UI change before and after
+    /// without opening a window.
+    #[test]
+    #[ignore = "writes screenshots: run with --ignored and AUDIOSYNC_SHOT_DIR set"]
+    fn shots_of_the_main_window_and_flyout() {
+        let dir = std::path::PathBuf::from(
+            std::env::var_os("AUDIOSYNC_SHOT_DIR").expect("AUDIOSYNC_SHOT_DIR names a folder"),
+        );
+        let app = app_over(MockBackend::new());
+        // No refresh timer may fire and hide the Now Playing card set below.
+        hold_clock();
+        app.refresh();
+        app.main.set_now_playing_shown(true);
+        app.main.set_now_playing_title(
+            "A track title long enough to need more than the two lines the card shows".into(),
+        );
+        app.main.set_now_playing_subtitle("Artist".into());
+        app.equalizer.show().expect("the equalizer shows headless");
+        app.equalizer.invoke_enabled_toggled(true);
+        app.equalizer.invoke_gain_changed(1, 6.0);
+        app.equalizer.invoke_gain_changed(4, -4.5);
+        app.equalizer.invoke_take_focus();
+        draw_frames();
+        tab(app.equalizer.window(), 4);
+        for (suffix, appearance) in [
+            ("", ui_model::Appearance::Light),
+            ("-dark", ui_model::Appearance::Dark),
+        ] {
+            app.apply_appearance(appearance);
+            // draw_frames sizes every window 1000x720; the shots take the real sizes after it:
+            // main.slint's preferred size, the flyout's width and then its fitted height.
+            draw_frames();
+            app.main
+                .window()
+                .set_size(slint::LogicalSize::new(776.0, 680.0));
+            app.flyout
+                .window()
+                .set_size(slint::LogicalSize::new(340.0, 720.0));
+            let fit = app.flyout.get_fit_height();
+            app.flyout
+                .window()
+                .set_size(slint::LogicalSize::new(340.0, fit));
+            app.equalizer
+                .window()
+                .set_size(slint::LogicalSize::new(660.0, 420.0));
+            for (name, window) in [
+                ("main-window", app.main.window()),
+                ("flyout", app.flyout.window()),
+                ("equalizer", app.equalizer.window()),
+            ] {
+                let shot = window
+                    .take_snapshot()
+                    .expect("the software renderer draws it");
+                let file = png(shot.width(), shot.height(), shot.as_bytes());
+                std::fs::write(dir.join(format!("{name}{suffix}.png")), file)
+                    .expect("the PNG is written");
+            }
+        }
+    }
+
+    /// An uncompressed RGBA PNG (stored deflate blocks), since the Windows
+    /// build has no image crate.
+    fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        fn crc(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            let crc = crc(&out[start..]);
+            out.extend_from_slice(&crc.to_be_bytes());
+        }
+        let mut raw = Vec::new();
+        for row in rgba.chunks(width as usize * 4) {
+            raw.push(0);
+            raw.extend_from_slice(row);
+        }
+        let mut zlib = vec![0x78, 0x01];
+        let blocks = raw.len().div_ceil(0xFFFF);
+        for (index, block) in raw.chunks(0xFFFF).enumerate() {
+            zlib.push(u8::from(index + 1 == blocks));
+            let len = block.len() as u16;
+            zlib.extend_from_slice(&len.to_le_bytes());
+            zlib.extend_from_slice(&(!len).to_le_bytes());
+            zlib.extend_from_slice(block);
+        }
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in &raw {
+            a = (a + u32::from(byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        let mut header = [0u8; 13];
+        header[..4].copy_from_slice(&width.to_be_bytes());
+        header[4..8].copy_from_slice(&height.to_be_bytes());
+        header[8..10].copy_from_slice(&[8, 6]);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(&mut out, b"IHDR", &header);
+        chunk(&mut out, b"IDAT", &zlib);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    // covers: S388
+    #[test]
+    fn launch_at_sign_in_follows_the_file_menu_and_its_notice_is_dismissed_here() {
+        let app = app_over(MockBackend::new());
+        let store = launch_at_login::MemoryStore::default();
+        *app.login.borrow_mut() = LaunchAtLogin::new(
+            Box::new(store.clone()),
+            Some(std::path::PathBuf::from(r"C:\Apps\audiosync.exe")),
+        );
+        app.refresh();
+        assert!(!app.main.get_launch_at_login());
+
+        app.main.invoke_launch_at_login_toggled(true);
+        assert!(app.main.get_launch_at_login());
+        assert!(store.entry().run.is_some());
+
+        // Task Manager turns it off; the next reading shows it.
+        store.entry().approval = Some(vec![3; 12]);
+        app.reread_launch_at_login();
+        assert!(!app.main.get_launch_at_login());
+
+        store.entry().refuse_writes = true;
+        store.entry().approval = None;
+        store.entry().run = None;
+        app.reread_launch_at_login();
+        app.main.invoke_launch_at_login_toggled(true);
+        let notices = app.snapshot().notices;
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].message, NoticeMessage::LaunchAtLoginFailed);
+        assert_eq!(app.main.get_notices().row_count(), 1);
+
+        hold_clock();
+        app.main
+            .invoke_notice_dismissed(launch_at_login::NOTICE_ID as i32);
+        let_notice_close();
+        assert!(app.snapshot().notices.is_empty());
+        assert_eq!(app.main.get_notices().row_count(), 0);
+    }
+
+    #[test]
+    fn an_input_device_with_more_than_two_channels_offers_its_pairs_in_both_windows() {
+        let app = app_over(MockBackend::new());
+        let labels = |model: ModelRc<SharedString>| -> Vec<String> {
+            (0..model.row_count())
+                .filter_map(|row| model.row_data(row))
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(
+            app.main.get_input_pairs().row_count(),
+            0,
+            "not for the whole system"
+        );
+
+        let line_in = app
+            .snapshot()
+            .sources
+            .iter()
+            .position(|source| source.id == "input:line")
+            .expect("listed");
+        app.main.invoke_source_selected(line_in as i32);
+        let offered = ["Channels 1-2", "Channels 3-4", "Channel 5"];
+        assert_eq!(labels(app.main.get_input_pairs()), offered);
+        assert_eq!(labels(app.flyout.get_input_pairs()), offered);
+        assert_eq!(app.main.get_input_pair_index(), 0);
+
+        app.flyout.invoke_input_pair_selected(2);
+        assert_eq!(app.snapshot().input_pair, 2);
+        assert_eq!(app.main.get_input_pair_index(), 2);
+        assert_eq!(app.flyout.get_input_pair_index(), 2);
+
+        app.main.invoke_source_selected(0);
+        assert_eq!(app.main.get_input_pairs().row_count(), 0);
+        assert_eq!(app.main.get_input_pair_index(), 0);
+    }
+
+    // covers: S355, S211
+    #[test]
+    fn an_unplugged_chosen_input_is_listed_last_as_not_connected() {
+        for (name, shown) in [
+            (
+                "Microphone (USB Audio)",
+                "Microphone (USB Audio) (not connected)",
+            ),
+            ("", "Input Device (not connected)"),
+        ] {
+            let mut backend = MockBackend::new();
+            backend.unplug_chosen_input(name);
+            let app = app_over(backend);
+            let last = app.main.get_sources().row_count() - 1;
+            for (sources, index) in [
+                (app.main.get_sources(), app.main.get_source_index()),
+                (app.flyout.get_sources(), app.flyout.get_source_index()),
+            ] {
+                assert_eq!(index, last as i32, "{shown}: still chosen");
+                assert_eq!(
+                    sources.row_data(last).map(String::from).as_deref(),
+                    Some(shown)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_saved_pair_the_device_no_longer_has_shows_channels_one_and_two() {
+        let mut state = MockBackend::new().snapshot();
+        state.source_id = "input:line".into();
+        state.input_pair = 7;
+        let (labels, index) =
+            input_pair_choice(&state, |first, last| format!("{first}-{last}").into());
+        assert_eq!(labels, ["1-2", "3-4", "5-5"]);
+        assert_eq!(index, 0);
+        state
+            .sources
+            .iter_mut()
+            .for_each(|source| source.channels = 2);
+        assert_eq!(
+            input_pair_choice(&state, |_, _| "x".into()),
+            (Vec::new(), 0)
+        );
+    }
+
+    /// The sender picks AirPlay 2 or AirPlay 1 per speaker, so the File menu
+    /// offers no choice between them.
+    #[test]
+    fn the_file_menu_has_no_airplay2_item() {
+        let main = include_str!("../ui/main.slint");
+        assert!(
+            !main.contains("Strings.airplay2-"),
+            "the File menu still has an AirPlay 2 item"
+        );
+    }
+
+    // covers: P213
+    #[test]
+    fn the_now_playing_play_pause_tells_the_backend_what_the_card_showed() {
+        use crate::now_playing_card::fake::{FakeControls, track};
+        let backend = MockBackend::new();
+        let pressed = backend.play_pauses.clone();
+        let app = app_over(backend);
+        let fake = FakeControls::default();
+        app.set_media_controls(fake.controls());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        app.main.invoke_now_playing_transport(1);
+        assert!(pressed.borrow().is_empty(), "no session shown");
+
+        fake.read(Some(track("Spotify.exe", "Song", "", true)));
+        app.poll();
+        app.main.invoke_now_playing_transport(0);
+        app.main.invoke_now_playing_transport(1);
+        app.main.invoke_now_playing_transport(2);
+        fake.read(Some(track("Spotify.exe", "Song", "", false)));
+        app.poll();
+        app.main.invoke_now_playing_transport(1);
+        assert_eq!(
+            *pressed.borrow(),
+            [
+                ("Spotify.exe".to_owned(), true),
+                ("Spotify.exe".to_owned(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_now_playing_card_follows_the_media_session_and_its_buttons_drive_it() {
+        use crate::now_playing_card::fake::{FakeControls, track};
+        let app = app_over(MockBackend::new());
+        let fake = FakeControls::default();
+        app.set_media_controls(fake.controls());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        assert_eq!(fake.following(), Some(CardSource::AnyApp));
+        assert!(!app.main.get_now_playing_shown(), "no session yet");
+
+        fake.read(Some(track("Spotify.exe", "Song", "", true)));
+        app.poll();
+        assert!(app.main.get_now_playing_shown());
+        assert_eq!(app.main.get_now_playing_title(), "Song");
+        assert_eq!(app.main.get_now_playing_subtitle(), "Spotify");
+        assert!(app.main.get_now_playing_playing());
+        assert!(!app.main.get_now_playing_has_artwork());
+
+        app.main.invoke_now_playing_transport(0);
+        app.main.invoke_now_playing_transport(1);
+        app.main.invoke_now_playing_transport(2);
+        assert_eq!(
+            fake.sent(),
+            [Transport::Previous, Transport::PlayPause, Transport::Next]
+        );
+
+        fake.read(Some(track("Spotify.exe", "Song", "Band", false)));
+        app.poll();
+        assert!(!app.main.get_now_playing_playing());
+        assert_eq!(app.main.get_now_playing_subtitle(), "Band");
+
+        // The focus on a button goes to the source list as the card hides.
+        app.main.set_now_playing_focused_button(1);
+        fake.read(None);
+        app.poll();
+        assert!(!app.main.get_now_playing_shown());
+        assert_eq!(app.main.get_now_playing_focused_button(), -1);
+
+        app.main.hide().expect("the main window hides");
+        app.poll();
+        assert_eq!(fake.following(), None, "nothing is read while hidden");
+    }
+
+    /// A wider window widens the speaker list first, to its full 644 px,
+    /// then the left column, from where its master volume track ended in
+    /// the 268 px column (208 px) back to 268 px.
+    #[test]
+    fn the_main_window_widens_the_speaker_list_before_the_left_column() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        let widths = |window: f32| {
+            app.main
+                .window()
+                .set_size(slint::LogicalSize::new(window, 680.0));
+            // Runs the window's change handlers, as the event loop does.
+            slint::platform::update_timers_and_animations();
+            let width = |id: &str| element(&app, id).map_or(0.0, |column| column.size().width);
+            (
+                width("MainWindow::left-column"),
+                width("MainWindow::scroll"),
+            )
+        };
+        assert_eq!(widths(776.0), (208.0, 524.0), "at its narrowest");
+        assert_eq!(widths(896.0), (208.0, 644.0), "the speaker list first");
+        assert_eq!(widths(926.0), (238.0, 644.0), "then the left column");
+        assert_eq!(widths(956.0), (268.0, 644.0));
+        assert_eq!(widths(1100.0), (268.0, 644.0));
+    }
+
+    /// Shuffle and repeat show only while the player takes them, read the
+    /// player's own state, and a click asks for the next state.
+    #[test]
+    fn the_now_playing_card_shows_shuffle_and_repeat_only_when_the_player_takes_them() {
+        use crate::now_playing_card::fake::{FakeControls, track};
+        use crate::now_playing_card::{PlayModes, Repeat};
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        let fake = FakeControls::default();
+        app.set_media_controls(fake.controls());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        let shown = |label: &str| {
+            draw_frames();
+            ElementHandle::find_by_accessible_label(&app.main, label)
+                .next()
+                .map(|button| button.accessible_value().unwrap_or_default().to_string())
+        };
+        fake.read(Some(track("Spotify.exe", "Song", "Band", true)));
+        app.poll();
+        assert_eq!((shown("Shuffle"), shown("Repeat")), (None, None));
+
+        let mut song = track("Spotify.exe", "Song", "Band", true);
+        song.modes = PlayModes {
+            shuffle: Some(true),
+            repeat: Some(Repeat::All),
+        };
+        fake.read(Some(song.clone()));
+        app.poll();
+        assert_eq!(
+            (shown("Shuffle"), shown("Repeat")),
+            (Some("On".into()), Some("On".into()))
+        );
+        app.main.invoke_now_playing_transport(3);
+        app.main.invoke_now_playing_transport(4);
+        assert_eq!(
+            fake.sent(),
+            [Transport::Shuffle(false), Transport::Repeat(Repeat::One)]
+        );
+
+        song.modes = PlayModes {
+            shuffle: Some(false),
+            repeat: Some(Repeat::One),
+        };
+        fake.read(Some(song));
+        app.poll();
+        assert_eq!(
+            (shown("Shuffle"), shown("Repeat")),
+            (Some("Off".into()), Some("One".into()))
+        );
+    }
+
+    /// A focused Shuffle or Repeat button that goes when the player stops
+    /// taking it leaves no button marked as focused.
+    #[test]
+    fn a_mode_button_that_goes_drops_its_focus_mark() {
+        use crate::now_playing_card::fake::{FakeControls, track};
+        use crate::now_playing_card::{PlayModes, Repeat};
+        let app = app_over(MockBackend::new());
+        let fake = FakeControls::default();
+        app.set_media_controls(fake.controls());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        let mut song = track("Spotify.exe", "Song", "Band", true);
+        song.modes = PlayModes {
+            shuffle: Some(false),
+            repeat: Some(Repeat::Off),
+        };
+        fake.read(Some(song.clone()));
+        app.poll();
+        draw_frames();
+        for (button, modes) in [
+            (
+                3,
+                PlayModes {
+                    shuffle: None,
+                    ..song.modes
+                },
+            ),
+            (
+                4,
+                PlayModes {
+                    repeat: None,
+                    ..song.modes
+                },
+            ),
+        ] {
+            fake.read(Some(song.clone()));
+            app.poll();
+            draw_frames();
+            app.main.set_now_playing_focused_button(button);
+            fake.read(Some(crate::now_playing_card::CardTrack {
+                modes,
+                ..song.clone()
+            }));
+            app.poll();
+            draw_frames();
+            assert_eq!(
+                app.main.get_now_playing_focused_button(),
+                -1,
+                "button {button}"
+            );
+        }
+    }
+
+    /// With Shuffle and Repeat showing, all five buttons keep their size
+    /// and fit inside the source block at the default 776 px window.
+    // covers: S450
+    #[test]
+    fn the_five_transport_buttons_fit_the_narrow_left_column() {
+        use crate::now_playing_card::fake::{FakeControls, track};
+        use crate::now_playing_card::{PlayModes, Repeat};
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        let fake = FakeControls::default();
+        app.set_media_controls(fake.controls());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        let mut song = track("Spotify.exe", "Song", "Band", true);
+        song.modes = PlayModes {
+            shuffle: Some(false),
+            repeat: Some(Repeat::Off),
+        };
+        fake.read(Some(song));
+        app.poll();
+        draw_frames();
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(776.0, 680.0));
+        slint::platform::update_timers_and_animations();
+        // Slint's tests find only what is drawn, so a button clipped off the
+        // card is missing.
+        let span = |label: &str| {
+            ElementHandle::find_by_accessible_label(&app.main, label)
+                .next()
+                .map(|element| {
+                    let x = element.absolute_position().x;
+                    (x, x + element.size().width)
+                })
+        };
+        let card = span("Now Playing").expect("the card shows");
+        let column =
+            element(&app, "MainWindow::left-column").map_or(0.0, |column| column.size().width);
+        assert_eq!(
+            card.1 - card.0,
+            column - 4.0 - 24.0,
+            "it fills the block inside its padding, clear of the column's scroll gutter"
+        );
+        let inner = card;
+        let shown = ["Shuffle", "Previous Track", "Pause", "Next Track", "Repeat"].map(span);
+        assert!(
+            shown.iter().all(Option::is_some),
+            "every button shows inside the card {inner:?}: {shown:?}"
+        );
+        let buttons = shown.map(Option::unwrap_or_default);
+        let widths = buttons.map(|(start, end)| end - start);
+        assert_eq!(
+            widths,
+            [32.0, 32.0, 40.0, 32.0, 32.0],
+            "the buttons keep their size"
+        );
+        assert!(
+            buttons[0].0 >= inner.0 && buttons[4].1 <= inner.1,
+            "the row {buttons:?} fits inside the card {inner:?}"
+        );
+        assert!(
+            buttons.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+            "no button overlaps the next: {buttons:?}"
+        );
+    }
+
+    /// A Now Playing title too long for its line stays on one line and
+    /// scrolls: it rests 2 s at its start, then moves 30 px a second. With
+    /// Windows' animation effects off it stays at its start.
+    #[test]
+    fn a_long_now_playing_title_scrolls_on_one_line() {
+        use crate::now_playing_card::fake::{FakeControls, track};
+        use i_slint_backend_testing::ElementHandle;
+        let title = "A title far too long for the one line the Now Playing card gives it";
+        let app = app_over(MockBackend::new());
+        let fake = FakeControls::default();
+        app.set_media_controls(fake.controls());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        hold_clock();
+        draw_frames();
+        fake.read(Some(track("Spotify.exe", title, "Band", true)));
+        app.poll();
+        // The track read the host's animation setting, which CI runners have off.
+        app.main.global::<Motion>().set_on(true);
+        draw_frames();
+        let text = || {
+            ElementHandle::find_by_accessible_label(&app.main, title)
+                .next()
+                .expect("the title")
+                .query_descendants()
+                .match_id("MarqueeText::label")
+                .find_first()
+                .expect("its text")
+        };
+        let height = text().size().height;
+        assert!(height < 30.0, "one line, {height} px high");
+        let start = text().absolute_position().x;
+        advance_clock(Duration::from_millis(1900));
+        draw_frames();
+        assert_eq!(text().absolute_position().x, start, "it rests at its start");
+        advance_clock(Duration::from_millis(1100));
+        draw_frames();
+        let moved = start - text().absolute_position().x;
+        assert!(
+            (moved - 30.0).abs() < 1.0,
+            "30 px in its first second, moved {moved}"
+        );
+
+        app.main.global::<Motion>().set_on(false);
+        draw_frames();
+        assert_eq!(text().absolute_position().x, start, "cut, not scrolled");
+    }
+
+    /// The Equalizer row names its preset after "Equalizer" on the same
+    /// line, with room for "Electronic" in the narrow left column.
+    // covers: S450
+    #[test]
+    fn the_equalizer_row_shows_its_preset_after_its_name() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.main.show().expect("the main window shows");
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(776.0, 680.0));
+        app.main.global::<Motion>().set_on(true);
+        app.main.set_equalizer_on(true);
+        app.main.set_equalizer_curve("Electronic".into());
+        slint::platform::update_timers_and_animations();
+        let element = |id: &str| {
+            ElementHandle::find_by_element_id(&app.main, id)
+                .next()
+                .unwrap_or_else(|| panic!("{id}"))
+        };
+        let (label, curve) = (
+            element("EqualizerCard::label"),
+            element("EqualizerCard::curve"),
+        );
+        let after = label.absolute_position().x + label.size().width;
+        assert!(
+            curve.absolute_position().x >= after,
+            "the preset at {} sits after the name, which ends at {after}",
+            curve.absolute_position().x
+        );
+        let middle = |e: &ElementHandle| e.absolute_position().y + e.size().height / 2.0;
+        assert!((middle(&curve) - middle(&label)).abs() <= 1.0, "one line");
+        // A name that fits rests at the preset's width; a longer one takes
+        // its own width to scroll. The room is drawn for Segoe UI, so other
+        // hosts' fonts don't decide it.
+        let text = ElementHandle::find_by_element_id(&app.main, "MarqueeText::label")
+            .find(|t| {
+                (t.absolute_position().y - curve.absolute_position().y).abs() < 0.5
+                    && (t.absolute_position().x - curve.absolute_position().x).abs() < 0.5
+            })
+            .expect("the preset's text");
+        assert!(
+            !cfg!(windows) || text.size().width <= curve.size().width + 0.5,
+            "Electronic needs {} px of the preset's {} px",
+            text.size().width,
+            curve.size().width
+        );
+    }
+
+    /// Calibrate All Speakers shows in full on one line in the narrow left
+    /// column.
+    // covers: S450
+    #[test]
+    fn calibrate_all_speakers_shows_in_full_in_the_narrow_column() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.main.show().expect("the main window shows");
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(776.0, 680.0));
+        slint::platform::update_timers_and_animations();
+        let element = |id: &str| {
+            ElementHandle::find_by_element_id(&app.main, id)
+                .next()
+                .unwrap_or_else(|| panic!("{id}"))
+        };
+        let (button, column) = (
+            element("CalibrationCard::calibrate-button"),
+            element("MainWindow::left-column"),
+        );
+        let end = |e: &ElementHandle| e.absolute_position().x + e.size().width;
+        // The scroll bar's room.
+        let inside = end(&column) - 4.0;
+        assert!(
+            button.size().height < 40.0,
+            "one line, {} px high",
+            button.size().height
+        );
+        assert!(
+            end(&button) <= inside + 0.5,
+            "the button ends at {}, the card's inside at {inside}",
+            end(&button)
+        );
+
+        // What a run does is the row's tooltip; why it stopped or can't
+        // start stays under the row.
+        let lines =
+            || ElementHandle::find_by_element_id(&app.main, "CalibrationCard::status-line").count();
+        app.main
+            .set_calibrate_all_status("Plays a short sound on each speaker.".into());
+        app.main.set_calibrate_all_status_is_hint(true);
+        slint::platform::update_timers_and_animations();
+        assert_eq!(lines(), 0, "the hint is not a paragraph in the column");
+        app.main.set_calibrate_all_status_is_hint(false);
+        slint::platform::update_timers_and_animations();
+        assert_eq!(lines(), 1, "a reason shows under the row");
+    }
+
+    /// A speaker name too long for its row scrolls like the Now Playing
+    /// title; with Windows' animation effects off it stays cut.
+    #[test]
+    fn a_long_speaker_name_scrolls_in_its_row() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        let mut long = backend.snapshot().speaker("local:desk").unwrap().clone();
+        long.id = "local:long".into();
+        long.name = "A speaker whose name is far too long for the row the speaker list gives it, even in a wide window".into();
+        backend.add_speaker(long);
+        // From before the rows are built, which starts their scroll.
+        hold_clock();
+        let app = app_over(backend);
+        app.main.show().expect("the main window shows");
+        app.poll();
+        draw_frames();
+        let places = || -> Vec<f32> {
+            ElementHandle::find_by_element_id(&app.main, "MarqueeText::label")
+                .map(|label| label.absolute_position().x)
+                .collect()
+        };
+        let start = places();
+        advance_clock(Duration::from_millis(3000));
+        draw_frames();
+        let moved: Vec<f32> = start
+            .iter()
+            .zip(places())
+            .map(|(was, now)| was - now)
+            .filter(|by| by.abs() > 0.5)
+            .collect();
+        assert_eq!(moved.len(), 1, "only the long name moves: {moved:?}");
+        assert!(
+            (moved[0] - 30.0).abs() < 1.0,
+            "30 px in its first second, moved {}",
+            moved[0]
+        );
+
+        app.main.global::<Motion>().set_on(false);
+        draw_frames();
+        assert_eq!(places(), start, "cut, not scrolled");
+    }
+
+    fn dialog_notice() -> ui_model::Notice {
+        ui_model::Notice {
+            id: DIALOG_NOTICE_ID,
+            subject: "dialog".to_owned(),
+            message: NoticeMessage::DialogMessage {
+                title: "Rename".to_owned(),
+                text: "Taken".to_owned(),
+            },
+            time: "09.41".to_owned(),
+            post: ui_model::next_post(),
+        }
+    }
+
+    /// A notice posted while the app runs is fresh on the refresh that
+    /// first lists it, so the main window eases it in once; the notices
+    /// there at launch and those listed before are not.
+    #[test]
+    fn only_a_notice_new_since_the_last_refresh_is_fresh() {
+        let mut backend = MockBackend::new();
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        let app = app_over(backend);
+        app.refresh();
+        let fresh = || -> Vec<bool> { app.main.get_notices().iter().map(|n| n.fresh).collect() };
+        assert_eq!(fresh(), [false], "there at launch");
+        app.ui.borrow_mut().dialog_notice = Some(dialog_notice());
+        app.refresh();
+        assert_eq!(fresh(), [true, false], "just posted");
+        app.refresh();
+        assert_eq!(fresh(), [false, false], "listed before");
+    }
+
+    /// A notice posted while the window shows opens smoothly and pushes the
+    /// columns down; a dismissed one fades and its room closes before it
+    /// leaves the list. With Windows' animation effects off it shows at once.
+    #[test]
+    fn a_notice_eases_in_and_out_of_the_main_window() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        hold_clock();
+        draw_frames();
+        let column = || {
+            ElementHandle::find_by_element_id(&app.main, "MainWindow::left-column")
+                .next()
+                .expect("the left column")
+                .absolute_position()
+                .y
+        };
+        let post = || {
+            app.ui.borrow_mut().dialog_notice = Some(dialog_notice());
+            app.refresh();
+            draw_frames();
+        };
+        let bare = column();
+        post();
+        assert_eq!(column(), bare, "the notice starts closed");
+        advance_clock(Duration::from_millis(100));
+        draw_frames();
+        let opening = column();
+        advance_clock(Duration::from_millis(500));
+        draw_frames();
+        let open = column();
+        assert!(
+            bare < opening && opening < open,
+            "the columns move down smoothly: {bare}, {opening}, {open}"
+        );
+
+        let title = app
+            .main
+            .get_notices()
+            .row_data(0)
+            .expect("the notice")
+            .title;
+        let label = app.main.global::<Strings>().invoke_dismiss_notice(title);
+        ElementHandle::find_by_accessible_label(&app.main, &label)
+            .next()
+            .expect("its dismiss button")
+            .invoke_accessible_default_action();
+        draw_frames();
+        assert_eq!(
+            app.main.get_notices().row_count(),
+            1,
+            "listed while it fades"
+        );
+        assert_eq!(column(), open, "its room stays while it fades");
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert_eq!(app.main.get_notices().row_count(), 0, "gone once closed");
+        assert_eq!(column(), bare);
+
+        app.main.global::<Motion>().set_on(false);
+        post();
+        assert_eq!(column(), open, "shown at once");
+    }
+
+    /// Clicks the main window's dismiss button of the notice titled `title`.
+    fn click_dismiss(app: &App, title: SharedString) {
+        use i_slint_backend_testing::ElementHandle;
+        let label = app.main.global::<Strings>().invoke_dismiss_notice(title);
+        ElementHandle::find_by_accessible_label(&app.main, &label)
+            .next()
+            .expect("its dismiss button")
+            .invoke_accessible_default_action();
+        draw_frames();
+    }
+
+    fn main_notice_titles(app: &App) -> Vec<SharedString> {
+        app.main.get_notices().iter().map(|n| n.title).collect()
+    }
+
+    /// The main window open on a backend notice and a dialog notice, with
+    /// the clock held.
+    fn two_notices_shown() -> Rc<App> {
+        let mut backend = MockBackend::new();
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        let app = app_over(backend);
+        app.ui.borrow_mut().dialog_notice = Some(dialog_notice());
+        app.main.show().expect("the main window shows");
+        app.refresh();
+        hold_clock();
+        draw_frames();
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        app
+    }
+
+    /// Two notices dismissed one right after the other both go: the first
+    /// leaving the list while the second fades does not bring it back.
+    #[test]
+    fn two_notices_dismissed_within_a_fade_both_go() {
+        let app = two_notices_shown();
+        let titles = main_notice_titles(&app);
+        assert_eq!(titles.len(), 2);
+        click_dismiss(&app, titles[0].clone());
+        advance_clock(Duration::from_millis(100));
+        draw_frames();
+        click_dismiss(&app, titles[1].clone());
+        advance_clock(Duration::from_millis(250));
+        draw_frames();
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert_eq!(main_notice_titles(&app), Vec::<SharedString>::new());
+    }
+
+    /// A notice that clears itself while another fades out leaves at once,
+    /// and the fading one still goes.
+    #[test]
+    fn a_notice_clearing_itself_during_a_fade_keeps_the_fade_going() {
+        let app = two_notices_shown();
+        let titles = main_notice_titles(&app);
+        let dialog = app
+            .main
+            .get_notices()
+            .iter()
+            .position(|n| u64::try_from(n.id) == Ok(DIALOG_NOTICE_ID))
+            .expect("the dialog notice");
+        click_dismiss(&app, titles[1 - dialog].clone());
+        advance_clock(Duration::from_millis(100));
+        app.ui.borrow_mut().dialog_notice = None;
+        app.refresh();
+        draw_frames();
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert_eq!(main_notice_titles(&app), Vec::<SharedString>::new());
+    }
+
+    /// A notice raised again under its ID with new text while its old text
+    /// fades out stays, shown in full.
+    #[test]
+    fn a_notice_raised_again_with_new_text_during_its_fade_stays() {
+        let app = two_notices_shown();
+        let dialog_title = || {
+            app.main
+                .get_notices()
+                .iter()
+                .find(|n| u64::try_from(n.id) == Ok(DIALOG_NOTICE_ID))
+                .map(|n| n.title)
+                .expect("the dialog notice")
+        };
+        click_dismiss(&app, dialog_title());
+        advance_clock(Duration::from_millis(100));
+        let mut again = dialog_notice();
+        again.message = NoticeMessage::DialogMessage {
+            title: "Rename".to_owned(),
+            text: "Too long".to_owned(),
+        };
+        app.ui.borrow_mut().dialog_notice = Some(again);
+        app.refresh();
+        draw_frames();
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        let shown: Vec<bool> = app
+            .main
+            .get_notices()
+            .iter()
+            .filter(|n| u64::try_from(n.id) == Ok(DIALOG_NOTICE_ID))
+            .map(|n| n.closing)
+            .collect();
+        assert_eq!(shown, [false]);
+    }
+
+    /// A notice whose text changes and changes back during its fade was
+    /// raised again, so the old fade leaves it shown.
+    #[test]
+    fn a_notice_whose_text_changes_back_during_its_fade_stays() {
+        let app = two_notices_shown();
+        let dialog = |app: &App| {
+            app.main
+                .get_notices()
+                .iter()
+                .find(|n| u64::try_from(n.id) == Ok(DIALOG_NOTICE_ID))
+                .map(|n| (n.title, n.closing))
+        };
+        let (title, _) = dialog(&app).expect("the dialog notice");
+        click_dismiss(&app, title);
+        let mut changed = dialog_notice();
+        changed.message = NoticeMessage::DialogMessage {
+            title: "Rename".to_owned(),
+            text: "Too long".to_owned(),
+        };
+        for notice in [changed, dialog_notice()] {
+            advance_clock(Duration::from_millis(50));
+            app.ui.borrow_mut().dialog_notice = Some(notice);
+            app.refresh();
+            draw_frames();
+        }
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert_eq!(dialog(&app).map(|(_, closing)| closing), Some(false));
+    }
+
+    /// A notice raised again with new text during its old text's fade can
+    /// be dismissed at once, before the old fade ends.
+    #[test]
+    fn a_notice_raised_again_during_its_fade_dismisses_before_the_old_fade_ends() {
+        let app = two_notices_shown();
+        let dialog_title = |app: &App| {
+            app.main
+                .get_notices()
+                .iter()
+                .find(|n| u64::try_from(n.id) == Ok(DIALOG_NOTICE_ID))
+                .map(|n| n.title)
+        };
+        click_dismiss(&app, dialog_title(&app).expect("the dialog notice"));
+        advance_clock(Duration::from_millis(100));
+        let mut again = dialog_notice();
+        again.message = NoticeMessage::DialogMessage {
+            title: "Rename".to_owned(),
+            text: "Too long".to_owned(),
+        };
+        app.ui.borrow_mut().dialog_notice = Some(again);
+        app.refresh();
+        draw_frames();
+        advance_clock(Duration::from_millis(50));
+        click_dismiss(&app, dialog_title(&app).expect("the notice raised again"));
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert_eq!(dialog_title(&app), None);
+    }
+
+    // covers: S421
+    #[test]
+    fn a_reading_the_sessions_report_shows_in_the_window_before_the_poll_and_is_logged() {
+        use crate::debug_log;
+        use crate::now_playing_card::fake::{FakeControls, track};
+        let path = debug_log::test_dir("view-now-playing-read").join(debug_log::FILE_NAME);
+        let log = DebugLog::new(Some(path.clone()));
+        let app = app_logging(MockBackend::new(), log.clone());
+        let fake = FakeControls::default();
+        app.set_media_controls(fake.controls());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        fake.read(Some(track("Spotify.exe", "Song", "", true)));
+        app.main.invoke_now_playing_read();
+        assert!(app.main.get_now_playing_playing());
+
+        fake.read(Some(track("Spotify.exe", "Song", "", false)));
+        app.main.invoke_now_playing_read();
+        assert!(!app.main.get_now_playing_playing());
+        assert!(log.flush(debug_log::TEST_FLUSH));
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            written.contains(r#"now playing card: the window shows "Song" (paused)"#),
+            "{written}"
+        );
+    }
+
+    // covers: S408
+    #[test]
+    fn the_input_level_meter_reads_only_while_the_main_window_shows() {
+        let backend = MockBackend::new();
+        let reads = backend.input_peak_reads.clone();
+        reads.set(Some(0));
+        let app = app_over(backend);
+        let weak = Rc::downgrade(&app);
+
+        app.follow_input_level(&weak);
+        assert_eq!(reads.get(), Some(0), "nothing is read while closed");
+        assert!(!app.meter_timer.running());
+
+        app.main.show().expect("the main window shows");
+        app.follow_input_level(&weak);
+        assert_eq!(
+            reads.get(),
+            Some(2),
+            "once the window shows, the kept peak is dropped and a new one read"
+        );
+        assert!(app.meter_timer.running());
+        assert!(app.main.get_input_level() > 0.0);
+
+        app.main.window().set_minimized(true);
+        app.tick_input_level();
+        app.follow_input_level(&weak);
+        assert_eq!(reads.get(), Some(2), "nothing is read while minimized");
+        assert!(!app.meter_timer.running(), "the meter's timer stops");
+        assert_eq!(app.main.get_input_level(), 0.0, "the bar empties");
+        assert_eq!(app.main.get_input_level_spoken(), 0);
+
+        app.main.window().set_minimized(false);
+        app.follow_input_level(&weak);
+        assert_eq!(reads.get(), Some(4), "it reads again once restored");
+
+        app.main.hide().expect("the main window hides");
+        app.tick_input_level();
+        app.follow_input_level(&weak);
+        assert_eq!(reads.get(), Some(4), "nothing is read while hidden");
+        assert!(!app.meter_timer.running());
+    }
+
+    #[test]
+    fn view_appearance_turns_every_window_light_or_dark_and_is_kept() {
+        use slint::language::ColorScheme;
+        let app = app_over(MockBackend::new());
+        let dark = |app: &App| {
+            [
+                app.main.global::<Tokens>().get_dark(),
+                app.flyout.global::<Tokens>().get_dark(),
+                app.equalizer.global::<Tokens>().get_dark(),
+                app.help.global::<Tokens>().get_dark(),
+            ]
+        };
+        assert_eq!(app.main.get_appearance(), crate::Appearance::System);
+
+        app.main.invoke_appearance_chosen(crate::Appearance::Dark);
+        assert_eq!(app.main.get_appearance(), crate::Appearance::Dark);
+        assert_eq!(dark(&app), [true; 4]);
+        assert_eq!(
+            app.backend.borrow().view_settings().appearance,
+            ui_model::Appearance::Dark
+        );
+
+        app.main.invoke_appearance_chosen(crate::Appearance::Light);
+        assert_eq!(dark(&app), [false; 4]);
+        assert_eq!(
+            app.pin_dialog.global::<Palette>().get_color_scheme(),
+            ColorScheme::Light
+        );
+
+        // Headless, Slint knows no Windows theme, so Match System is light.
+        app.main.invoke_appearance_chosen(crate::Appearance::System);
+        assert_eq!(app.main.get_appearance(), crate::Appearance::System);
+        assert_eq!(dark(&app), [false; 4]);
+        assert_eq!(
+            app.backend.borrow().view_settings().appearance,
+            ui_model::Appearance::System
+        );
+    }
+
+    #[test]
+    fn a_saved_appearance_shows_at_launch_and_the_preview_is_not_saved() {
+        let mut backend = MockBackend::new();
+        backend.set_view_settings(ViewSettings {
+            appearance: ui_model::Appearance::Dark,
+            ..ViewSettings::default()
+        });
+        let app = app_over(backend);
+        assert_eq!(app.main.get_appearance(), crate::Appearance::Dark);
+        assert!(app.about.global::<Tokens>().get_dark());
+
+        app.apply_appearance(ui_model::Appearance::Light);
+        app.main.invoke_show_virtual_devices_toggled(true);
+        assert_eq!(
+            app.backend.borrow().view_settings().appearance,
+            ui_model::Appearance::Dark,
+            "the preview's appearance isn't saved with the next change"
+        );
+    }
+
+    // covers: S416
+    #[test]
+    fn the_tray_panel_is_named_so_it_isnt_taken_for_windows_quick_settings() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        assert_eq!(strings.get_flyout_title(), "AudioSync tray panel");
+        for text in [strings.get_help_start(), strings.get_help_notices()] {
+            assert!(text.contains("AudioSync tray panel"), "{text}");
+            assert!(!text.contains("quick settings"), "{text}");
+        }
+    }
+
+    // covers: S420
+    #[test]
+    fn a_window_that_fails_to_open_says_so_plainly_and_logs_the_reason() {
+        use crate::debug_log;
+        let path = debug_log::test_dir("view-window-failed").join(debug_log::FILE_NAME);
+        let log = DebugLog::new(Some(path.clone()));
+        let app = app_logging(MockBackend::new(), log.clone());
+        let error = slint::PlatformError::Other("the raw reason".into());
+        assert_eq!(
+            app.window_error_text(&error),
+            "AudioSync couldn't open this window. Try again, or exit AudioSync and open it again."
+        );
+        assert!(log.flush(debug_log::TEST_FLUSH));
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(written.contains("the raw reason"), "{written}");
+    }
+
+    /// The window frames are Windows 11's, so no other system logs them.
+    #[test]
+    fn only_windows_logs_the_window_frame() {
+        use crate::debug_log;
+        let path = debug_log::test_dir("view-frame-log").join(debug_log::FILE_NAME);
+        let log = DebugLog::new(Some(path.clone()));
+        let app = app_logging(MockBackend::new(), log.clone());
+        app.apply_frame(app.main.window(), "main window", Frame::Titled);
+        app.apply_frame(app.flyout.window(), "flyout", Frame::Flyout);
+        assert!(log.flush(debug_log::TEST_FLUSH));
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            cfg!(windows) || !written.contains("Mica") && !written.contains("rounded corners"),
+            "{written}"
+        );
+    }
+
+    // covers: S212
+    #[test]
+    fn a_late_read_keeps_the_window_frame_and_logs_no_unchanged_airplay2_choice() {
+        use crate::debug_log;
+        let path = debug_log::test_dir("view-late-read").join(debug_log::FILE_NAME);
+        let backend = MockBackend::new();
+        let late_view = backend.late_view.clone();
+        let log = DebugLog::new(Some(path.clone()));
+        let app = app_logging(backend, log.clone());
+        let size = app.main.window().size();
+        *late_view.borrow_mut() = Some(ViewSettings {
+            window: Some(ui_model::WindowFrame {
+                x: 40,
+                y: 40,
+                width: 701.0,
+                height: 503.0,
+                maximized: true,
+            }),
+            ..ViewSettings::default()
+        });
+        app.poll();
+        assert_eq!(app.main.window().size(), size, "the frame stays");
+        assert!(log.flush(debug_log::TEST_FLUSH));
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!written.contains("applies at the next launch"), "{written}");
+    }
+
+    // covers: S212
+    #[test]
+    fn window_settings_read_after_launch_show_and_survive_a_quit() {
+        let backend = MockBackend::new();
+        let late_view = backend.late_view.clone();
+        let app = app_over(backend);
+        let file = ViewSettings {
+            appearance: ui_model::Appearance::Dark,
+            show_virtual_devices: true,
+            ..ViewSettings::default()
+        };
+        *late_view.borrow_mut() = Some(file.clone());
+        app.poll();
+        assert_eq!(app.main.get_appearance(), crate::Appearance::Dark);
+        app.save_settings();
+        assert_eq!(app.backend.borrow().view_settings(), file);
+    }
+
+    // covers: S212
+    #[test]
+    fn the_poll_keeps_the_main_windows_new_frame_without_a_close() {
+        let app = app_over(MockBackend::new());
+        app.main.show().expect("the main window shows");
+        app.poll();
+        // The headless window has no position to move, so a resize stands in.
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(911.0, 733.0));
+        app.poll();
+        let kept = app.backend.borrow().view_settings().window;
+        assert_eq!(
+            kept.map(|frame| (frame.width, frame.height)),
+            Some((911.0, 733.0)),
+            "a crash after this poll keeps where the window was"
+        );
+    }
+
+    /// The speaker list opens slim, grows one for one with the window and
+    /// stops at the 644 px it had in the old 980 px default window.
+    // covers: S420
+    #[test]
+    fn the_speaker_list_grows_with_the_window_up_to_its_old_width() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.main.show().expect("the main window shows");
+        let list_width = |window_width: f32| {
+            app.main
+                .window()
+                .set_size(slint::LogicalSize::new(window_width, 680.0));
+            // No draw_frames: it sets every headless window to 1000 x 720.
+            slint::platform::update_timers_and_animations();
+            ElementHandle::find_by_element_id(&app.main, "MainWindow::scroll")
+                .next()
+                .expect("the speaker list")
+                .size()
+                .width
+        };
+        assert_eq!(list_width(776.0), 524.0, "the default window");
+        assert_eq!(list_width(876.0), 624.0, "a wider window");
+        assert_eq!(list_width(1400.0), 644.0, "a wide window");
+    }
+
+    /// The header's switch ends with the speaker cards, also past the
+    /// speaker list's widest instead of at the far side of a wide window.
+    // covers: S420
+    #[test]
+    fn the_header_ends_where_the_speaker_list_stops_growing() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.main.show().expect("the main window shows");
+        let right_edge = |id: &str| {
+            let element = ElementHandle::find_by_element_id(&app.main, id)
+                .next()
+                .unwrap_or_else(|| panic!("{id}"));
+            element.absolute_position().x + element.size().width
+        };
+        for width in [776.0, 1400.0] {
+            app.main
+                .window()
+                .set_size(slint::LogicalSize::new(width, 680.0));
+            slint::platform::update_timers_and_animations();
+            let switch = right_edge("MainWindow::power");
+            let card = right_edge("SpeakerSection::card");
+            assert!(
+                (switch - card).abs() < 1.0,
+                "at {width} px the switch ends at {switch}, the speaker cards at {card}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_main_window_keeps_a_virtual_output_listed_after_it_is_turned_off() {
+        let mut backend = MockBackend::new();
+        let mut cable = backend.snapshot().speaker("local:desk").unwrap().clone();
+        cable.id = "local:cable".into();
+        cable.name = "Cable Input".into();
+        cable.kind = ui_model::SpeakerKind::Virtual;
+        cable.enabled = true;
+        backend.add_speaker(cable);
+        backend.set_running(true);
+        let app = app_over(backend);
+        let listed = || {
+            app.models
+                .flyout_this_pc
+                .iter()
+                .chain(app.models.flyout_connected.iter())
+                .any(|s| s.id == "local:cable")
+        };
+        assert!(!app.ui.borrow().show_virtual, "Show Virtual Devices is off");
+        assert!(listed(), "on, the virtual output is listed");
+
+        app.main.invoke_speaker_toggled("local:cable".into());
+        let enabled = |app: &App| app.snapshot().speaker("local:cable").unwrap().enabled;
+        assert!(!enabled(&app), "the click on its row turned it off");
+        assert!(listed(), "turned off, its row stays under the focus");
+        app.refresh();
+        assert!(listed(), "and a later refresh keeps it");
+
+        app.main.invoke_show_virtual_devices_toggled(true);
+        assert!(listed(), "Show Virtual Devices on lists it");
+        app.main.invoke_show_virtual_devices_toggled(false);
+        assert!(
+            !listed(),
+            "Show Virtual Devices changed: off and hidden again, it is forgotten"
+        );
+    }
+
+    // covers: P215, S223
+    #[test]
+    fn a_speaker_that_cant_play_right_now_shows_waiting_not_playing() {
+        let mut backend = MockBackend::new();
+        backend.set_running(true);
+        let state = backend.snapshot();
+        let mut busy = state.speaker("local:speakers").unwrap().clone();
+        busy.id = "local:busy".into();
+        busy.waiting = Some(ui_model::Waiting::ForDevice);
+        let mut retrying = state.speaker("airplay:kitchen").unwrap().clone();
+        retrying.id = "airplay:retrying".into();
+        retrying.waiting = Some(ui_model::Waiting::Reconnecting);
+        let mut gone = retrying.clone();
+        gone.id = "airplay:gone".into();
+        gone.waiting = Some(ui_model::Waiting::NotOnNetwork);
+        backend.add_speaker(busy);
+        backend.add_speaker(retrying);
+        backend.add_speaker(gone);
+        let app = app_over(backend);
+        let row = |id: &str| {
+            app.models
+                .flyout_this_pc
+                .iter()
+                .chain(app.models.flyout_connected.iter())
+                .find(|s| s.id == id)
+                .expect("listed")
+        };
+        assert_eq!(row("local:speakers").state, RowState::Playing);
+        assert_eq!(row("local:busy").state, RowState::WaitingForDevice);
+        assert_eq!(row("airplay:retrying").state, RowState::Reconnecting);
+        assert_eq!(row("airplay:gone").state, RowState::NotOnNetwork);
+
+        // Narrator hears the row's state and what a click does; the note
+        // under the name says the same.
+        let strings = app.strings();
+        let read = |state: RowState| {
+            (
+                strings.invoke_value(state, "Kitchen".into()).to_string(),
+                strings.invoke_help(state).to_string(),
+                strings.invoke_row_note(state, "Kitchen".into()).to_string(),
+            )
+        };
+        let turn_off = strings.get_turn_off().to_string();
+        let waiting = "In use by another app".to_owned();
+        assert_eq!(
+            read(RowState::WaitingForDevice),
+            (waiting.clone(), turn_off.clone(), waiting)
+        );
+        let reconnecting = "Reconnecting\u{2026}".to_owned();
+        assert_eq!(
+            read(RowState::Reconnecting),
+            (reconnecting.clone(), turn_off.clone(), reconnecting)
+        );
+        let slot = "Waiting: too many AirPlay 2 speakers".to_owned();
+        assert_eq!(
+            read(RowState::WaitingForAirplay2),
+            (slot.clone(), turn_off.clone(), slot)
+        );
+        let ptp = "Waiting: AirPlay 2 speakers on another network".to_owned();
+        assert_eq!(
+            read(RowState::WaitingForPtp),
+            (ptp.clone(), turn_off.clone(), ptp)
+        );
+        // The Mac row's words (P215).
+        let away = "Not on the network right now, plays once it's back".to_owned();
+        assert_eq!(
+            read(RowState::NotOnNetwork),
+            (away.clone(), turn_off.clone(), away)
+        );
+        // The Mac row's words, naming the speaker whose code is asked for.
+        let password = "Waiting for the password".to_owned();
+        assert_eq!(
+            read(RowState::WaitingForPassword),
+            (password.clone(), turn_off.clone(), password)
+        );
+        let pin = "Enter the code shown on Kitchen".to_owned();
+        assert_eq!(
+            read(RowState::WaitingForPin),
+            (pin.clone(), turn_off.clone(), pin)
+        );
+        assert_eq!(
+            read(RowState::Playing),
+            ("On".to_owned(), turn_off, String::new())
+        );
+
+        // A click turns a waiting speaker off: it is on.
+        app.main.invoke_speaker_toggled("local:busy".into());
+        assert!(!app.snapshot().speaker("local:busy").unwrap().enabled);
+    }
+
+    /// The delay field's text on the desk's row.
+    fn desk_delay_text(app: &App) -> String {
+        desk_row(app).delay_text.to_string()
+    }
+
+    /// The desk's row.
+    fn desk_row(app: &App) -> SpeakerItem {
+        app.models
+            .flyout_this_pc
+            .iter()
+            .chain(app.models.flyout_connected.iter())
+            .chain(app.models.this_pc.iter())
+            .chain(app.models.connected.iter())
+            .find(|s| s.id == "local:desk")
+            .expect("the desk has a row")
+    }
+
+    /// Voice Access finds a button by the words it shows, so each delay
+    /// step's Narrator name starts with its visible text.
+    #[test]
+    fn a_delay_steps_accessible_name_starts_with_its_visible_text() {
+        let app = app_over(MockBackend::new());
+        let strings = app.main.global::<Strings>();
+        for delta in [-100, -10, 10, 100] {
+            let shown = strings.invoke_delay_step(delta);
+            let name = strings.invoke_delay_step_accessibility(delta);
+            assert!(name.starts_with(shown.as_str()), "{name:?} / {shown:?}");
+            assert!(name.contains("delay"), "{name:?} says what it changes");
+        }
+    }
+
+    // covers: S220
+    #[test]
+    fn a_draft_is_typed_text_other_than_the_applied_value() {
+        assert!(!is_draft(None, "+120"), "nothing typed");
+        assert!(!is_draft(Some("+120"), "+120"), "the applied value typed");
+        assert!(is_draft(Some("220"), "+120"));
+        assert!(is_draft(Some("120"), "+120"), "the text differs");
+        assert!(is_draft(Some("abc"), "+120"), "unreadable text");
+        assert!(is_draft(Some(""), "0"), "an emptied field");
+    }
+
+    // covers: S220
+    #[test]
+    fn a_speakers_delay_field_marks_typing_until_it_applies_or_reverts() {
+        let app = app_over(MockBackend::new());
+        let pending = || desk_row(&app).delay_pending;
+        assert!(!pending(), "the applied value is no draft");
+
+        app.main
+            .invoke_delay_edited("local:desk".into(), "220".into());
+        assert!(pending(), "typing is a draft");
+        app.main.invoke_delay_committed("local:desk".into());
+        assert!(!pending(), "Enter clears it");
+
+        app.main
+            .invoke_delay_edited("local:desk".into(), "5".into());
+        app.main.invoke_delay_cancelled("local:desk".into());
+        assert!(!pending(), "Escape clears it");
+
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+".into());
+        assert!(pending(), "unreadable text is a draft");
+        app.main.invoke_delay_committed("local:desk".into());
+        assert!(!pending(), "Enter on unreadable text restores the value");
+
+        app.main
+            .invoke_delay_edited("local:desk".into(), "9".into());
+        app.main.invoke_delay_stepped("local:desk".into(), 10);
+        assert!(!pending(), "a step clears it");
+
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+19".into());
+        assert!(!pending(), "the applied value typed again is no draft");
+    }
+
+    // covers: S220
+    #[test]
+    fn a_typed_speaker_delay_applies_only_on_enter() {
+        let app = app_over(MockBackend::new());
+        let applied = || app.snapshot().speaker("local:desk").unwrap().delay_ms;
+        assert_eq!(applied(), Some(120.0), "the example desk has a delay");
+        assert_eq!(desk_delay_text(&app), "+120");
+
+        // Typing "220" applies nothing on the way (2, 22, 220).
+        for text in ["2", "22", "220"] {
+            app.main
+                .invoke_delay_edited("local:desk".into(), text.into());
+            assert_eq!(desk_delay_text(&app), text, "the field keeps what is typed");
+            assert_eq!(applied(), Some(120.0), "typing {text} applies nothing");
+        }
+        app.main.invoke_delay_committed("local:desk".into());
+        assert_eq!(applied(), Some(220.0), "Enter applies what was typed");
+        assert_eq!(desk_delay_text(&app), "+220");
+
+        // Escape drops the typing; an Enter after it applies nothing.
+        app.main
+            .invoke_delay_edited("local:desk".into(), "5".into());
+        app.main.invoke_delay_cancelled("local:desk".into());
+        assert_eq!(
+            desk_delay_text(&app),
+            "+220",
+            "Escape shows the saved value"
+        );
+        app.main.invoke_delay_committed("local:desk".into());
+        assert_eq!(applied(), Some(220.0), "Enter after Escape applies nothing");
+
+        // Unreadable text reverts to the saved value.
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+".into());
+        app.main.invoke_delay_committed("local:desk".into());
+        assert_eq!(applied(), Some(220.0));
+        assert_eq!(desk_delay_text(&app), "+220", "unreadable text reverts");
+
+        // A step applies at once, on top of the typed value.
+        app.main
+            .invoke_delay_edited("local:desk".into(), "150".into());
+        app.main.invoke_delay_stepped("local:desk".into(), 10);
+        assert_eq!(applied(), Some(160.0), "a step builds on the typed value");
+        assert_eq!(desk_delay_text(&app), "+160", "a step ends the typing");
+        app.main.invoke_delay_committed("local:desk".into());
+        assert_eq!(applied(), Some(160.0), "the typing applied once");
+
+        // Unreadable text: the step builds on the saved value.
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+".into());
+        app.main.invoke_delay_stepped("local:desk".into(), 10);
+        assert_eq!(applied(), Some(170.0), "a step over unreadable text");
+        assert_eq!(desk_delay_text(&app), "+170");
+    }
+
+    // covers: S220
+    #[test]
+    fn an_airplay_delay_step_builds_on_the_typed_value() {
+        let app = app_over(MockBackend::new());
+        let shown = || app.main.get_airplay_delay_text().to_string();
+        app.main.invoke_airplay_delay_edited("2000".into());
+        app.main.invoke_airplay_delay_stepped(100);
+        assert_eq!(app.snapshot().airplay_delay_ms, Some(2100.0));
+        assert_eq!(shown(), format_ms(2100.0), "a step ends the typing");
+        assert!(!app.main.get_airplay_delay_pending());
+    }
+
+    // covers: S220
+    #[test]
+    fn a_cast_delay_step_floors_the_typed_value_first() {
+        let mut backend = MockBackend::new();
+        let mut speaker = backend.snapshot().speaker("local:desk").unwrap().clone();
+        speaker.id = "cc:attic".into();
+        speaker.kind = ui_model::SpeakerKind::Cast;
+        backend.add_speaker(speaker);
+        let app = app_over(backend);
+        app.main.invoke_delay_edited("cc:attic".into(), "-5".into());
+        app.main.invoke_delay_stepped("cc:attic".into(), 10);
+        assert_eq!(delay_of(&app, "cc:attic"), Some(10.0), "-5 reads as 0");
+    }
+
+    // covers: S220
+    #[test]
+    fn a_delay_step_clamps_an_out_of_range_typed_value_first() {
+        let mut backend = MockBackend::new();
+        let mut speaker = backend.snapshot().speaker("local:desk").unwrap().clone();
+        speaker.id = "cc:attic".into();
+        speaker.kind = ui_model::SpeakerKind::Cast;
+        backend.add_speaker(speaker);
+        let app = app_over(backend);
+        let step = |id: &str, typed: &str, delta: i32| {
+            app.main.invoke_delay_edited(id.into(), typed.into());
+            app.main.invoke_delay_stepped(id.into(), delta);
+            delay_of(&app, id)
+        };
+        assert_eq!(step("local:desk", "25000", -100), Some(19_900.0));
+        assert_eq!(step("local:desk", "-5000", 100), Some(-1900.0));
+        assert_eq!(step("cc:attic", "-5000", 100), Some(100.0));
+    }
+
+    /// A speaker's applied delay.
+    fn delay_of(app: &App, id: &str) -> Option<f64> {
+        app.snapshot().speaker(id).unwrap().delay_ms
+    }
+
+    /// The speaker's row.
+    fn row_of(app: &App, id: &str) -> SpeakerItem {
+        app.models
+            .this_pc
+            .iter()
+            .chain(app.models.connected.iter())
+            .find(|s| s.id == id)
+            .expect("the speaker has a row")
+    }
+
+    // covers: S362
+    #[test]
+    fn only_a_local_output_with_an_offset_offers_calibration_and_says_what_it_needs() {
+        let app = app_over(MockBackend::new());
+        assert!(row_of(&app, "local:desk").calibratable);
+        assert!(
+            !row_of(&app, "local:speakers").calibratable,
+            "the reference"
+        );
+        let desk = row_of(&app, "local:desk");
+        assert!(!desk.calibration_enabled, "streaming is off");
+        assert!(
+            desk.calibration_status.starts_with("Turn on streaming"),
+            "{}",
+            desk.calibration_status
+        );
+
+        let mut backend = MockBackend::new();
+        backend.set_running(true);
+        backend.set_speaker_enabled("local:desk", true);
+        let app = app_over(backend);
+        let desk = row_of(&app, "local:desk");
+        assert!(desk.calibration_enabled);
+        assert_eq!(desk.calibration_status, "", "nothing stands in the way");
+
+        let mut state = app.snapshot();
+        state.calibration.speaker_id = Some("local:desk".into());
+        state.calibration.phase = Phase::Failed(Failure::MicrophoneDenied);
+        let speaker = state.speaker("local:desk").unwrap().clone();
+        let line = calibration_status(&app.strings(), &state, &speaker);
+        assert!(
+            line.to_lowercase().contains("privacy"),
+            "it says where to allow it: {line}"
+        );
+        state.calibration.phase = Phase::Done {
+            offset_ms: 412.4,
+            clamped: false,
+        };
+        let line = calibration_status(&app.strings(), &state, &speaker);
+        assert!(line.contains("412"), "{line}");
+    }
+
+    // covers: S232
+    #[test]
+    fn another_calibration_holding_the_outputs_is_named_under_a_rows_button() {
+        let mut backend = MockBackend::new();
+        backend.set_running(true);
+        backend.set_speaker_enabled("local:desk", true);
+        let app = app_over(backend);
+        let strings = app.strings();
+        let mut state = app.snapshot();
+        state.calibration.speaker_id = Some("local:speakers".into());
+        state.calibration.phase = Phase::Running(Step::Preparing);
+        state.calibration.busy = true;
+        state.calibration.own_run_holds = true;
+        let desk = state.speaker("local:desk").unwrap().clone();
+        assert!(!speaker_item(&state, &desk, false, true, None).calibration_enabled);
+        assert_eq!(
+            calibration_status(&strings, &state, &desk),
+            strings.get_calibrate_all_busy()
+        );
+
+        // Its own cut-off sweep playing out, its line already gone: no other calibration runs.
+        state.calibration.speaker_id = Some("local:desk".into());
+        state.calibration.phase = Phase::Idle;
+        assert!(!speaker_item(&state, &desk, false, true, None).calibration_enabled);
+        assert_eq!(calibration_status(&strings, &state, &desk), "");
+
+        state.calibration.own_run_holds = false;
+        assert_eq!(
+            calibration_status(&strings, &state, &desk),
+            strings.get_calibrate_all_busy(),
+            "Calibrate All holds the outputs"
+        );
+    }
+
+    // covers: S362
+    #[test]
+    fn a_calibration_that_cannot_start_names_only_what_is_off() {
+        fn switch(state: &mut AppState, streaming: bool, desk: bool, reference: bool) {
+            state.running = streaming;
+            for speaker in &mut state.speakers {
+                match speaker.id.as_str() {
+                    "local:desk" => speaker.enabled = desk,
+                    "local:speakers" => speaker.enabled = reference,
+                    _ => {}
+                }
+            }
+        }
+        fn engine(session: Option<u64>, playing: &[&str]) -> calibration::Engine {
+            calibration::Engine {
+                session,
+                playing: playing.iter().map(|id| id.to_string()).collect(),
+                reference: Some("builtin".into()),
+                ..Default::default()
+            }
+        }
+        fn lineup(session: Option<u64>, ids: &[&str]) -> crate::audio::calibrate_all::Lineup {
+            crate::audio::calibrate_all::Lineup {
+                session,
+                reference: Some("builtin".into()),
+                members: ids
+                    .iter()
+                    .map(|id| crate::audio::calibrate_all::Member {
+                        id: id.to_string(),
+                        class: audiosync_core::calibrate_all::Class::Local,
+                        offset_ms: Some(0.0),
+                        latency_ms: 2500.0,
+                        sender_ms: 0.0,
+                        adjustment_ms: 0.0,
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let mut state = app.snapshot();
+        state.reference_name = Some("Speakers".into());
+        let row = |state: &AppState| {
+            let desk = state.speaker("local:desk").unwrap().clone();
+            calibration_status(&strings, state, &desk).to_string()
+        };
+        let mut rows = Vec::new();
+        for (streaming, desk, reference) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, true),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            switch(&mut state, streaming, desk, reference);
+            rows.push(row(&state));
+        }
+        assert_eq!(
+            rows,
+            [
+                "Turn on streaming to calibrate.",
+                "Turn on this speaker to calibrate it.",
+                // The button stays enabled while the reference is off; the press names it.
+                "",
+                "Turn on streaming and this speaker to calibrate it.",
+                "Turn on streaming to calibrate.",
+                "Turn on streaming and this speaker to calibrate it.",
+            ],
+            "the line under the button"
+        );
+
+        let pressed: Vec<String> = [
+            engine(None, &["builtin", "usb"]),
+            engine(Some(1), &["builtin"]),
+            engine(Some(1), &["usb"]),
+            engine(Some(1), &[]),
+        ]
+        .iter()
+        .map(|engine| {
+            let failure = calibration::blocker(engine, "usb").expect("it can't start");
+            calibration_failure(&strings, "Speakers", failure).to_string()
+        })
+        .collect();
+        assert_eq!(
+            pressed,
+            [
+                "Turn on streaming to calibrate.",
+                "Turn on this speaker to calibrate it.",
+                "Turn on Speakers to calibrate.",
+                "Turn on this speaker and Speakers to calibrate it.",
+            ],
+            "the press"
+        );
+
+        let none = std::collections::BTreeSet::new();
+        let all: Vec<String> = [lineup(None, &["builtin", "usb"]), lineup(Some(1), &["usb"])]
+            .iter()
+            .map(|lineup| {
+                let mut state = app.snapshot();
+                state.reference_name = Some("Speakers".into());
+                state.calibrate_all.phase = AllPhase::Idle;
+                state.calibrate_all.other_running = false;
+                state.calibrate_all.blocked = crate::audio::calibrate_all::blocked(lineup, &none);
+                calibrate_all_card(&strings, &state).status.to_string()
+            })
+            .collect();
+        assert_eq!(
+            all,
+            [
+                "Turn on streaming to calibrate.",
+                "Turn on Speakers to calibrate."
+            ],
+            "Calibrate All"
+        );
+
+        let mut both = lineup(None, &[]);
+        both.reference_off = true;
+        assert_eq!(
+            crate::audio::calibrate_all::blocked(&both, &none)
+                .map(|failure| { calibration_failure(&strings, "", failure).to_string() }),
+            Some("Turn on streaming and the PC's own speakers to calibrate.".to_owned()),
+            "Calibrate All, without a reference name"
+        );
+
+        let again: Vec<String> = [
+            Missing::STREAMING,
+            Missing::SPEAKER,
+            Missing::REFERENCE,
+            Missing {
+                reference: true,
+                ..Missing::STREAMING
+            },
+            Missing {
+                speaker: true,
+                ..Missing::STREAMING
+            },
+            Missing::ALL,
+        ]
+        .into_iter()
+        .map(|missing| {
+            let mut state = app.snapshot();
+            state.reference_name = Some("Speakers".into());
+            state.calibrate_all.other_running = false;
+            state.calibrate_all.phase = AllPhase::CannotMeasureAgain("Den".into(), missing);
+            calibrate_all_card(&strings, &state).status.to_string()
+        })
+        .collect();
+        assert_eq!(
+            again,
+            [
+                "Turn on streaming to measure it again.",
+                "Turn on Den to measure it again.",
+                "Turn on Speakers to measure it again.",
+                "Turn on streaming and Speakers to measure it again.",
+                "Turn on streaming and Den to measure it again.",
+                "Turn on streaming, Den and Speakers to measure it again.",
+            ],
+            "Measure Again"
+        );
+    }
+
+    // covers: S239
+    #[test]
+    fn measure_again_of_a_row_whose_delay_changed_says_so_as_on_the_mac() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        assert_eq!(
+            calibration_failure(&strings, "Speakers", Failure::DelayChanged).to_string(),
+            "This speaker's delay changed after it was measured. Calibrate All again."
+        );
+    }
+
+    // covers: S362
+    #[test]
+    fn outputs_left_out_by_kind_show_why_on_the_card_and_in_their_delay_controls() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let mut state = app.snapshot();
+        state.calibrate_all.blocked = Some(Failure::OnlyLeftOut);
+        state.calibrate_all.left_out = vec![
+            LeftOutRow {
+                id: "phones".into(),
+                name: "Headphones".into(),
+                kind: ui_model::MicKind::Headphones,
+                included: false,
+            },
+            LeftOutRow {
+                id: "cable".into(),
+                name: "Cable Input".into(),
+                kind: ui_model::MicKind::Virtual,
+                included: true,
+            },
+        ];
+        let card = calibrate_all_card(&strings, &state);
+        assert!(!card.can_start);
+        assert!(card.status.contains("Include Anyway"), "{}", card.status);
+        assert!(
+            !card.status.contains("Only"),
+            "not the only-the-reference text"
+        );
+        assert_eq!(card.left_out.len(), 2);
+        assert_eq!(
+            card.left_out[0].reason,
+            "Left out of microphone calibration: the microphone can't hear headphones."
+        );
+        assert!(!card.left_out[0].included);
+        assert_eq!(
+            card.left_out[1].reason,
+            "Included anyway: measured in this run."
+        );
+        assert!(card.left_out[0].help.contains("as headphones"));
+        assert!(card.left_out[1].help.starts_with("For a virtual output"));
+
+        let mut speaker = state.speaker("local:desk").unwrap().clone();
+        speaker.enabled = true;
+        assert!(is_calibratable(&speaker));
+        speaker.mic_left_out = Some(ui_model::MicKind::Virtual);
+        assert!(!is_calibratable(&speaker), "no Calibrate with Microphone");
+        assert_eq!(calibration_status(&strings, &state, &speaker), "");
+        assert_eq!(
+            calibration_left_out(&strings, ui_model::MicKind::Virtual),
+            "Left out of microphone calibration: a virtual output has nothing for the \
+             microphone to hear."
+        );
+    }
+
+    // covers: S362
+    #[test]
+    fn include_anyway_acts_on_the_output_its_row_showed_after_the_list_changed() {
+        use i_slint_backend_testing::ElementHandle;
+        fn row(id: &str, name: &str) -> LeftOutRow {
+            LeftOutRow {
+                id: id.into(),
+                name: name.into(),
+                kind: ui_model::MicKind::Headphones,
+                included: false,
+            }
+        }
+        let backend = MockBackend::new();
+        let left_out = backend.left_out.clone();
+        let includes = backend.includes.clone();
+        *left_out.borrow_mut() = vec![row("phones", "Headphones"), row("cable", "Cable Input")];
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        // Tall enough that the card's left-out rows are on screen.
+        app.main
+            .window()
+            .set_size(slint::PhysicalSize::new(1000, 2000));
+        let click = |label: &str| {
+            let buttons: Vec<_> =
+                ElementHandle::find_by_accessible_label(&app.main, label).collect();
+            assert_eq!(buttons.len(), 1, "{label}");
+            buttons[0].invoke_accessible_default_action();
+        };
+
+        // A headset plugged in ahead of them before the card redraws.
+        *left_out.borrow_mut() = vec![
+            row("usb", "USB Headset"),
+            row("phones", "Headphones"),
+            row("cable", "Cable Input"),
+        ];
+        click("Include Anyway, Cable Input");
+        assert_eq!(*includes.borrow(), vec![("cable".to_owned(), true)]);
+
+        // Unplugged before the card redraws: the click does nothing.
+        *left_out.borrow_mut() = vec![row("usb", "USB Headset"), row("cable", "Cable Input")];
+        click("Include Anyway, Headphones");
+        assert_eq!(includes.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_calibrate_all_card_names_each_step_and_says_how_the_airplay_speakers_differ() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let mut state = app.snapshot();
+        state.calibrate_all.phase = AllPhase::Running(AllProgress::Measuring {
+            name: "Den".into(),
+            reference: false,
+            take: 2,
+            searching: false,
+        });
+        let card = calibrate_all_card(&strings, &state);
+        assert!(card.running);
+        assert!(card.status.contains("Den") && card.status.contains('2'));
+        state.calibrate_all.phase = AllPhase::Running(AllProgress::Measuring {
+            name: "Den".into(),
+            reference: false,
+            take: 1,
+            searching: true,
+        });
+        let card = calibrate_all_card(&strings, &state);
+        assert!(card.status.contains("up to a minute"), "{}", card.status);
+
+        let clear = Measurement {
+            new_ms: 2040.0,
+            uncertainty_ms: 1.2,
+            difference_ms: 40.0,
+            clamped: false,
+        };
+        let row = |name: &str, class, state| SheetRow {
+            name: name.into(),
+            class,
+            old_ms: Some(2000.0),
+            state,
+            can_measure_again: true,
+        };
+        state.calibrate_all.phase = AllPhase::Idle;
+        state.calibrate_all.sheet = Some(SheetState {
+            rows: vec![
+                row("Speakers", Class::Local, SheetRowState::Reference),
+                row("Kitchen", Class::AirPlay, SheetRowState::Certain(clear)),
+                row(
+                    "Bedroom",
+                    Class::AirPlay,
+                    SheetRowState::Uncertain(Measurement {
+                        uncertainty_ms: 14.0,
+                        ..clear
+                    }),
+                ),
+            ],
+            airplay: Some(AirPlayShared {
+                old_ms: Some(2000.0),
+                new_ms: Some(2040.0),
+                spread_ms: 23.0,
+                certain_rows: 2,
+                state: SharedState::Spread,
+                clamped: false,
+            }),
+            ended: None,
+            failure: None,
+            again_ended: None,
+            can_apply: true,
+            applied: false,
+            can_undo: false,
+            undone: false,
+        });
+        let card = calibrate_all_card(&strings, &state);
+        assert!(card.results_shown && card.can_apply && !card.applied);
+        assert!(
+            card.rows[1].detail.contains("2040"),
+            "{}",
+            card.rows[1].detail
+        );
+        assert!(card.rows[2].detail.contains("Measure Again"));
+        assert!(card.airplay.contains("23 ms"), "{}", card.airplay);
+        assert!(card.airplay.contains("differ by"), "over 10 ms apart");
+        let never = SheetRow {
+            old_ms: None,
+            ..row("Den", Class::Cast, SheetRowState::Certain(clear))
+        };
+        let detail = row_detail(&strings, "", &never);
+        assert!(detail.starts_with("Was none."), "{detail}");
+        let sheet = state.calibrate_all.sheet.as_mut().unwrap();
+        let shared = sheet.airplay.as_mut().unwrap();
+        shared.spread_ms = 4.0;
+        shared.state = SharedState::Certain;
+        let card = calibrate_all_card(&strings, &state);
+        assert!(card.airplay.contains("4 ms apart"), "{}", card.airplay);
+        assert!(!card.airplay.contains("differ by"));
+        assert_eq!(card.said, strings.invoke_calibrate_all_finished(1, 2));
+
+        // Busy after Apply: Undo is off, but Close still reads Done.
+        let sheet = state.calibrate_all.sheet.as_mut().unwrap();
+        sheet.applied = true;
+        sheet.can_undo = false;
+        assert!(calibrate_all_card(&strings, &state).applied);
+        let sheet = state.calibrate_all.sheet.as_mut().unwrap();
+        sheet.applied = false;
+        sheet.ended = Some(EndReason::SpeakerTurnedOff);
+        sheet.can_apply = false;
+        sheet.failure = None;
+        let card = calibrate_all_card(&strings, &state);
+        assert!(!card.can_apply);
+        assert_eq!(
+            card.said,
+            strings.invoke_calibrate_all_stopped(strings.get_calibrate_all_ended_off())
+        );
+
+        state.calibrate_all.sheet = None;
+        state.calibrate_all.phase = AllPhase::Failed(Failure::MicrophoneDenied);
+        let card = calibrate_all_card(&strings, &state);
+        assert!(card.privacy && !card.results_shown);
+        assert!(
+            card.said.to_lowercase().contains("privacy"),
+            "{}",
+            card.said
+        );
+    }
+
+    // covers: S240
+    #[test]
+    fn a_delay_edit_and_a_source_switch_end_with_the_macs_lines() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        assert_eq!(
+            ended_text(&strings, EndReason::DelaysChanged),
+            "A delay changed during the measurement."
+        );
+        assert_eq!(
+            ended_text(&strings, EndReason::SourceChanged),
+            "The source was switched during the measurement."
+        );
+        assert_eq!(
+            ended_text(&strings, EndReason::SpeakersChanged),
+            "The speakers changed during the measurement."
+        );
+    }
+
+    // covers: S362
+    #[test]
+    fn the_calibrate_all_card_says_what_holds_it_and_when_nothing_was_clear() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let mut state = app.snapshot();
+        state.calibrate_all.phase = AllPhase::Idle;
+        state.calibrate_all.other_running = true;
+        let card = calibrate_all_card(&strings, &state);
+        assert_eq!(card.status, strings.get_calibrate_all_busy());
+
+        state.calibrate_all.other_running = false;
+        state.calibrate_all.phase = AllPhase::CannotMeasureAgain("Den".into(), Missing::SPEAKER);
+        let card = calibrate_all_card(&strings, &state);
+        assert!(card.status.contains("Den"), "{}", card.status);
+        assert!(
+            card.status.ends_with("to measure it again."),
+            "{}",
+            card.status
+        );
+        assert_eq!(card.said, card.status);
+
+        let unclear = Measurement {
+            new_ms: 2040.0,
+            uncertainty_ms: 14.0,
+            difference_ms: 40.0,
+            clamped: false,
+        };
+        let row = |name: &str, state| SheetRow {
+            name: name.into(),
+            class: Class::Cast,
+            old_ms: None,
+            state,
+            can_measure_again: true,
+        };
+        state.calibrate_all.phase = AllPhase::Idle;
+        state.calibrate_all.sheet = Some(SheetState {
+            rows: vec![
+                row("Speakers", SheetRowState::Reference),
+                row("Den", SheetRowState::Uncertain(unclear)),
+            ],
+            airplay: None,
+            ended: None,
+            failure: None,
+            again_ended: None,
+            can_apply: false,
+            applied: false,
+            can_undo: false,
+            undone: false,
+        });
+        let card = calibrate_all_card(&strings, &state);
+        assert_eq!(card.outcome, strings.get_calibrate_all_nothing_certain());
+    }
+
+    #[test]
+    fn a_calibrations_ending_is_announced_once() {
+        let mut announced = None;
+        let mut calibration = ui_model::CalibrationState {
+            speaker_id: Some("local:desk".into()),
+            phase: Phase::Running(Step::Preparing),
+            busy: true,
+            own_run_holds: true,
+        };
+        assert_eq!(calibration_ended(&mut announced, &calibration), None);
+        calibration.phase = Phase::Failed(Failure::MicrophoneSkipped);
+        assert_eq!(
+            calibration_ended(&mut announced, &calibration).as_deref(),
+            Some("local:desk")
+        );
+        calibration.busy = false;
+        assert_eq!(
+            calibration_ended(&mut announced, &calibration),
+            None,
+            "said"
+        );
+        calibration.phase = Phase::Idle;
+        assert_eq!(calibration_ended(&mut announced, &calibration), None);
+        calibration.phase = Phase::Failed(Failure::MicrophoneSkipped);
+        assert_eq!(
+            calibration_ended(&mut announced, &calibration).as_deref(),
+            Some("local:desk"),
+            "a second run that ends the same way"
+        );
+    }
+
+    #[test]
+    fn narrator_hears_each_speaker_as_calibrate_all_starts_measuring_it() {
+        let backend = MockBackend::new();
+        let phase = backend.calibrate_all_phase.clone();
+        let app = app_over(backend);
+        let said = || app.main.get_notice_announcement().to_string();
+        let measuring = |name: &str, take| {
+            Some(AllPhase::Running(AllProgress::Measuring {
+                name: name.into(),
+                reference: false,
+                take,
+                searching: false,
+            }))
+        };
+        *phase.borrow_mut() = measuring("Den", 1);
+        app.refresh();
+        assert_eq!(said(), "Listening to Den, sweep 1 of 2…");
+        app.clear_announcement();
+        *phase.borrow_mut() = measuring("Den", 2);
+        app.refresh();
+        assert_eq!(said(), "", "the same speaker's second sweep");
+        *phase.borrow_mut() = measuring("Kitchen", 1);
+        app.refresh();
+        assert_eq!(said(), "Listening to Kitchen, sweep 1 of 2…");
+    }
+
+    #[test]
+    fn a_blocked_microphone_offers_its_privacy_settings_on_the_row() {
+        let mut backend = MockBackend::new();
+        backend.set_running(true);
+        backend.set_speaker_enabled("local:desk", true);
+        let app = app_over(backend);
+        let mut state = app.snapshot();
+        let speaker = state.speaker("local:desk").unwrap().clone();
+        assert!(!speaker_item(&state, &speaker, false, true, None).calibration_privacy);
+        state.calibration.speaker_id = Some("local:desk".into());
+        state.calibration.phase = Phase::Failed(Failure::MicrophoneDenied);
+        assert!(speaker_item(&state, &speaker, false, true, None).calibration_privacy);
+        let bt = state.speaker("local:bt").unwrap().clone();
+        assert!(!speaker_item(&state, &bt, false, true, None).calibration_privacy);
+    }
+
+    // covers: S355
+    #[test]
+    fn open_privacy_settings_shows_only_where_something_opens_that_page() {
+        let privacy = SettingsPage::MicrophonePrivacy.uri();
+        assert!(offers_privacy(true, |uri| uri == privacy));
+        // Linux has no program for the page (guide::linux_program): no button.
+        assert!(!offers_privacy(true, |uri| uri != privacy));
+        assert!(!offers_privacy(false, |_| true));
+    }
+
+    /// Opens the desk's and the headset's sync controls, types 400 into the
+    /// desk's field and `headset` into the headset's.
+    fn type_into_two_rows(app: &App, headset: &str) {
+        for id in ["local:desk", "local:bt"] {
+            app.main.invoke_sync_toggled(id.into());
+        }
+        app.main
+            .invoke_delay_edited("local:desk".into(), "400".into());
+        app.main
+            .invoke_delay_edited("local:bt".into(), headset.into());
+        assert_eq!(
+            delay_of(app, "local:desk"),
+            Some(120.0),
+            "typing applies nothing"
+        );
+    }
+
+    // covers: S221
+    #[test]
+    fn the_delay_button_applies_every_typed_delay_and_closes_only_its_controls() {
+        let app = app_over(MockBackend::new());
+        type_into_two_rows(&app, "-200");
+
+        app.main.invoke_sync_toggled("local:desk".into());
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(400.0),
+            "closing applied it"
+        );
+        assert_eq!(desk_delay_text(&app), "+400");
+        assert_eq!(
+            delay_of(&app, "local:bt"),
+            Some(-200.0),
+            "the other open row's typing applied too"
+        );
+        let ui = app.ui.borrow();
+        assert!(!ui.sync_open.contains("local:desk"));
+        assert!(ui.sync_open.contains("local:bt"), "the headset's stay open");
+        assert!(ui.delay_drafts.is_empty());
+    }
+
+    // covers: S221
+    #[test]
+    fn enter_applies_its_rows_typed_delay_and_keeps_every_control_open() {
+        let app = app_over(MockBackend::new());
+        type_into_two_rows(&app, "-200");
+        app.main.invoke_delay_committed("local:desk".into());
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(400.0),
+            "Enter applied it"
+        );
+        let ui = app.ui.borrow();
+        assert!(
+            ui.sync_open.contains("local:desk"),
+            "its controls stay open"
+        );
+        assert!(ui.sync_open.contains("local:bt"), "and the headset's");
+        assert!(ui.delay_drafts.contains_key("local:bt"), "with its draft");
+        drop(ui);
+        assert_eq!(delay_of(&app, "local:bt"), Some(-250.0));
+    }
+
+    // covers: S181 (typing in a speaker's delay field survives a delay set elsewhere)
+    #[test]
+    fn a_typed_speaker_delay_survives_a_delay_set_elsewhere() {
+        let app = app_over(MockBackend::new());
+        app.main.invoke_sync_toggled("local:desk".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "300".into());
+        // The phone remote or a calibration sets the delay before Enter.
+        app.update(|b| b.set_speaker_delay("local:desk", 100.0));
+        assert_eq!(delay_of(&app, "local:desk"), Some(100.0));
+        app.main.invoke_delay_committed("local:desk".into());
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(300.0),
+            "Enter applies the typing"
+        );
+    }
+
+    // covers: S221
+    #[test]
+    fn a_click_on_a_rows_box_toggles_its_controls_and_applies_the_typing_first() {
+        let app = app_over(MockBackend::new());
+        draw_frames();
+        let window = app.main.window();
+        app.main.invoke_sync_toggled("local:bt".into());
+        app.main
+            .invoke_delay_edited("local:bt".into(), "-200".into());
+
+        // The blank part of the desk's row, right of its name.
+        click(window, 600.0, 466.0);
+        assert_eq!(
+            delay_of(&app, "local:bt"),
+            Some(-200.0),
+            "the headset's typing applied first"
+        );
+        let open = |app: &App| app.ui.borrow().sync_open.clone();
+        assert!(open(&app).contains("local:desk"), "the desk's opened");
+        assert!(open(&app).contains("local:bt"), "the headset's stay open");
+
+        app.main
+            .invoke_delay_edited("local:desk".into(), "400".into());
+        app.main.invoke_airplay_delay_edited("2100".into());
+        click(window, 600.0, 466.0);
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(400.0),
+            "closing applied it"
+        );
+        assert_eq!(app.snapshot().airplay_delay_ms, Some(2100.0));
+        assert!(!open(&app).contains("local:desk"), "and closed it");
+
+        // The reference row has no delay: a click there is outside.
+        click(window, 600.0, 466.0);
+        app.main
+            .invoke_delay_edited("local:desk".into(), "300".into());
+        click(window, 600.0, 162.0);
+        assert_eq!(delay_of(&app, "local:desk"), Some(300.0));
+        assert!(open(&app).is_empty());
+    }
+
+    fn ctrl_s(window: &slint::Window) {
+        window.dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
+        press(window, "s");
+        window.dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
+    }
+
+    // covers: S221
+    #[test]
+    fn ctrl_s_applies_every_typed_delay_wherever_the_focus_is_and_keeps_the_controls_open() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        type_into_two_rows(&app, "-200");
+        app.main.invoke_airplay_delay_edited("2100".into());
+        app.main.invoke_focus_streaming_switch();
+        draw_frames();
+        ctrl_s(app.main.window());
+        assert_eq!(delay_of(&app, "local:desk"), Some(400.0));
+        assert_eq!(delay_of(&app, "local:bt"), Some(-200.0));
+        assert_eq!(app.snapshot().airplay_delay_ms, Some(2100.0));
+        let ui = app.ui.borrow();
+        assert_eq!(ui.sync_open.len(), 2, "the sync controls stay open");
+        assert!(ui.delay_drafts.is_empty() && ui.airplay_delay_draft.draft.is_none());
+    }
+
+    #[test]
+    fn the_range_line_is_announced_once_as_a_field_goes_out_of_range() {
+        let mut fields = HashSet::new();
+        let hint = |text: &str| SharedString::from(text);
+        let desk = |text: &str| vec![("local:desk".to_owned(), hint(text))];
+        assert_eq!(newly_out_of_range(&mut fields, desk("A")), Some(hint("A")));
+        assert_eq!(
+            newly_out_of_range(&mut fields, desk("B")),
+            None,
+            "still out"
+        );
+        assert_eq!(newly_out_of_range(&mut fields, Vec::new()), None);
+        assert_eq!(
+            newly_out_of_range(&mut fields, desk("C")),
+            Some(hint("C")),
+            "out again"
+        );
+        let both = vec![
+            ("local:desk".to_owned(), hint("C")),
+            (AIRPLAY_DELAY_FIELD.to_owned(), hint("D")),
+        ];
+        assert_eq!(newly_out_of_range(&mut fields, both), Some(hint("D")));
+
+        let app = app_over(MockBackend::new());
+        app.main.invoke_sync_toggled("local:desk".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+30000".into());
+        let said = app.main.get_notice_announcement();
+        assert_eq!(
+            said,
+            "The range is \u{2212}2000 to +20000 ms. Enter applies +20000."
+        );
+    }
+
+    /// No AirPlay speaker found, and Connected Speakers lists the desk
+    /// (`with_desk`) or nothing.
+    fn app_with_the_no_airplay_note(with_desk: bool) -> Rc<App> {
+        let mut backend = MockBackend::new();
+        backend.set_airplay_none_found(true);
+        backend.retain_speakers(|s| {
+            !s.id.starts_with("airplay:")
+                && s.id != "local:bt"
+                && (with_desk || s.id != "local:desk")
+        });
+        let app = app_over(backend);
+        draw_frames();
+        app
+    }
+
+    // covers: S221
+    #[test]
+    fn a_click_on_the_no_airplay_note_under_a_list_works_like_one_on_the_last_row() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_with_the_no_airplay_note(true);
+        // The note's wording and wrap differ per host and font, so the
+        // clicks aim at its own box, not at fixed points.
+        let click_the_note = || {
+            let note = ElementHandle::find_by_element_id(&app.main, "SpeakerSection::note-area")
+                .next()
+                .expect("the note shows");
+            let (at, size) = (note.absolute_position(), note.size());
+            let y = at.y + size.height / 2.0;
+            let height = app
+                .main
+                .window()
+                .size()
+                .to_logical(app.main.window().scale_factor())
+                .height;
+            assert!(y > 0.0 && y < height, "the note is in view at {y}");
+            click(app.main.window(), at.x + size.width / 2.0, y);
+        };
+        click_the_note();
+        assert!(
+            app.ui.borrow().sync_open.contains("local:desk"),
+            "the desk's controls opened"
+        );
+        app.main
+            .invoke_delay_edited("local:desk".into(), "400".into());
+        // The open controls push the note below the list's bottom edge.
+        scroll(app.main.window(), 640.0, 600.0, -300.0);
+        draw_frames();
+        click_the_note();
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(400.0),
+            "closing applied it"
+        );
+        assert!(app.ui.borrow().sync_open.is_empty());
+    }
+
+    /// While AirPlay discovery has listed nothing yet, the main window's
+    /// empty Connected Speakers list says it looks, as the flyout does.
+    #[test]
+    fn the_main_window_and_the_flyout_both_look_while_airplay_searches() {
+        let mut backend = MockBackend::new();
+        backend.set_airplay_searching(true);
+        let app = app_over(backend);
+        assert!(app.main.get_airplay_searching());
+        assert!(app.flyout.get_airplay_searching());
+
+        let app = app_over(MockBackend::new());
+        assert!(!app.main.get_airplay_searching());
+    }
+
+    /// With AirPlay discovery off or failed and no output on this PC, the
+    /// flyout says no speaker is connected instead of staying blank.
+    #[test]
+    fn an_empty_flyout_says_no_speaker_is_connected() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        backend.retain_speakers(|_| false);
+        let app = app_over(backend);
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        assert!(
+            ElementHandle::find_by_accessible_label(&app.flyout, "No connected speakers")
+                .next()
+                .is_some(),
+            "the empty flyout says so"
+        );
+    }
+
+    /// With only this PC's outputs listed, the flyout gives the main window's
+    /// note on the network speakers, and while AirPlay still looks, both name
+    /// a Google Cast search that found nothing after it.
+    #[test]
+    fn the_network_note_shows_beside_this_pcs_outputs() {
+        use i_slint_backend_testing::ElementHandle;
+        let shown_with = |this_pc: bool, airplay_searching: bool, cast: ui_model::CastList| {
+            let mut backend = MockBackend::new();
+            backend.retain_speakers(|s| this_pc && s.kind.is_this_pc());
+            backend.set_airplay_none_found(!airplay_searching);
+            backend.set_airplay_searching(airplay_searching);
+            backend.set_cast_list(cast);
+            let app = app_over(backend);
+            app.main.show().unwrap();
+            app.flyout.show().expect("the flyout shows headless");
+            draw_frames();
+            app
+        };
+        let shown = |airplay_searching, cast| shown_with(true, airplay_searching, cast);
+        fn has(window: &impl slint::ComponentHandle, text: &str) -> bool {
+            ElementHandle::find_by_accessible_label(window, text)
+                .next()
+                .is_some()
+        }
+
+        let app = shown(false, ui_model::CastList::Quiet);
+        let none_found = app.strings().get_airplay_none_found();
+        assert!(has(&app.flyout, &none_found), "{none_found}");
+
+        let app = shown(true, ui_model::CastList::NoneFound);
+        let looking = format!(
+            "Looking for AirPlay speakers… {}",
+            app.strings().invoke_cast_list(CastList::NoneFound)
+        );
+        assert!(has(&app.main, &looking), "main: {looking}");
+        assert!(has(&app.flyout, &looking), "flyout: {looking}");
+
+        let app = shown_with(false, true, ui_model::CastList::Failed);
+        let looking = format!(
+            "Looking for AirPlay speakers… {}",
+            app.strings().invoke_cast_list(CastList::Failed)
+        );
+        assert!(has(&app.flyout, &looking), "no PC outputs: {looking}");
+    }
+
+    /// Streaming with no speaker listed at all: neither window asks to turn
+    /// one on, which there is none to turn on.
+    #[test]
+    fn streaming_with_no_speaker_listed_asks_for_none_to_be_turned_on() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        backend.retain_speakers(|_| false);
+        backend.set_no_speaker_on(true);
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        let text = "No speaker is on. The first one you turn on starts playing.";
+        assert!(
+            ElementHandle::find_by_accessible_label(&app.main, text)
+                .next()
+                .is_none()
+        );
+        assert!(
+            ElementHandle::find_by_accessible_label(&app.flyout, text)
+                .next()
+                .is_none()
+        );
+    }
+
+    /// On Windows the notes that no speaker was found always name Windows
+    /// Firewall, and suggest a Private network only once Windows reports a
+    /// Public one; the Guide names the firewall for any network.
+    // covers: S391
+    #[test]
+    fn the_none_found_notes_suggest_private_only_on_a_public_network() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        for note in [
+            strings.get_airplay_none_found(),
+            strings.get_network_none_found(),
+            strings.invoke_cast_list(CastList::NoneFound),
+        ] {
+            assert!(!note.contains("Private"), "{note}");
+            assert!(
+                !cfg!(windows) || note.contains("Windows Firewall allows AudioSync"),
+                "{note}"
+            );
+        }
+        assert!(
+            strings
+                .get_help_airplay()
+                .contains("Windows Firewall allows AudioSync")
+        );
+        strings.set_public_network(true);
+        assert!(
+            strings
+                .get_airplay_none_found()
+                .contains("set the network to Private")
+        );
+    }
+
+    /// The Guide's AirPlay section says what the sender does: AirPlay 2
+    /// speakers play by default, and no AirPlay 2 switch is named.
+    // covers: S312
+    #[test]
+    fn the_airplay_guide_plays_airplay_2_by_default() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        for guide in [strings.get_help_airplay(), strings.get_help_airplay_linux()] {
+            assert!(!guide.contains("off at first"), "{guide}");
+            assert!(
+                guide.contains("uses AirPlay 2, or AirPlay 1 when it was paired over AirPlay 1"),
+                "{guide}"
+            );
+            assert!(!guide.contains("(Experimental)"), "{guide}");
+        }
+    }
+
+    /// A Public reading reaches the note that no speaker was found on a poll
+    /// that changes nothing else, and the note leaves the firewall out again
+    /// once it goes.
+    // covers: S391
+    #[test]
+    fn the_none_found_note_takes_a_public_reading_on_a_quiet_poll() {
+        use crate::network_profile::{Category, ProfileSource};
+        use std::time::Instant;
+
+        struct Public;
+        impl ProfileSource for Public {
+            fn connected(&self) -> Option<Vec<Category>> {
+                Some(vec![Category::Public])
+            }
+        }
+        let mut backend = MockBackend::new();
+        backend.set_airplay_none_found(true);
+        let app = app_over(backend);
+        app.remote.borrow_mut().profiles = Some(std::sync::Arc::new(Public));
+        app.refresh();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.strings().get_public_network() {
+            assert!(Instant::now() < deadline, "no Public reading came in");
+            std::thread::sleep(Duration::from_millis(5));
+            app.poll();
+        }
+        app.watch_network(false);
+        assert!(!app.strings().get_public_network(), "the note went");
+    }
+
+    #[test]
+    fn streaming_with_every_speaker_off_says_the_first_one_on_plays() {
+        let mut backend = MockBackend::new();
+        backend.set_no_speaker_on(true);
+        let app = app_over(backend);
+        assert!(app.main.get_no_speaker_on());
+        assert!(app.flyout.get_no_speaker_on());
+
+        let app = app_over(MockBackend::new());
+        assert!(!app.main.get_no_speaker_on());
+        assert!(!app.flyout.get_no_speaker_on());
+    }
+
+    // covers: S221
+    #[test]
+    fn a_click_on_the_no_airplay_note_alone_is_outside_every_row() {
+        let app = app_with_the_no_airplay_note(false);
+        app.main.invoke_airplay_delay_edited("2100".into());
+        click(app.main.window(), 420.0, 388.0);
+        assert_eq!(app.snapshot().airplay_delay_ms, Some(2100.0), "it applied");
+        assert!(app.ui.borrow().sync_open.is_empty(), "and opened nothing");
+    }
+
+    // covers: S221
+    #[test]
+    fn a_click_on_the_blank_space_of_open_sync_controls_closes_them_and_applies_the_typing() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_with_the_no_airplay_note(true);
+        let strings = app.strings();
+        let name = app.snapshot().speaker("local:desk").unwrap().name.clone();
+        let field_label = strings.invoke_delay_of(name.into());
+        let step_label = strings.invoke_delay_step_accessibility(100);
+        // Taken from the laid-out controls, as fonts differ between hosts:
+        // right of the steps on the field's line, then in the layout's gap
+        // under the field.
+        let points = || {
+            let bounds = |label: &str| -> Vec<_> {
+                ElementHandle::find_by_accessible_label(&app.main, label)
+                    .map(|e| (e.absolute_position(), e.size()))
+                    .collect()
+            };
+            let steps = bounds(&step_label);
+            let on_its_line = |middle: f32| {
+                steps
+                    .iter()
+                    .find(|(top, size)| top.y < middle && middle < top.y + size.height)
+                    .map(|(top, size)| top.x + size.width)
+            };
+            // The row's delay button has the field's label too; the field is
+            // the one with a +100 step on its line.
+            let (at, size, steps_end) = bounds(&field_label)
+                .into_iter()
+                .find_map(|(at, size)| {
+                    on_its_line(at.y + size.height / 2.0).map(|end| (at, size, end))
+                })
+                .expect("the open controls' field and +100 step");
+            let middle = at.y + size.height / 2.0;
+            let list = ElementHandle::find_by_element_id(&app.main, "MainWindow::scroll")
+                .next()
+                .expect("the speaker list");
+            let x = steps_end + 16.0;
+            assert!(x < list.absolute_position().x + list.size().width);
+            [
+                (x, middle),
+                (at.x + size.width / 2.0, at.y + size.height + 3.0),
+            ]
+        };
+        for (point, ms) in [(0, 400.0), (1, 300.0)] {
+            app.main.invoke_sync_toggled("local:desk".into());
+            draw_frames();
+            app.main
+                .invoke_delay_edited("local:desk".into(), format!("{ms}").into());
+            let (x, y) = points()[point];
+            click(app.main.window(), x, y);
+            assert!(
+                app.ui.borrow().sync_open.is_empty(),
+                "the controls closed at {x}, {y}"
+            );
+            assert_eq!(
+                delay_of(&app, "local:desk"),
+                Some(ms),
+                "closing applied the typing"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_typed_delay_is_enabled_only_while_a_delay_is_typed() {
+        let app = app_over(MockBackend::new());
+        assert!(!app.main.get_delay_typing(), "nothing is typed");
+        app.main.invoke_sync_toggled("local:desk".into());
+        assert!(!app.main.get_delay_typing(), "open controls alone");
+        app.main
+            .invoke_delay_edited("local:desk".into(), "400".into());
+        assert!(app.main.get_delay_typing());
+        app.main.invoke_delay_apply_requested();
+        assert!(!app.main.get_delay_typing(), "applied");
+        app.main.invoke_airplay_delay_edited("2100".into());
+        assert!(app.main.get_delay_typing(), "the AirPlay field counts too");
+        app.main.invoke_airplay_delay_cancelled();
+        assert!(!app.main.get_delay_typing(), "dropped");
+    }
+
+    // covers: S220
+    #[test]
+    fn closing_the_window_without_a_tray_quits_and_drops_every_typed_delay() {
+        let app = app_over(MockBackend::new());
+        app.set_tray_available(false);
+        app.main.invoke_sync_toggled("local:desk".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "400".into());
+        app.main.invoke_airplay_delay_edited("2100".into());
+
+        app.close_main();
+        let ui = app.ui.borrow();
+        assert!(ui.delay_drafts.is_empty() && ui.airplay_delay_draft.draft.is_none());
+        assert!(ui.sync_open.is_empty());
+        let state = app.snapshot();
+        assert_eq!(state.speaker("local:desk").unwrap().delay_ms, Some(120.0));
+        assert_eq!(state.airplay_delay_ms, Some(1750.0));
+    }
+
+    #[test]
+    fn closing_the_window_with_a_tray_applies_every_typed_delay() {
+        let app = app_over(MockBackend::new());
+        app.set_tray_available(true);
+        app.main.invoke_sync_toggled("local:desk".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "400".into());
+        app.main.invoke_airplay_delay_edited("2100".into());
+
+        app.close_main();
+        assert!(app.ui.borrow().sync_open.is_empty());
+        let state = app.snapshot();
+        assert_eq!(state.speaker("local:desk").unwrap().delay_ms, Some(400.0));
+        assert_eq!(state.airplay_delay_ms, Some(2100.0));
+    }
+
+    #[test]
+    fn a_range_line_said_with_a_new_notice_keeps_the_notice() {
+        let mut backend = MockBackend::new();
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        backend.post("start", NoticeMessage::NoSpeaker, "09.41");
+        let app = app_over(backend);
+        let strings = app.strings();
+        let notice =
+            strings.invoke_notice_announcement(notice_title(&strings, &NoticeMessage::NoSpeaker));
+        app.main.invoke_sync_toggled("local:desk".into());
+        // As if the second notice came with the keystroke.
+        *app.notice_announcer.borrow_mut() = NoticeAnnouncer {
+            posted: Some(vec![1]),
+            ..NoticeAnnouncer::default()
+        };
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+30000".into());
+        let range = "The range is \u{2212}2000 to +20000 ms. Enter applies +20000.";
+        assert_eq!(
+            app.main.get_notice_announcement(),
+            format!("{notice}. {range}")
+        );
+    }
+
+    // covers: S220
+    #[test]
+    fn a_delay_field_takes_only_digits_and_marks_a_number_out_of_range() {
+        let app = app_over(MockBackend::new());
+        app.main.invoke_sync_toggled("local:desk".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "1".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "1a".into());
+        assert_eq!(desk_delay_text(&app), "1", "the letter is refused");
+        app.main
+            .invoke_delay_edited("local:desk".into(), "12".into());
+        assert_eq!(desk_delay_text(&app), "12", "the letter was dropped");
+        assert_eq!(desk_row(&app).delay_range_hint, "");
+
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+120910".into());
+        assert_eq!(
+            desk_row(&app).delay_range_hint,
+            "The range is \u{2212}2000 to +20000 ms. Enter applies +20000."
+        );
+        app.main.invoke_delay_committed("local:desk".into());
+        assert_eq!(delay_of(&app, "local:desk"), Some(20000.0));
+        assert_eq!(desk_row(&app).delay_range_hint, "", "nothing is typed now");
+
+        app.main.invoke_airplay_delay_edited("-5".into());
+        assert_eq!(
+            app.main.get_airplay_delay_range_hint(),
+            "The range is 0 to 20000 ms. Enter applies 0."
+        );
+    }
+
+    // covers: S220
+    #[test]
+    fn narrator_hears_a_delay_set_by_a_step_or_enter_and_a_refused_character() {
+        let app = app_over(MockBackend::new());
+        let said = || app.main.get_notice_announcement().to_string();
+        let name = desk_row(&app).name.to_string();
+        app.main.invoke_sync_toggled("local:desk".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "220".into());
+        app.main.invoke_delay_committed("local:desk".into());
+        assert_eq!(said(), format!("{name} delay set to +220 ms"), "Enter");
+        app.main.invoke_delay_stepped("local:desk".into(), -10);
+        assert_eq!(said(), format!("{name} delay set to +210 ms"), "a step");
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+210a".into());
+        assert_eq!(said(), "Only digits, with + or \u{2212} in front");
+
+        app.main.invoke_airplay_delay_stepped(100);
+        let ms = app.snapshot().airplay_delay_ms.expect("an AirPlay delay");
+        assert_eq!(said(), format!("AirPlay Delay set to {ms} ms"));
+    }
+
+    /// Windows reads a live region only as it appears or its words change,
+    /// so Enter setting the same delay again empties it first and the words
+    /// come back a moment later.
+    // covers: S220
+    #[test]
+    fn narrator_hears_the_same_delay_set_again() {
+        let app = app_over(MockBackend::new());
+        hold_clock();
+        let said = || app.main.get_notice_announcement().to_string();
+        app.main.invoke_airplay_delay_stepped(-2000);
+        assert_eq!(said(), "AirPlay Delay set to 0 ms");
+
+        app.main.invoke_airplay_delay_edited("0".into());
+        app.main.invoke_airplay_delay_committed();
+        assert_eq!(said(), "", "emptied, so the same words are heard again");
+        advance_clock(Duration::from_millis(500));
+        slint::platform::update_timers_and_animations();
+        assert_eq!(said(), "AirPlay Delay set to 0 ms", "a moment later");
+    }
+
+    /// As on the Mac, a step at the range's end applies nothing, so Narrator
+    /// hears nothing.
+    // covers: S220
+    #[test]
+    fn narrator_hears_nothing_from_a_delay_step_that_leaves_the_delay_as_it_is() {
+        let app = app_over(MockBackend::new());
+        let said = || app.main.get_notice_announcement().to_string();
+        app.main.invoke_sync_toggled("local:desk".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "+20000".into());
+        app.main.invoke_delay_committed("local:desk".into());
+        app.clear_announcement();
+        app.main.invoke_delay_stepped("local:desk".into(), 10);
+        assert_eq!(delay_of(&app, "local:desk"), Some(20000.0));
+        assert_eq!(said(), "", "a speaker's step past 20 000 ms");
+
+        app.main.invoke_airplay_delay_edited("0".into());
+        app.main.invoke_airplay_delay_committed();
+        app.clear_announcement();
+        app.main.invoke_airplay_delay_stepped(-10);
+        assert_eq!(app.snapshot().airplay_delay_ms, Some(0.0));
+        assert_eq!(said(), "", "an AirPlay delay step below 0 ms");
+    }
+
+    // covers: S221
+    #[test]
+    fn a_click_on_a_control_does_only_what_the_control_does() {
+        let app = app_over(MockBackend::new());
+        draw_frames();
+        type_into_two_rows(&app, "-200");
+        let running = app.snapshot().running;
+        // The streaming switch, at the right end of the header.
+        click(app.main.window(), 920.0, 78.0);
+        assert_ne!(
+            app.snapshot().running,
+            running,
+            "the switch toggled streaming"
+        );
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(120.0),
+            "and applied no typed delay"
+        );
+        let ui = app.ui.borrow();
+        assert_eq!(ui.sync_open.len(), 2, "the sync controls stay open");
+        assert_eq!(ui.delay_drafts.len(), 2, "with their typing");
+    }
+
+    // covers: S221
+    #[test]
+    fn a_click_outside_every_control_applies_each_typed_delay_and_closes_every_sync_control() {
+        use i_slint_backend_testing::ElementHandle;
+        // Between the wordmark and the streaming switch, in the gap under the
+        // left column's Equalizer card (None: found in the layout, since the
+        // fonts set how tall the cards are), then on the blank part of a row in each speaker section, which the
+        // row's own TouchArea takes.
+        for place in [
+            Some((500.0, 60.0)),
+            None,
+            Some((600.0, 162.0)),
+            Some((600.0, 389.0)),
+        ] {
+            let app = app_over(MockBackend::new());
+            draw_frames();
+            let (x, y) = place.unwrap_or_else(|| {
+                let card =
+                    ElementHandle::find_by_element_id(&app.main, "MainWindow::equalizer-card")
+                        .next()
+                        .expect("the Equalizer card");
+                (100.0, card.absolute_position().y + card.size().height + 4.0)
+            });
+            type_into_two_rows(&app, "abc");
+            app.main.invoke_airplay_delay_edited("2100".into());
+            click(app.main.window(), x, y);
+            assert_eq!(delay_of(&app, "local:desk"), Some(400.0), "at {x}, {y}");
+            assert_eq!(app.snapshot().airplay_delay_ms, Some(2100.0));
+            assert_eq!(
+                delay_of(&app, "local:bt"),
+                Some(-250.0),
+                "unreadable text applies nothing"
+            );
+            assert!(
+                !row_of(&app, "local:bt").delay_pending,
+                "and shows the delay in use"
+            );
+            let ui = app.ui.borrow();
+            assert!(ui.sync_open.is_empty(), "every sync control closed");
+            assert!(ui.delay_drafts.is_empty() && ui.airplay_delay_draft.draft.is_none());
+        }
+    }
+
+    // covers: S221
+    #[test]
+    fn escape_drops_every_typed_delay_and_closes_every_sync_control() {
+        let app = app_over(MockBackend::new());
+        type_into_two_rows(&app, "-200");
+        app.main.invoke_airplay_delay_edited("2100".into());
+        app.main.invoke_delay_cancelled("local:bt".into());
+        assert_eq!(delay_of(&app, "local:desk"), Some(120.0));
+        assert_eq!(delay_of(&app, "local:bt"), Some(-250.0));
+        assert_eq!(app.snapshot().airplay_delay_ms, Some(1750.0));
+        assert_eq!(
+            desk_delay_text(&app),
+            "+120",
+            "the field shows the delay in use"
+        );
+        let ui = app.ui.borrow();
+        assert!(ui.sync_open.is_empty(), "every sync control closed");
+        assert!(ui.delay_drafts.is_empty() && ui.airplay_delay_draft.draft.is_none());
+    }
+
+    // covers: S220, S221
+    #[test]
+    fn leaving_the_delay_field_applies_nothing_and_enter_and_escape_hand_the_focus_back() {
+        let app = app_over(MockBackend::new());
+        let window = app.main.window();
+        app.main.show().unwrap();
+        let focus_desk_field = || {
+            app.main.invoke_sync_toggled("local:desk".into());
+            draw_frames();
+            app.main.set_focus_speaker_part(RowPart::Sync);
+            app.main.set_focus_speaker_id("local:desk".into());
+            draw_frames();
+        };
+        let focus = || app.main_focus.borrow().speaker.clone();
+        focus_desk_field();
+        assert_eq!(
+            focus(),
+            Some(("local:desk".into(), RowPart::Sync)),
+            "the field has it"
+        );
+
+        press(window, "4");
+        press(window, "0");
+        tab(window, 1);
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(120.0),
+            "leaving the field applies nothing"
+        );
+        assert!(desk_row(&app).delay_pending, "the draft stays marked");
+
+        press(window, Key::Escape);
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(120.0),
+            "Escape applied nothing"
+        );
+        assert!(!app.ui.borrow().sync_open.contains("local:desk"));
+        assert_eq!(
+            focus(),
+            Some(("local:desk".into(), RowPart::Delay)),
+            "its delay button has it"
+        );
+
+        focus_desk_field();
+        press(window, "9");
+        press(window, "x");
+        assert_eq!(desk_delay_text(&app), "+1209", "a letter can't be typed");
+        press(window, Key::Return);
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(1209.0),
+            "Enter applied it"
+        );
+        assert!(
+            app.ui.borrow().sync_open.contains("local:desk"),
+            "and kept it open"
+        );
+        assert_eq!(
+            focus(),
+            Some(("local:desk".into(), RowPart::Sync)),
+            "the field keeps it"
+        );
+
+        press(window, "1");
+        ctrl_s(window);
+        assert_eq!(
+            delay_of(&app, "local:desk"),
+            Some(12091.0),
+            "Ctrl+S applied it"
+        );
+        assert!(app.ui.borrow().sync_open.contains("local:desk"));
+    }
+
+    // covers: S220
+    #[test]
+    fn quitting_drops_every_typed_delay_and_keeps_the_applied_ones() {
+        let app = app_over(MockBackend::new());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "400".into());
+        app.main.invoke_airplay_delay_edited("2100".into());
+
+        app.save_settings();
+        assert!(app.ui.borrow().delay_drafts.is_empty(), "no draft is left");
+        assert!(app.ui.borrow().airplay_delay_draft.draft.is_none());
+        // A focus loss as the window goes applies nothing either.
+        app.main.invoke_delay_committed("local:desk".into());
+        app.main.invoke_airplay_delay_committed();
+        let state = app.snapshot();
+        assert_eq!(state.speaker("local:desk").unwrap().delay_ms, Some(120.0));
+        assert_eq!(state.airplay_delay_ms, Some(1750.0));
+    }
+
+    // covers: S315
+    #[cfg(windows)]
+    #[test]
+    fn the_end_of_a_windows_session_gives_a_removed_exe_its_bak_back_and_keeps_the_record() {
+        let backend = MockBackend::new();
+        let saved_views = backend.saved_views.clone();
+        let app = app_over(backend);
+        let (updater, exe) = crate::updater::tests::swapped_exe_gone("session-end");
+        *app.updater.borrow_mut() = Some(updater);
+        app.at_session_end();
+        assert!(exe.exists(), "the .bak is audiosync.exe again");
+        let saved: Vec<_> = saved_views
+            .borrow()
+            .iter()
+            .map(|view| view.update_record.clone())
+            .collect();
+        assert_eq!(
+            saved,
+            [Some(ui_model::UpdateRecord {
+                version: "0.9.0".to_owned(),
+                reason: ui_model::UpdateRecordReason::Blocked,
+            })],
+            "the one save already holds the record"
+        );
+    }
+
+    /// An app streaming to an AirPlay and a Google Cast speaker.
+    fn app_with_both_senders_joined() -> (
+        Rc<App>,
+        crate::audio::airplay::tests::FakeAirPlay,
+        crate::audio::cast::tests::FakeCast,
+    ) {
+        use crate::audio::airplay::tests::{Call, FakeAirPlay, OPEN_TXT, device, id_of};
+        use crate::audio::cast::tests::{FakeCast, KITCHEN};
+        let mut audio = crate::audio::mock::MockBackend::empty();
+        audio.connect_output("speakers", "Speakers");
+        let airplay = FakeAirPlay::new();
+        audio.set_airplay(airplay.link(), None);
+        let den = device(1, "Den", OPEN_TXT);
+        airplay.appear(&den);
+        let cast = FakeCast::default();
+        cast.announce(KITCHEN, "Kitchen", audiosync_cast::discovery::DEVICE_PORT);
+        audio.set_cast(cast.link());
+        let mut adapter =
+            crate::adapter::AudioAdapter::new(audio, || "09.41".to_owned(), DebugLog::default());
+        adapter.poll();
+        adapter.set_speaker_enabled(&format!("ap:{}", id_of(&den)), true);
+        adapter.set_speaker_enabled(&format!("cc:{KITCHEN}"), true);
+        adapter.set_running(true);
+        assert!(adapter.snapshot().running);
+        assert_eq!(cast.state().started.len(), 1, "the Cast speaker joined");
+        let calls = airplay.take_calls();
+        assert!(
+            calls.iter().any(|call| matches!(call, Call::Add { .. })),
+            "the AirPlay speaker joined: {calls:?}"
+        );
+        (app_over(adapter), airplay, cast)
+    }
+
+    // covers: S351
+    #[cfg(windows)]
+    #[test]
+    fn the_end_of_a_windows_session_tears_the_airplay_and_cast_senders_down() {
+        let (app, airplay, cast) = app_with_both_senders_joined();
+
+        app.at_session_end();
+        assert!(airplay.links_dropped(), "the AirPlay sender tore down");
+        assert_eq!(cast.state().shutdowns, 1, "the Cast host shut down");
+    }
+
+    // covers: S186 (Quit from the tray or a window)
+    #[test]
+    fn quitting_drops_the_app_so_the_backend_runs_its_shut_down() {
+        let (app, airplay, cast) = app_with_both_senders_joined();
+
+        // What main does once the event loop ends; the shut-down's fades are
+        // checked in the controller's tests.
+        app.at_quit();
+        drop(app);
+        assert!(airplay.links_dropped(), "the AirPlay sender tore down");
+        assert_eq!(cast.state().shutdowns, 1, "the Cast host shut down");
+    }
+
+    // covers: S351
+    #[cfg(windows)]
+    #[test]
+    fn the_end_of_a_windows_session_applies_an_open_rename() {
+        let app = app_over(MockBackend::new());
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "Desk left".into());
+        app.at_session_end();
+        assert_eq!(name_of(&app, "local:desk"), "Desk left");
+        assert!(app.ui.borrow().rename.is_none());
+    }
+
+    // covers: S351
+    #[test]
+    fn an_exit_signal_on_linux_runs_the_quit_steps_of_a_windows_session_end() {
+        let (app, airplay, cast) = app_with_both_senders_joined();
+        let ending = crate::session_ending(&app, &app.log, "exit signal");
+        crate::platform::keep_exit_signal_ending(ending);
+
+        assert_eq!(crate::platform::end_at_exit_signal(15), Some(143));
+        assert!(airplay.links_dropped(), "the AirPlay sender tore down");
+        assert_eq!(cast.state().shutdowns, 1, "the Cast host shut down");
+        assert_eq!(
+            crate::platform::end_at_exit_signal(2),
+            None,
+            "the steps run once"
+        );
+        assert_eq!(cast.state().shutdowns, 1);
+    }
+
+    // covers: S220
+    #[test]
+    fn quitting_with_unreadable_typing_keeps_the_applied_delay() {
+        let app = app_over(MockBackend::new());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "abc".into());
+        app.main.invoke_airplay_delay_edited("".into());
+        app.save_settings();
+        app.main.invoke_delay_committed("local:desk".into());
+        app.main.invoke_airplay_delay_committed();
+        let state = app.snapshot();
+        assert_eq!(state.speaker("local:desk").unwrap().delay_ms, Some(120.0));
+        assert_eq!(state.airplay_delay_ms, Some(1750.0));
+    }
+
+    // covers: S228
+    #[test]
+    fn quitting_applies_an_open_rename() {
+        let app = app_over(MockBackend::new());
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "Desk left".into());
+        app.save_settings();
+        assert_eq!(name_of(&app, "local:desk"), "Desk left");
+        assert!(app.ui.borrow().rename.is_none());
+    }
+
+    // covers: S228
+    #[test]
+    fn quitting_applies_an_open_zone_rename_to_the_zone() {
+        let app = app_over(MockBackend::zones_preview());
+        app.main.invoke_zone_rename_requested("zone:office".into());
+        app.main
+            .invoke_zone_rename_edited("zone:office".into(), "Study".into());
+        app.save_settings();
+        let state = app.snapshot();
+        let office = state.zones.iter().find(|z| z.id == "zone:office");
+        assert_eq!(office.unwrap().name, "Study");
+        assert!(app.ui.borrow().rename.is_none());
+    }
+
+    fn name_of(app: &App, id: &str) -> String {
+        app.snapshot().speaker(id).unwrap().name.clone()
+    }
+
+    #[test]
+    fn the_waiting_notices_name_the_sender_limit_and_what_to_do() {
+        let app = app_over(MockBackend::new());
+        let strings = app.main.global::<Strings>();
+        assert_eq!(
+            strings.invoke_notice_airplay(AirPlayProblem::TooManyAirplay2Speakers, "Loft".into()),
+            format!(
+                "AudioSync plays up to {} AirPlay 2 speakers at once, so Loft waits. \
+                 It starts once one of them stops.",
+                audiosync_airplay::sender::AIRPLAY2_SESSIONS
+            )
+        );
+        // The number comes from the sender, not from the strings file.
+        strings.set_airplay2_sessions(2);
+        assert_eq!(
+            strings.invoke_notice_airplay(AirPlayProblem::TooManyAirplay2Speakers, "Loft".into()),
+            "AudioSync plays up to 2 AirPlay 2 speakers at once, so Loft waits. \
+             It starts once one of them stops."
+        );
+        assert_eq!(
+            strings.invoke_notice_airplay(AirPlayProblem::PtpOtherNetwork, "Loft".into()),
+            "Loft waits while AudioSync plays to AirPlay 2 speakers on another network. \
+             Turn those speakers off and Loft starts."
+        );
+    }
+
+    #[test]
+    fn the_code_notes_carry_the_macs_tooltips() {
+        let app = app_over(MockBackend::new());
+        let strings = app.main.global::<Strings>();
+        let help = |a, every_time, state| {
+            strings
+                .invoke_speaker_availability_help(a, every_time, state)
+                .to_string()
+        };
+        let every_time = "This speaker asks for a code each time it connects, so \
+                          auto-connect leaves it off. AudioSync asks you for the code \
+                          when you turn the speaker on.";
+        assert_eq!(
+            help(Availability::NeedsCode, true, RowState::Off),
+            every_time
+        );
+        assert_eq!(help(Availability::Open, true, RowState::Off), every_time);
+        assert_eq!(
+            help(Availability::NeedsCode, false, RowState::Off),
+            "This speaker asks for a code or password. AudioSync asks you for it when you \
+             turn the speaker on."
+        );
+        // No note, no tooltip.
+        assert_eq!(help(Availability::Open, true, RowState::Playing), "");
+        assert_eq!(help(Availability::Pairing, false, RowState::Off), "");
+    }
+
+    // covers: S360
+    #[test]
+    fn hide_speaker_takes_the_row_out_and_hidden_speakers_brings_it_back() {
+        let app = app_over(MockBackend::new());
+        let strings = app.main.global::<Strings>();
+        let reference = app
+            .snapshot()
+            .speakers
+            .iter()
+            .find(|speaker| speaker.is_reference())
+            .map(|speaker| speaker.id.clone())
+            .expect("the mock has a reference");
+        assert!(!row_of(&app, &reference).hideable, "no Hide Speaker");
+        assert!(row_of(&app, "local:desk").hideable);
+        assert_eq!(app.main.get_hidden_speakers().row_count(), 0);
+        let name = name_of(&app, "local:desk");
+
+        app.main.invoke_speaker_hide_requested("local:desk".into());
+        assert!(app.snapshot().speaker("local:desk").is_none());
+        assert!(
+            !app.models
+                .connected
+                .iter()
+                .any(|row| row.id == "local:desk"),
+            "its row is gone"
+        );
+        assert_eq!(app.main.get_notice_announcement(), format!("{name} hidden"));
+        let entries = app.main.get_hidden_speakers();
+        assert_eq!(entries.row_count(), 1);
+        let entry = entries.row_data(0).unwrap();
+        assert_eq!(entry.id, "local:desk");
+        assert!(entry.present);
+        let usb = strings.invoke_speaker_kind(SpeakerKind::Usb);
+        assert_eq!(entry.kind, usb);
+        assert_eq!(
+            strings.invoke_hidden_speaker_entry(entry.name.clone(), entry.kind.clone(), true),
+            format!("{name} ({usb})")
+        );
+        assert_eq!(
+            strings.invoke_hidden_speaker_entry(entry.name, entry.kind, false),
+            format!("{name} ({usb}, not found)")
+        );
+        assert!(app.main.get_connected_all_hidden());
+        assert!(!app.main.get_this_pc_all_hidden());
+
+        app.main
+            .invoke_speaker_hide_requested(reference.as_str().into());
+        assert!(app.snapshot().speaker(&reference).is_some());
+
+        app.main
+            .invoke_speaker_unhide_requested("local:desk".into());
+        assert!(!app.snapshot().speaker("local:desk").unwrap().enabled);
+        assert!(row_of(&app, "local:desk").hideable);
+        assert_eq!(app.main.get_notice_announcement(), format!("{name} shown"));
+        assert_eq!(app.main.get_hidden_speakers().row_count(), 0);
+        assert!(!app.main.get_connected_all_hidden());
+    }
+
+    // covers: S360
+    #[test]
+    fn a_listed_hidden_speaker_shows_its_kind_now() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let mut state = app.snapshot();
+        let entry = |id: &str, present| ui_model::HiddenSpeaker {
+            id: id.into(),
+            name: id.into(),
+            kind_text: "AirPlay".into(),
+            present,
+        };
+        state.hidden = vec![
+            entry("airplay:found-as-2", Some(ui_model::SpeakerKind::AirPlay2)),
+            entry("airplay:gone", None),
+        ];
+        let kinds: Vec<SharedString> = hidden_items(&strings, &state)
+            .into_iter()
+            .map(|item| item.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                strings.invoke_speaker_kind(SpeakerKind::Airplay2),
+                "AirPlay".into()
+            ]
+        );
+    }
+
+    // covers: S228
+    #[test]
+    fn a_rename_applies_on_enter_and_escape_keeps_the_old_name() {
+        let app = app_over(MockBackend::new());
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        let row = row_of(&app, "local:desk");
+        assert!(row.renaming && row.name_text == "Desk Speaker");
+        assert_eq!(
+            app.main.get_focus_speaker_part(),
+            RowPart::None,
+            "the focus waits for the menu to close"
+        );
+        slint::platform::update_timers_and_animations();
+        assert_eq!(app.main.get_focus_speaker_part(), RowPart::Name);
+
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "  Desk left ".into());
+        assert_eq!(
+            name_of(&app, "local:desk"),
+            "Desk Speaker",
+            "typing applies nothing"
+        );
+        app.main
+            .invoke_speaker_rename_committed("local:desk".into());
+        assert_eq!(name_of(&app, "local:desk"), "Desk left");
+        let row = row_of(&app, "local:desk");
+        assert!(!row.renaming);
+        assert_eq!(
+            row.system_name, "Desk Speaker",
+            "the tooltip keeps the device name"
+        );
+
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "Other".into());
+        app.main
+            .invoke_speaker_rename_cancelled("local:desk".into());
+        assert_eq!(name_of(&app, "local:desk"), "Desk left", "Escape keeps it");
+        assert!(app.ui.borrow().rename.is_none());
+
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "".into());
+        app.main
+            .invoke_speaker_rename_committed("local:desk".into());
+        assert_eq!(
+            name_of(&app, "local:desk"),
+            "Desk Speaker",
+            "empty brings it back"
+        );
+        assert_eq!(row_of(&app, "local:desk").system_name, "");
+    }
+
+    // covers: S228
+    #[test]
+    fn one_rename_at_a_time_and_a_click_outside_applies_it() {
+        let app = app_over(MockBackend::new());
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "Desk".into());
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        assert_eq!(
+            app.ui.borrow().rename,
+            Some(("local:desk".to_owned(), "Desk".to_owned())),
+            "asked again, it keeps the typing"
+        );
+
+        app.main.invoke_speaker_rename_requested("local:bt".into());
+        assert_eq!(
+            name_of(&app, "local:desk"),
+            "Desk",
+            "the open rename applied first"
+        );
+        assert!(!row_of(&app, "local:desk").renaming);
+        assert!(row_of(&app, "local:bt").renaming);
+
+        app.main
+            .invoke_speaker_rename_edited("local:bt".into(), "Headset".into());
+        app.main.invoke_blank_clicked();
+        assert_eq!(name_of(&app, "local:bt"), "Headset");
+        assert!(app.ui.borrow().rename.is_none());
+    }
+
+    // covers: S228
+    #[test]
+    fn a_click_on_the_row_being_renamed_only_applies_the_name() {
+        let app = app_over(MockBackend::new());
+        draw_frames();
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "Desk".into());
+        draw_frames();
+        click(app.main.window(), 600.0, 466.0);
+        assert_eq!(name_of(&app, "local:desk"), "Desk");
+        assert!(app.ui.borrow().rename.is_none());
+        assert!(app.ui.borrow().sync_open.is_empty(), "no delay panel");
+
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main.invoke_sync_toggled("local:desk".into());
+        assert!(app.ui.borrow().rename.is_none());
+        assert!(app.ui.borrow().sync_open.is_empty(), "no delay panel");
+    }
+
+    // covers: S228
+    #[test]
+    fn the_name_field_stops_at_sixty_characters_while_typing() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        draw_frames();
+        for _ in 0..65 {
+            press(app.main.window(), "a");
+        }
+        let sixty = "a".repeat(60);
+        assert_eq!(
+            app.ui.borrow().rename,
+            Some(("local:desk".to_owned(), sixty.clone()))
+        );
+        press(app.main.window(), Key::Return);
+        assert_eq!(name_of(&app, "local:desk"), sixty);
+    }
+
+    // covers: S228
+    #[test]
+    fn a_speaker_gone_mid_rename_closes_its_field() {
+        let app = app_over(MockBackend::new());
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "Desk".into());
+        let mut unplugged = MockBackend::new();
+        unplugged.retain_speakers(|s| s.id != "local:desk");
+        *app.backend.borrow_mut() = Box::new(unplugged);
+        app.refresh();
+        assert!(app.ui.borrow().rename.is_none());
+
+        *app.backend.borrow_mut() = Box::new(MockBackend::new());
+        app.refresh();
+        assert!(
+            !row_of(&app, "local:desk").renaming,
+            "back, its field stays closed"
+        );
+    }
+
+    /// A point on the name of speaker `id`, found by double-clicking around
+    /// where it sits: its place moves with the system font's line heights
+    /// and widths. Leaves no field open and no sync controls shown.
+    fn name_point(app: &App, id: &str) -> (f32, f32) {
+        let window = app.main.window();
+        let mut others = Vec::new();
+        // 12 px apart, so Slint never counts two tries as one double-click.
+        for x in (380..=476).step_by(12) {
+            for y in (400..=716).step_by(12) {
+                let (x, y) = (x as f32, y as f32);
+                click(window, x, y);
+                click(window, x, y);
+                let renamed = app.ui.borrow().rename.as_ref().map(|(id, _)| id.clone());
+                if let Some(renamed) = &renamed {
+                    app.main.invoke_speaker_rename_cancelled(renamed.into());
+                }
+                app.ui.borrow_mut().sync_open.clear();
+                app.refresh();
+                draw_frames();
+                match renamed {
+                    Some(renamed) if renamed == id => return (x, y),
+                    Some(renamed) => others.push((x, y, renamed)),
+                    None => {}
+                }
+            }
+        }
+        panic!("no double-click renames {id}; these rename others: {others:?}");
+    }
+
+    #[test]
+    fn a_double_click_on_a_name_renames_and_a_single_one_is_a_click_on_the_row() {
+        hold_clock();
+        let app = app_over(MockBackend::new());
+        draw_frames();
+        let window = app.main.window();
+        let (x, y) = name_point(&app, "local:desk");
+        click(window, x, y);
+        click(window, x, y);
+        assert!(
+            row_of(&app, "local:desk").renaming,
+            "the double-click renames"
+        );
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert!(
+            app.ui.borrow().sync_open.is_empty(),
+            "and doesn't open the sync controls"
+        );
+
+        app.main
+            .invoke_speaker_rename_cancelled("local:desk".into());
+        draw_frames();
+        click(window, x, y);
+        assert!(
+            app.ui.borrow().sync_open.is_empty(),
+            "one click waits for a second"
+        );
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert!(
+            app.ui.borrow().sync_open.contains("local:desk"),
+            "then works like a click on the row"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_name_waits_the_systems_double_click_time() {
+        hold_clock();
+        let app = app_over(MockBackend::new());
+        let field = app.main.global::<NameField>();
+        assert_eq!(
+            field.get_double_click(),
+            crate::platform::double_click_ms(),
+            "set at startup"
+        );
+        draw_frames();
+        let window = app.main.window();
+        let (x, y) = name_point(&app, "local:desk");
+
+        field.set_double_click(150);
+        click(window, x, y);
+        advance_clock(Duration::from_millis(250));
+        draw_frames();
+        assert!(
+            app.ui.borrow().sync_open.contains("local:desk"),
+            "a short setting answers a single click sooner than 500 ms"
+        );
+
+        app.main.invoke_sync_toggled("local:desk".into());
+        assert!(app.ui.borrow().sync_open.is_empty());
+        // 700 ms is past Slint's fixed 500 ms.
+        field.set_double_click(3000);
+        click(window, x, y);
+        advance_clock(Duration::from_millis(700));
+        draw_frames();
+        click(window, x, y);
+        assert!(
+            row_of(&app, "local:desk").renaming,
+            "a long setting still renames on a slow second click"
+        );
+        assert!(app.ui.borrow().sync_open.is_empty());
+    }
+
+    /// Double-clicks around the main window's right column, 12 px apart,
+    /// until `found` says the double-click did what the test looks for;
+    /// each try is undone, the zones preview put back.
+    fn double_click_point(app: &App, found: impl Fn(&App) -> bool) -> (f32, f32) {
+        let window = app.main.window();
+        for x in (380..=440).step_by(12) {
+            for y in (200..=716).step_by(12) {
+                let (x, y) = (x as f32, y as f32);
+                click(window, x, y);
+                click(window, x, y);
+                let hit = found(app);
+                let _ = app.zone_dialog.hide();
+                app.blank_click();
+                *app.backend.borrow_mut() = Box::new(MockBackend::zones_preview());
+                {
+                    let mut ui = app.ui.borrow_mut();
+                    ui.sync_open.clear();
+                    ui.collapsed.clear();
+                    ui.flyout_collapsed.clear();
+                }
+                app.refresh();
+                draw_frames();
+                if hit {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("no double-click there does it");
+    }
+
+    fn in_zones_row(app: &App, id: &str) -> SpeakerItem {
+        app.models
+            .this_pc_zoned
+            .iter()
+            .chain(app.models.connected_zoned.iter())
+            .find(|s| s.id == id)
+            .expect("the speaker has an In zones row")
+    }
+
+    fn zone_member_row(app: &App, id: &str) -> SpeakerItem {
+        app.models
+            .zones
+            .iter()
+            .flat_map(|zone| zone.members.iter().collect::<Vec<_>>())
+            .find(|s| s.id == id)
+            .expect("the speaker has a row under its zone")
+    }
+
+    fn zone_name(app: &App, id: &str) -> String {
+        let state = app.snapshot();
+        state
+            .zones
+            .iter()
+            .find(|z| z.id == id)
+            .unwrap()
+            .name
+            .clone()
+    }
+
+    // covers: S228, S359
+    #[test]
+    fn a_double_click_on_a_zone_name_renames_it_in_its_header_and_a_single_one_folds_it() {
+        hold_clock();
+        let app = app_over(MockBackend::zones_preview());
+        draw_frames();
+        let window = app.main.window();
+        let (x, y) = double_click_point(&app, |app| {
+            press(app.main.window(), "Q");
+            press(app.main.window(), Key::Return);
+            zone_name(app, "zone:living") == "Q"
+        });
+        click(window, x, y);
+        click(window, x, y);
+        assert!(
+            !app.zone_dialog.window().is_visible(),
+            "the name is edited in the header, not in a dialog"
+        );
+        for key in ["D", "e", "n"] {
+            press(window, key);
+        }
+        press(window, Key::Return);
+        assert_eq!(zone_name(&app, "zone:living"), "Den");
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert!(
+            !app.ui.borrow().collapsed.contains("zone:living"),
+            "the double-click doesn't fold the zone"
+        );
+
+        press(window, Key::F2);
+        press(window, "X");
+        press(window, Key::Escape);
+        assert_eq!(
+            zone_name(&app, "zone:living"),
+            "Den",
+            "F2 on the zone's switch renames in place too; Escape keeps the name"
+        );
+        assert!(!app.zone_dialog.window().is_visible());
+
+        click(window, x, y);
+        assert!(
+            !app.ui.borrow().collapsed.contains("zone:living"),
+            "one click waits for a second"
+        );
+        advance_clock(Duration::from_millis(600));
+        draw_frames();
+        assert!(
+            app.ui.borrow().collapsed.contains("zone:living"),
+            "then folds the zone"
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_an_in_zones_name_renames_the_speaker_in_that_row() {
+        hold_clock();
+        let app = app_over(MockBackend::zones_preview());
+        draw_frames();
+        let window = app.main.window();
+        scroll(window, 650.0, 400.0, -3000.0);
+        // In its In zones row only: a double-click on its row under Upstairs
+        // renames it there.
+        let renames_bedroom = |app: &App| {
+            in_zones_row(app, "airplay:bedroom").renaming
+                && !zone_member_row(app, "airplay:bedroom").renaming
+        };
+        let (x, y) = double_click_point(&app, renames_bedroom);
+        click(window, x, y);
+        click(window, x, y);
+        let row = in_zones_row(&app, "airplay:bedroom");
+        assert!(
+            row.renaming && row.name_text == "Bedroom",
+            "the double-click renames it in its In zones row"
+        );
+        assert!(
+            !zone_member_row(&app, "airplay:bedroom").renaming,
+            "and not under its zone as well"
+        );
+
+        for key in ["N", "o", "o", "k"] {
+            press(window, key);
+        }
+        press(window, Key::Return);
+        assert_eq!(name_of(&app, "airplay:bedroom"), "Nook");
+        assert!(!in_zones_row(&app, "airplay:bedroom").renaming);
+
+        press(window, Key::F2);
+        assert!(
+            in_zones_row(&app, "airplay:bedroom").renaming,
+            "the focus went back to the row's switch, where F2 renames"
+        );
+        press(window, Key::Escape);
+        assert!(!in_zones_row(&app, "airplay:bedroom").renaming);
+        assert_eq!(name_of(&app, "airplay:bedroom"), "Nook");
+
+        app.main
+            .invoke_speaker_rename_requested("airplay:bedroom".into());
+        assert!(zone_member_row(&app, "airplay:bedroom").renaming);
+        assert!(
+            !in_zones_row(&app, "airplay:bedroom").renaming,
+            "a rename under the zone stays there"
+        );
+    }
+
+    /// The first element `id` names in the main window.
+    fn element(app: &App, id: &str) -> Option<i_slint_backend_testing::ElementHandle> {
+        i_slint_backend_testing::ElementHandle::find_by_element_id(&app.main, id).next()
+    }
+
+    /// Rests the pointer on the middle of the element `label` names and
+    /// returns where, and the tip `tip` names once it had time to show.
+    fn rest_on(
+        app: &App,
+        label: &str,
+        tip: &str,
+    ) -> (
+        slint::LogicalPosition,
+        Option<i_slint_backend_testing::ElementHandle>,
+    ) {
+        let label = element(app, label).unwrap_or_else(|| panic!("{label}"));
+        let (at, size) = (label.absolute_position(), label.size());
+        let position =
+            slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
+        app.main
+            .window()
+            .dispatch_event(WindowEvent::PointerMoved { position });
+        advance_clock(Duration::from_secs(2));
+        slint::platform::update_timers_and_animations();
+        (position, element(app, tip))
+    }
+
+    /// Checks that the tip on `label` holds more than `label` shows. The
+    /// tip's Text has no accessible label to compare (Narrator reads the
+    /// row). Its font is no larger than the label's yet it needs more width
+    /// than the label has: the label is cut and the tip is not.
+    fn shows_in_full(app: &App, label: &str, tip: &str) {
+        let width = element(app, label).map_or(0.0, |label| label.size().width);
+        let (_, shown) = rest_on(app, label, tip);
+        let shown = shown
+            .and_then(|tip| {
+                tip.query_descendants()
+                    .match_id("LabelTip::tip-text")
+                    .find_first()
+            })
+            .unwrap_or_else(|| panic!("a tooltip on {label}"));
+        assert!(
+            shown.size().width > width,
+            "{label}: tip {} wide, label {width}",
+            shown.size().width
+        );
+    }
+
+    /// The main window over `backend` at its narrowest, 776 px, where the
+    /// speaker list takes 524 px. draw_frames sets 1000 px again.
+    fn narrow_app(backend: MockBackend) -> Rc<App> {
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        draw_frames();
+        hold_clock();
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(776.0, 680.0));
+        slint::platform::update_timers_and_animations();
+        app
+    }
+
+    /// A long-named copy of the mock's Kitchen speaker.
+    fn long_named_speaker(backend: &MockBackend, id: &str) -> ui_model::Speaker {
+        let mut speaker = backend
+            .snapshot()
+            .speaker("airplay:kitchen")
+            .unwrap()
+            .clone();
+        speaker.id = id.into();
+        speaker.name = "The long living room television by the window and the bookshelf".into();
+        speaker
+    }
+
+    /// A zone name or zone count line cut to "…" in the half-width speaker
+    /// list shows in full in a tooltip while the pointer rests on it, and a
+    /// press hides the tip until the pointer leaves.
+    // covers: S420
+    #[test]
+    fn a_long_zone_name_shows_in_full_in_its_tooltip() {
+        let mut backend = MockBackend::new();
+        backend.set_running(true);
+        let mut tv = long_named_speaker(&backend, "airplay:tv");
+        tv.enabled = true;
+        tv.waiting = Some(ui_model::Waiting::ForPin);
+        backend.add_speaker(tv);
+        let name = "The long living room zone by the window and the bookshelf";
+        backend.add_zone("zone:long", name, &["airplay:tv"]);
+        let app = narrow_app(backend);
+        shows_in_full(&app, "ZoneHeader::name-text", "ZoneHeader::name-tip");
+        shows_in_full(&app, "ZoneHeader::count-text", "ZoneHeader::count-tip");
+
+        let window = app.main.window();
+        let (position, _) = rest_on(&app, "ZoneHeader::count-text", "ZoneHeader::count-tip");
+        let button = PointerEventButton::Left;
+        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        let nudged = slint::LogicalPosition::new(position.x + 1.0, position.y);
+        window.dispatch_event(WindowEvent::PointerMoved { position: nudged });
+        advance_clock(Duration::from_secs(2));
+        slint::platform::update_timers_and_animations();
+        assert!(
+            element(&app, "ZoneHeader::count-tip").is_none(),
+            "a press hides the count line's tip"
+        );
+    }
+
+    /// A speaker name cut to "…" in its In zones row shows in full in a
+    /// tooltip.
+    // covers: S420
+    #[test]
+    fn a_long_in_zones_name_shows_in_full_in_its_tooltip() {
+        let mut backend = MockBackend::new();
+        let den = long_named_speaker(&backend, "airplay:den");
+        backend.add_speaker(den);
+        // A short zone name, so the "In Den" link leaves the name room.
+        backend.add_zone("zone:den", "Den", &["airplay:den"]);
+        let app = narrow_app(backend);
+        // The In zones rows sit at the end of the list.
+        let list = element(&app, "MainWindow::scroll").expect("the speaker list");
+        let (at, size) = (list.absolute_position(), list.size());
+        scroll(
+            app.main.window(),
+            at.x + size.width / 2.0,
+            at.y + size.height / 2.0,
+            -3000.0,
+        );
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(776.0, 680.0));
+        shows_in_full(&app, "ZoneMemberRow::name-label", "ZoneMemberRow::tip-text");
+    }
+
+    /// A zone count line that fits shows no tooltip: only one cut to "…"
+    /// does. A zone name keeps its tip for the rename hint, and an In zones
+    /// name keeps its tip, the only place with its device name.
+    // covers: S420
+    #[test]
+    fn a_zone_count_that_fits_shows_no_tooltip_but_a_zone_name_has_its_rename_hint() {
+        let mut backend = MockBackend::new();
+        let mut den = long_named_speaker(&backend, "airplay:den");
+        den.name = "Den".into();
+        backend.add_speaker(den);
+        backend.add_zone("zone:den", "Den", &["airplay:den"]);
+        let app = narrow_app(backend);
+        let (_, count_tip) = rest_on(&app, "ZoneHeader::count-text", "ZoneHeader::count-tip");
+        assert!(count_tip.is_none(), "the count line");
+        let (_, name_tip) = rest_on(&app, "ZoneHeader::name-text", "ZoneHeader::name-tip");
+        assert!(name_tip.is_some(), "the zone name");
+        scroll_to_end(&app);
+        let (_, tip) = rest_on(&app, "ZoneMemberRow::name-label", "ZoneMemberRow::tip-text");
+        assert!(tip.is_some(), "the In zones name");
+    }
+
+    /// Scrolls the narrow app's speaker list to its end, where the rows
+    /// below the first screen are built.
+    fn scroll_to_end(app: &App) {
+        let list = element(app, "MainWindow::scroll").expect("the speaker list");
+        let (at, size) = (list.absolute_position(), list.size());
+        scroll(
+            app.main.window(),
+            at.x + size.width / 2.0,
+            at.y + size.height / 2.0,
+            -3000.0,
+        );
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(776.0, 680.0));
+        slint::platform::update_timers_and_animations();
+    }
+
+    /// The narrow app scrolled to a stereo pair of `member` and Right, the
+    /// last speaker listed.
+    fn pair_app(member: &str) -> Rc<App> {
+        use crate::audio::backend::AirPlayGroup;
+        let mut backend = MockBackend::new();
+        let mut speaker = long_named_speaker(&backend, "airplay:pair");
+        speaker.name = "Pair".into();
+        speaker.group = Some(AirPlayGroup {
+            kind: AirPlayGroupKind::StereoPair,
+            members: vec![member.to_owned(), "Right".to_owned()],
+            member_ids: Vec::new(),
+            missing: Vec::new(),
+            missing_ids: Vec::new(),
+            incomplete: false,
+        });
+        backend.add_speaker(speaker);
+        let app = narrow_app(backend);
+        scroll_to_end(&app);
+        app
+    }
+
+    // covers: S420
+    #[test]
+    fn a_cut_pair_line_shows_in_full_in_its_tooltip() {
+        let app = pair_app("The long living room speaker by the window and the bookshelf");
+        shows_in_full(&app, "SpeakerRow::group-line", "SpeakerRow::group-tip");
+    }
+
+    // covers: S420
+    #[test]
+    fn a_pair_line_that_fits_shows_no_tooltip() {
+        let app = pair_app("Left");
+        let (_, tip) = rest_on(&app, "SpeakerRow::group-line", "SpeakerRow::group-tip");
+        assert!(tip.is_none());
+    }
+
+    /// With a long zone name, the "in <zone>" link in an In zones row gives
+    /// way before the speaker's name does: the name keeps 80 px and the link
+    /// ends before the options button.
+    // covers: S420
+    #[test]
+    fn a_long_zone_name_leaves_the_in_zones_name_room() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        let tv = long_named_speaker(&backend, "airplay:tv");
+        let name = tv.name.clone();
+        backend.add_speaker(tv);
+        let zone = "The long living room zone by the window and the bookshelf";
+        backend.add_zone("zone:long", zone, &["airplay:tv"]);
+        let app = narrow_app(backend);
+        let list = element(&app, "MainWindow::scroll").expect("the speaker list");
+        let (at, size) = (list.absolute_position(), list.size());
+        scroll(
+            app.main.window(),
+            at.x + size.width / 2.0,
+            at.y + size.height / 2.0,
+            -3000.0,
+        );
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(776.0, 680.0));
+        let strings = app.main.global::<Strings>();
+        let by_label = |label: SharedString| {
+            ElementHandle::find_by_accessible_label(&app.main, &label)
+                .next()
+                .unwrap_or_else(|| panic!("{label}"))
+        };
+        let badge = by_label(strings.invoke_in_zone_label(name.into(), zone.into()));
+        let row_y = badge.absolute_position().y + badge.size().height / 2.0;
+        let in_row = |id: &str| {
+            ElementHandle::find_by_element_id(&app.main, id)
+                .find(|e| {
+                    let y = e.absolute_position().y;
+                    y <= row_y && row_y <= y + e.size().height
+                })
+                .unwrap_or_else(|| panic!("{id} in the TV's In zones row"))
+        };
+        let width = in_row("ZoneMemberRow::name-label").size().width;
+        assert!(width >= 80.0, "the name is {width} px wide");
+        let link = by_label(strings.invoke_go_to_zone_label(zone.into()));
+        let options = in_row("ZoneMemberRow::options");
+        assert!(
+            link.absolute_position().x + link.size().width <= options.absolute_position().x,
+            "the link runs into the options button"
+        );
+    }
+
+    // covers: S228
+    #[test]
+    fn a_renamed_row_shows_its_device_name_in_the_name_tooltip() {
+        let app = app_over(MockBackend::new());
+        let strings = app.main.global::<Strings>();
+        assert_eq!(
+            row_of(&app, "local:desk").system_name,
+            "",
+            "no caption before a rename"
+        );
+
+        for (typed, caption) in [("Desk left", true), ("Desk Speaker", false)] {
+            app.main
+                .invoke_speaker_rename_requested("local:desk".into());
+            app.main
+                .invoke_speaker_rename_edited("local:desk".into(), typed.into());
+            app.main
+                .invoke_speaker_rename_committed("local:desk".into());
+            let row = row_of(&app, "local:desk");
+            assert_eq!(!row.system_name.is_empty(), caption, "after {typed:?}");
+        }
+
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "Desk left".into());
+        app.main
+            .invoke_speaker_rename_committed("local:desk".into());
+        let row = row_of(&app, "local:desk");
+        assert_eq!(
+            strings.invoke_speaker_name_tooltip(row.name.clone(), row.system_name.clone()),
+            "Desk left\nDevice name: Desk Speaker. Double-click to rename."
+        );
+        assert_eq!(
+            strings.invoke_speaker_tooltip(row.name.clone(), row.system_name.clone()),
+            "Desk left\nDevice name: Desk Speaker",
+            "the tray flyout's tooltip names it too"
+        );
+        let flyout_row = app
+            .flyout
+            .get_this_pc()
+            .iter()
+            .chain(app.flyout.get_speakers().iter())
+            .find(|s| s.id == "local:desk")
+            .unwrap();
+        assert_eq!(
+            flyout_row.system_name, "Desk Speaker",
+            "the tray flyout shows it too"
+        );
+        let label = strings.invoke_speaker_label(
+            row.name.clone(),
+            row.kind,
+            row.show_kind,
+            row.system_name,
+        );
+        assert!(
+            label.starts_with("Desk left,"),
+            "Narrator reads the new name first: {label}"
+        );
+    }
+
+    #[test]
+    fn rename_in_the_menu_opens_the_name_field_with_the_focus() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        draw_frames();
+        assert_eq!(
+            app.main_focus.borrow().speaker,
+            Some(("local:desk".into(), RowPart::Name)),
+            "the field took the focus"
+        );
+        press(app.main.window(), Key::Escape);
+        assert!(app.ui.borrow().rename.is_none(), "Escape closed it");
+        draw_frames();
+        assert_eq!(
+            app.main_focus.borrow().speaker,
+            Some(("local:desk".into(), RowPart::Toggle)),
+            "the focus went to the row's toggle"
+        );
+    }
+
+    // covers: S228
+    #[test]
+    fn leaving_the_name_field_for_another_control_applies_the_name() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        app.main
+            .invoke_speaker_rename_requested("local:desk".into());
+        draw_frames();
+        app.main
+            .invoke_speaker_rename_edited("local:desk".into(), "Desk".into());
+
+        let window = app.main.window();
+        window.dispatch_event(WindowEvent::WindowActiveChanged(false));
+        draw_frames();
+        window.dispatch_event(WindowEvent::WindowActiveChanged(true));
+        draw_frames();
+        assert!(
+            app.ui.borrow().rename.is_some(),
+            "another window taking the focus applies nothing"
+        );
+
+        press(window, Key::Tab);
+        draw_frames();
+        assert!(app.ui.borrow().rename.is_none(), "Tab left the field");
+        assert_eq!(name_of(&app, "local:desk"), "Desk");
+    }
+
+    // covers: S228
+    #[test]
+    fn leaving_the_name_field_for_the_master_volume_or_airplay_delay_applies_the_name() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        let window = app.main.window();
+        let rename = |name: &str| {
+            app.main
+                .invoke_speaker_rename_requested("local:desk".into());
+            draw_frames();
+            app.main
+                .invoke_speaker_rename_edited("local:desk".into(), name.into());
+        };
+
+        let click_on = |id: &str| {
+            let found = element(&app, id).unwrap_or_else(|| panic!("{id}"));
+            let (at, size) = (found.absolute_position(), found.size());
+            click(window, at.x + size.width / 2.0, at.y + size.height / 2.0);
+        };
+
+        rename("Desk");
+        click_on("MasterVolume::slider");
+        assert_eq!(
+            app.main_focus.borrow().control,
+            Some(MainControl::MasterVolume)
+        );
+        assert!(
+            app.ui.borrow().rename.is_none(),
+            "the volume took the focus"
+        );
+        assert_eq!(name_of(&app, "local:desk"), "Desk");
+
+        rename("Desk left");
+        scroll(window, 640.0, 600.0, -2000.0);
+        click_on("AirPlayDelayControls::field");
+        assert_eq!(
+            app.main_focus.borrow().control,
+            Some(MainControl::AirplayDelay)
+        );
+        assert!(app.ui.borrow().rename.is_none(), "the delay field took it");
+        assert_eq!(name_of(&app, "local:desk"), "Desk left");
+    }
+
+    #[test]
+    fn an_idle_cast_speakers_menu_button_works_for_rename() {
+        let mut backend = MockBackend::new();
+        let mut speaker = backend.snapshot().speaker("local:desk").unwrap().clone();
+        speaker.id = "cc:attic".into();
+        speaker.name = "Attic".into();
+        speaker.system_name = "Attic".into();
+        speaker.kind = ui_model::SpeakerKind::Cast;
+        speaker.enabled = false;
+        speaker.cast = Some(ui_model::CastRow {
+            state: ui_model::CastState::Idle,
+            muted: false,
+            volume_fixed: false,
+            volume_step: 1.0,
+            group: None,
+            added_by_address: false,
+            offline: false,
+            taken_over: false,
+        });
+        backend.add_speaker(speaker);
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        draw_frames();
+        app.main.set_focus_speaker_part(RowPart::Options);
+        app.main.set_focus_speaker_id("cc:attic".into());
+        draw_frames();
+        assert_eq!(
+            app.main_focus.borrow().speaker,
+            Some(("cc:attic".into(), RowPart::Options)),
+            "the … button takes the focus: its menu has Rename"
+        );
+    }
+
+    #[test]
+    fn a_removed_speakers_typed_delay_is_dropped() {
+        let app = app_over(MockBackend::new());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "99".into());
+        assert_eq!(desk_delay_text(&app), "99");
+
+        // The desk is unplugged: its draft goes with it.
+        let mut unplugged = MockBackend::new();
+        unplugged.retain_speakers(|s| s.id != "local:desk");
+        *app.backend.borrow_mut() = Box::new(unplugged);
+        app.refresh();
+        assert!(
+            !app.ui.borrow().delay_drafts.contains_key("local:desk"),
+            "the removed speaker's draft is gone"
+        );
+
+        // Plugged back in, it shows its saved delay.
+        *app.backend.borrow_mut() = Box::new(MockBackend::new());
+        app.refresh();
+        assert_eq!(desk_delay_text(&app), "+120");
+    }
+
+    // covers: S220
+    #[test]
+    fn escape_in_the_airplay_delay_field_leaves_the_applied_delay() {
+        let app = app_over(MockBackend::new());
+        let applied = app.snapshot().airplay_delay_ms;
+        assert_eq!(applied, Some(1750.0), "the example sender has a delay");
+        let shown = || app.main.get_airplay_delay_text().to_string();
+        assert_eq!(shown(), format_ms(1750.0));
+
+        assert!(!app.main.get_airplay_delay_pending());
+        app.main.invoke_airplay_delay_edited("9999".into());
+        assert_eq!(shown(), "9999", "the field keeps what is typed");
+        assert!(app.main.get_airplay_delay_pending(), "typing is a draft");
+        assert_eq!(
+            app.snapshot().airplay_delay_ms,
+            applied,
+            "typing applies nothing"
+        );
+
+        app.main.invoke_airplay_delay_cancelled();
+        assert_eq!(shown(), format_ms(1750.0), "Escape shows the applied value");
+        assert!(
+            !app.main.get_airplay_delay_pending(),
+            "Escape clears the draft"
+        );
+
+        app.main.invoke_airplay_delay_committed();
+        assert_eq!(
+            app.snapshot().airplay_delay_ms,
+            applied,
+            "leaving the field after Escape applies nothing"
+        );
+        assert_eq!(shown(), format_ms(1750.0));
+    }
+
+    // covers: S220
+    #[test]
+    fn an_airplay_delay_over_its_range_applies_clamped_once() {
+        let backend = MockBackend::new();
+        let applied = backend.airplay_delays.clone();
+        let app = app_over(backend);
+        let shown = || app.main.get_airplay_delay_text().to_string();
+        app.main.invoke_airplay_delay_edited("25000".into());
+        assert_eq!(app.snapshot().airplay_delay_ms, Some(1750.0));
+
+        app.main.invoke_airplay_delay_committed();
+        assert_eq!(
+            app.snapshot().airplay_delay_ms,
+            Some(ui_model::MAX_DELAY_MS)
+        );
+        assert_eq!(
+            shown(),
+            format_ms(ui_model::MAX_DELAY_MS),
+            "the field shows it clamped"
+        );
+        assert!(!app.main.get_airplay_delay_pending());
+        assert!(
+            app.ui.borrow().airplay_delay_draft.draft.is_none(),
+            "a focus loss after it has nothing to apply"
+        );
+
+        app.main.invoke_airplay_delay_committed();
+        assert_eq!(
+            applied.borrow().len(),
+            1,
+            "a focus loss after Return applies nothing"
+        );
+    }
+
+    // covers: S220
+    #[test]
+    fn an_airplay_delay_out_of_range_applies_its_end_and_a_step_past_it_nothing() {
+        let backend = MockBackend::new();
+        let applied = backend.airplay_delays.clone();
+        let app = app_over(backend);
+        app.main.invoke_airplay_delay_edited("25000".into());
+        app.main.invoke_airplay_delay_committed();
+        assert_eq!(applied.borrow().last(), Some(&ui_model::MAX_DELAY_MS));
+        let said = || app.main.get_notice_announcement().to_string();
+        app.clear_announcement();
+        app.main.invoke_airplay_delay_stepped(100);
+        assert_eq!(applied.borrow().len(), 1, "a step past 20 000 ms");
+        assert_eq!(said(), "", "and nothing is said");
+
+        app.main.invoke_airplay_delay_edited("-500".into());
+        app.main.invoke_airplay_delay_committed();
+        assert_eq!(applied.borrow().last(), Some(&0.0), "typed -500 applies 0");
+        app.clear_announcement();
+        app.main.invoke_airplay_delay_stepped(-100);
+        assert_eq!(applied.borrow().len(), 2, "a step below 0 ms");
+        assert_eq!(said(), "", "and nothing is said");
+        assert_eq!(app.snapshot().airplay_delay_ms, Some(0.0));
+    }
+
+    #[test]
+    fn the_main_window_fits_a_small_laptop_screen() {
+        // A 1366 x 768 screen at 150 %, with the taskbar, leaves about
+        // 911 x 464 logical pixels inside the window's frame.
+        let (min_width, min_height) = crate::settings::MIN_WINDOW;
+        assert!(
+            min_width <= 911.0 && min_height <= 464.0,
+            "{min_width} x {min_height}"
+        );
+        let main = include_str!("../ui/main.slint");
+        // By line, so a checkout with CRLF line ends (Windows CI) reads the same.
+        let has_line = |wanted: String| main.lines().any(|line| line.trim_end() == wanted);
+        assert!(has_line(format!("    min-width: {min_width}px;")));
+        assert!(has_line(format!("    min-height: {min_height}px;")));
+        // The left column scrolls when it is taller than the window, so
+        // its cards never push the window past that height.
+        assert!(main.contains("left-column := ScrollView {"));
+    }
+
+    #[test]
+    fn a_saved_main_window_is_fitted_to_the_monitor_it_opens_on() {
+        let laptop = crate::placement::Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1366.0,
+            height: 728.0,
+        };
+        let saved = WindowFrame {
+            x: 300,
+            y: 200,
+            width: 2500.0,
+            height: 1400.0,
+            maximized: true,
+        };
+        let fitted = fitted_main_frame(saved, laptop, 1.0, true);
+        assert_eq!(
+            fitted,
+            WindowFrame {
+                x: 0,
+                y: 0,
+                width: 1366.0 - MAIN_WINDOW_CHROME.0,
+                height: 728.0 - MAIN_WINDOW_CHROME.1,
+                maximized: true,
+            }
+        );
+        // At 150 %, the work area holds fewer logical pixels.
+        let full_hd = crate::placement::Bounds {
+            width: 1920.0,
+            height: 1040.0,
+            ..laptop
+        };
+        let fitted = fitted_main_frame(saved, full_hd, 1.5, true);
+        assert_eq!(
+            (fitted.width, fitted.height),
+            (
+                1280.0 - MAIN_WINDOW_CHROME.0,
+                (1040.0 / 1.5 - MAIN_WINDOW_CHROME.1).round()
+            )
+        );
+        // Never below the window's smallest size, never above the saved one.
+        let tiny = crate::placement::Bounds {
+            width: 700.0,
+            height: 500.0,
+            ..laptop
+        };
+        let fitted = fitted_main_frame(saved, tiny, 1.0, true);
+        assert_eq!((fitted.width, fitted.height), crate::settings::MIN_WINDOW);
+        // A window that fits is left exactly as saved.
+        let small = WindowFrame {
+            x: 120,
+            y: 40,
+            width: 1000.5,
+            height: 600.0,
+            maximized: false,
+        };
+        assert_eq!(fitted_main_frame(small, laptop, 1.0, true), small);
+    }
+
+    #[test]
+    fn a_main_window_on_a_monitor_that_is_gone_shows_on_the_primary_one() {
+        let primary = crate::placement::Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1366.0,
+            height: 728.0,
+        };
+        let frame = WindowFrame {
+            x: 2200,
+            y: 100,
+            width: 800.0,
+            height: 500.0,
+            maximized: false,
+        };
+        let centered = fitted_main_frame(frame, primary, 1.0, false);
+        assert_eq!(
+            place_to_show(frame, false, false, false, Some((primary, 1.0))),
+            Some(centered)
+        );
+        assert_eq!(
+            place_to_show(frame, true, false, false, Some((primary, 1.0))),
+            None
+        );
+        assert_eq!(place_to_show(frame, false, false, false, None), None);
+        // Windows parks a minimized window at (-32000, -32000), on no monitor.
+        let minimized = WindowFrame {
+            x: -32000,
+            y: -32000,
+            ..frame
+        };
+        assert_eq!(
+            place_to_show(minimized, false, true, false, Some((primary, 1.0))),
+            None
+        );
+        // A window the user dragged partly off the screen stays where it is.
+        let dragged = WindowFrame { x: -250, ..frame };
+        assert_eq!(
+            place_to_show(dragged, false, false, true, Some((primary, 1.0))),
+            None
+        );
+    }
+
+    /// A speaker that asks for a code every time keeps no pairing, so its PIN
+    /// prompt doesn't say it connects without a PIN afterwards.
+    #[test]
+    fn the_pin_prompt_of_an_every_time_speaker_promises_no_lasting_pairing() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        backend.set_code_every_time("airplay:living");
+        let app = app_over(backend);
+        app.main.invoke_speaker_toggled("airplay:living".into());
+        draw_frames();
+        let text = "Living Room shows a 4-digit code on its screen. Enter it to pair. Cancel \
+                    turns the speaker off; turn it on again to retry.";
+        assert!(
+            ElementHandle::find_by_accessible_label(&app.pin_dialog, text)
+                .next()
+                .is_some(),
+            "the prompt says {text}"
+        );
+    }
+
+    /// Windows makes the PIN dialog at the height its layout has before the
+    /// message wraps, and keeps it there when the message grows (after a
+    /// wrong PIN): the buttons were cut off. The dialog now grows to fit.
+    #[test]
+    fn the_pin_dialog_grows_to_show_its_buttons_after_a_wrong_pin() {
+        let app = app_over(MockBackend::new());
+        app.preview_pin(false);
+        let dialog = &app.pin_dialog;
+        // About the client height Windows gave it: too short for the
+        // wrong-PIN message at this width.
+        dialog
+            .window()
+            .set_size(slint::LogicalSize::new(380.0, 150.0));
+        dialog.set_wrong_pin(true);
+        app.fit_pin_dialog();
+        let size = dialog
+            .window()
+            .size()
+            .to_logical(dialog.window().scale_factor());
+        assert_eq!(size.width, 380.0);
+        let fit = dialog.get_fit_height();
+        assert!(
+            size.height >= fit,
+            "window {} high, layout needs {fit}",
+            size.height
+        );
+        let bottom = dialog.get_buttons_bottom();
+        assert!(
+            bottom > 0.0 && bottom <= size.height,
+            "buttons end at {bottom}, window {} high",
+            size.height
+        );
+    }
+
+    fn assert_window_fits(window: &slint::Window, fit: f32, what: &str) {
+        let height = window.size().to_logical(window.scale_factor()).height;
+        assert!(
+            height >= fit,
+            "{what}: window {height} high, layout needs {fit}"
+        );
+    }
+
+    /// X11 shows a dialog at its layout's height before the message wraps,
+    /// and no window manager grows it: the name field and the buttons of
+    /// Save Preset were cut off.
+    #[test]
+    fn the_zone_dialog_grows_to_show_its_field_and_buttons() {
+        let app = app_over(MockBackend::new());
+        let dialog = &app.zone_dialog;
+        // The size X11 gave it.
+        dialog
+            .window()
+            .set_size(slint::LogicalSize::new(380.0, 153.0));
+        app.ask_save_preset();
+        assert!(dialog.window().is_visible());
+        assert_window_fits(dialog.window(), dialog.get_fit_height(), "Save Preset");
+    }
+
+    /// The same for Add by Address, at opening and once a turned-down
+    /// address puts its reason above the field.
+    #[test]
+    fn the_add_by_address_dialog_grows_to_show_its_buttons() {
+        let app = app_over(MockBackend::new());
+        let dialog = &app.cast_address_dialog;
+        let window = dialog.window();
+        window.set_size(slint::LogicalSize::new(420.0, 153.0));
+        app.ask_cast_address();
+        let opened = dialog.get_fit_height();
+        assert_window_fits(window, opened, "opened");
+        type_text(window, "bad address:99999");
+        press(window, Key::Return);
+        assert!(!dialog.get_error().is_empty(), "turned down");
+        // The event loop's turn after the key.
+        slint::platform::update_timers_and_animations();
+        let fit = dialog.get_fit_height();
+        assert!(fit > opened, "the reason's row adds {fit} - {opened}");
+        assert_window_fits(window, fit, "turned down");
+    }
+
+    #[test]
+    fn a_usb_device_with_a_form_still_reads_as_usb() {
+        let app = app_over(MockBackend::new());
+        for kind in [
+            ui_model::SpeakerKind::Usb,
+            ui_model::SpeakerKind::UsbHeadphones,
+            ui_model::SpeakerKind::UsbSpeakers,
+        ] {
+            let label = app.strings().invoke_speaker_kind(speaker_kind(kind));
+            assert_eq!(label.as_str(), "USB", "{kind:?}");
+        }
+    }
+
+    // covers: S313
+    #[test]
+    fn an_airplay_row_names_which_airplay() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        for (kind, label) in [
+            (ui_model::SpeakerKind::AirPlay, "AirPlay"),
+            (ui_model::SpeakerKind::AirPlay2, "AirPlay 2"),
+        ] {
+            assert_eq!(
+                strings.invoke_speaker_kind(speaker_kind(kind)).as_str(),
+                label
+            );
+        }
+    }
+
+    // covers: S308 (its words; Tests/updatertexttest.sh checks how the .slint files use them)
+    #[test]
+    fn the_updater_texts() {
+        use ui_model::UpdaterNotice as N;
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let notices = [
+            N::Available {
+                new: "0.9.0".to_owned(),
+                running: "0.8.0".to_owned(),
+                last: None,
+            },
+            N::Available {
+                new: "0.9.0".to_owned(),
+                running: "0.8.0".to_owned(),
+                last: Some(ui_model::UpdateRecordReason::Blocked),
+            },
+            N::Available {
+                new: "0.9.0".to_owned(),
+                running: "0.8.0".to_owned(),
+                last: Some(ui_model::UpdateRecordReason::FailedStart),
+            },
+            N::Checking,
+            N::Downloading { percent: Some(42) },
+            N::Downloading { percent: None },
+            N::Installed {
+                version: "0.9.0".to_owned(),
+            },
+            N::UpToDate {
+                running: "0.8.0".to_owned(),
+            },
+            N::Unreachable,
+            N::Unreadable,
+            N::DownloadFailed,
+            N::BadSignature,
+            N::BrokenDownload,
+            N::DiskFull,
+            N::ReadOnly,
+            N::InUse,
+            N::Failed,
+            N::RestoreFailed {
+                renames: vec![("audiosync.exe.bak".to_owned(), "audiosync.exe".to_owned())],
+            },
+            N::RelaunchFailed,
+            N::Blocked,
+            N::NotAppImage,
+        ];
+        let mut texts = HashSet::new();
+        for notice in notices {
+            let message = NoticeMessage::Update(notice.clone());
+            let text = notice_text(&strings, &message);
+            assert!(
+                !text.is_empty() && !text.contains("{}"),
+                "{notice:?}: {text}"
+            );
+            assert!(
+                texts.insert(text.to_string()),
+                "{notice:?} has its own text"
+            );
+            assert_eq!(notice_title(&strings, &message).as_str(), "update");
+            let item = notice_item(
+                &strings,
+                &ui_model::Notice {
+                    id: UPDATER_NOTICE_ID,
+                    subject: "update".to_owned(),
+                    message,
+                    time: String::new(),
+                    post: 0,
+                },
+            );
+            assert_eq!(item.update_buttons.row_count(), notice.buttons().len());
+            for button in item.update_buttons.iter() {
+                assert!(!strings.invoke_update_button(button).is_empty());
+            }
+        }
+        assert_eq!(
+            notice_text(
+                &strings,
+                &NoticeMessage::Update(N::Available {
+                    new: "0.9.0".to_owned(),
+                    running: "0.8.0".to_owned(),
+                    last: None,
+                })
+            )
+            .as_str(),
+            "AudioSync 0.9.0 is available. You have 0.8.0."
+        );
+        // covers: S314, S315, S316
+        for (notice, buttons) in [
+            (N::Blocked, [ui_model::UpdaterButton::OpenReleasePage]),
+            (
+                N::RelaunchFailed,
+                [ui_model::UpdaterButton::OpenReleasePage],
+            ),
+            (N::BadSignature, [ui_model::UpdaterButton::OpenReleasePage]),
+            (N::Failed, [ui_model::UpdaterButton::OpenReleasePage]),
+        ] {
+            assert_eq!(notice.buttons(), buttons, "{notice:?}");
+        }
+        assert_eq!(
+            N::BrokenDownload.buttons(),
+            [ui_model::UpdaterButton::OpenReleasePage]
+        );
+        assert_eq!(
+            notice_text(
+                &strings,
+                &NoticeMessage::Update(N::Downloading { percent: Some(42) })
+            )
+            .as_str(),
+            "Downloading the update: 42%"
+        );
+        // Every pair the restore left, the exe first, each with its own name.
+        assert_eq!(
+            notice_text(
+                &strings,
+                &NoticeMessage::Update(N::RestoreFailed {
+                    renames: vec![
+                        ("audiosync.exe.bak".to_owned(), "audiosync.exe".to_owned()),
+                        (
+                            "THIRD-PARTY-NOTICES.txt.bak".to_owned(),
+                            "THIRD-PARTY-NOTICES.txt".to_owned()
+                        ),
+                    ]
+                })
+            )
+            .as_str(),
+            "The update failed and AudioSync couldn't put its old version back. In the \
+             AudioSync folder, rename audiosync.exe.bak to audiosync.exe and \
+             THIRD-PARTY-NOTICES.txt.bak to THIRD-PARTY-NOTICES.txt."
+        );
+        let labels: HashSet<String> = [
+            UpdateButton::Download,
+            UpdateButton::NotNow,
+            UpdateButton::SkipThisVersion,
+            UpdateButton::Cancel,
+            UpdateButton::TryAgain,
+            UpdateButton::OpenReleasePage,
+            UpdateButton::RestartNow,
+        ]
+        .into_iter()
+        .map(|button| strings.invoke_update_button(button).to_string())
+        .collect();
+        assert_eq!(labels.len(), 7);
+        assert!(labels.contains("Download and Install") && labels.contains("Restart Now"));
+        assert_eq!(
+            strings.get_check_updates_automatically().as_str(),
+            "Check for Updates Automatically"
+        );
+        assert_eq!(
+            strings.get_menu_check_for_updates().as_str(),
+            "Check for Updates…"
+        );
+        // Local and test builds have no updater, so its menu items stay hidden.
+        assert!(!app.main.get_updater_available());
+    }
+
+    /// With the updater, More Controls ends with how updates work, naming
+    /// the menu items and the notice button by their own words; without it,
+    /// the Guide leaves them out as the menus do.
+    // covers: S416
+    #[test]
+    fn the_guide_says_how_updates_work_only_with_the_updater() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let updates = strings.get_help_more_updates().to_string();
+        for named in [
+            format!(
+                "{} > {}",
+                strings.get_menu_help(),
+                strings.get_menu_check_for_updates()
+            ),
+            format!(
+                "{} > {}",
+                strings.get_menu_file(),
+                strings.get_check_updates_automatically()
+            ),
+            strings
+                .invoke_update_button(UpdateButton::Download)
+                .to_string(),
+        ] {
+            assert!(updates.contains(&named), "{named} in: {updates}");
+        }
+        assert!(!app.help.get_updater_available());
+        #[cfg(windows)]
+        {
+            let (updater, _) = crate::updater::tests::updater("guide-updates");
+            *app.updater.borrow_mut() = Some(updater);
+            app.refresh();
+            assert!(app.help.get_updater_available());
+        }
+    }
+
+    // covers: S308
+    /// Tab reaches each button of the updater's notice, Space or Enter
+    /// presses it, and the notice reports its focus.
+    #[test]
+    fn the_updater_notice_buttons_take_tab_then_space_or_enter() {
+        let app = main_window_over(MockBackend::new());
+        let item = notice_item(
+            &app.strings(),
+            &ui_model::Notice {
+                id: UPDATER_NOTICE_ID,
+                subject: "update".to_owned(),
+                message: NoticeMessage::Update(ui_model::UpdaterNotice::Available {
+                    new: "0.9.0".to_owned(),
+                    running: "0.8.0".to_owned(),
+                    last: None,
+                }),
+                time: String::new(),
+                post: 0,
+            },
+        );
+        assert_eq!(
+            item.update_buttons.iter().collect::<Vec<_>>(),
+            [
+                UpdateButton::NotNow,
+                UpdateButton::SkipThisVersion,
+                UpdateButton::Download
+            ]
+        );
+        let id = item.id;
+        // The test's own handlers: the app's would refresh the notices away.
+        let pressed = Rc::new(RefCell::new(Vec::new()));
+        let log = Rc::clone(&pressed);
+        app.main
+            .on_notice_update_button_pressed(move |button| log.borrow_mut().push(button));
+        let focused = Rc::new(Cell::new(false));
+        let seen = Rc::clone(&focused);
+        app.main.on_notice_focus_changed(move |notice, now| {
+            if notice == id {
+                seen.set(now);
+            }
+        });
+        app.main
+            .set_notices(ModelRc::from(Rc::new(VecModel::from(vec![item]))));
+        draw_frames();
+        let window = app.main.window();
+        let mut steps = 0;
+        while !focused.get() {
+            assert!(steps < 60, "Tab never reached the updater's notice");
+            tab(window, 1);
+            steps += 1;
+        }
+        press(window, " ");
+        assert_eq!(*pressed.borrow(), [UpdateButton::NotNow], "Space");
+        tab(window, 1);
+        assert!(focused.get(), "Skip This Version is the next stop");
+        press(window, Key::Return);
+        assert_eq!(
+            *pressed.borrow(),
+            [UpdateButton::NotNow, UpdateButton::SkipThisVersion],
+            "Enter"
+        );
+        tab(window, 1);
+        assert!(focused.get(), "Download and Install is the last stop");
+        press(window, " ");
+        assert_eq!(pressed.borrow().last(), Some(&UpdateButton::Download));
+    }
+
+    #[test]
+    fn a_muted_cast_row_says_so_only_while_it_plays() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let group = SharedString::from("Google Cast group");
+        assert_eq!(
+            strings
+                .invoke_cast_note(CastState::Idle, true, "".into())
+                .as_str(),
+            ""
+        );
+        assert_eq!(
+            strings.invoke_cast_note(CastState::Idle, true, group.clone()),
+            group
+        );
+        assert_eq!(
+            strings
+                .invoke_cast_note(CastState::Playing, true, group)
+                .as_str(),
+            "Muted on the group"
+        );
+    }
+
+    /// A Cast speaker paused on the device is on, but nothing reaches it:
+    /// its row keeps its state and loses the playing look (S437).
+    // covers: S437
+    #[test]
+    fn a_paused_cast_row_does_not_look_playing() {
+        let mut backend = MockBackend::new();
+        backend.set_running(true);
+        let state = backend.snapshot();
+        let mut speaker = state.speaker("airplay:kitchen").unwrap().clone();
+        speaker.kind = ui_model::SpeakerKind::Cast;
+        speaker.cast = Some(ui_model::CastRow {
+            state: ui_model::CastState::Paused,
+            muted: false,
+            volume_fixed: false,
+            volume_step: 0.01,
+            group: None,
+            added_by_address: false,
+            offline: false,
+            taken_over: false,
+        });
+        let row = speaker_item(&state, &speaker, true, false, None);
+        assert_eq!(row.state, RowState::Playing);
+        assert!(!row.plays, "paused on the device");
+        if let Some(cast) = speaker.cast.as_mut() {
+            cast.state = ui_model::CastState::Playing;
+        }
+        assert!(speaker_item(&state, &speaker, true, false, None).plays);
+    }
+
+    #[test]
+    fn a_cast_row_names_its_kind_and_says_where_it_is() {
+        let app = app_over(MockBackend::new());
+        let state = MockBackend::new().snapshot();
+        let mut speaker = state.speaker("local:desk").unwrap().clone();
+        speaker.kind = ui_model::SpeakerKind::Cast;
+        speaker.cast = Some(ui_model::CastRow {
+            state: ui_model::CastState::Connecting,
+            muted: true,
+            volume_fixed: false,
+            volume_step: crate::audio::cast::volume_step(Some(
+                &audiosync_cast::status::DeviceVolume {
+                    step_interval: Some(0.05),
+                    ..Default::default()
+                },
+            )),
+            group: None,
+            added_by_address: false,
+            offline: false,
+            taken_over: false,
+        });
+        let row = speaker_item(&state, &speaker, true, false, None);
+        assert_eq!(row.kind, SpeakerKind::Cast);
+        assert!(row.cast && row.muted && !row.volume_fixed);
+        assert_eq!(row.volume_step, 5.0);
+        assert_eq!(row.cast_state, CastState::Connecting);
+        let strings = app.strings();
+        assert_eq!(
+            strings.invoke_speaker_kind(row.kind).as_str(),
+            "Google Cast"
+        );
+        assert_eq!(
+            strings
+                .invoke_cast_note(row.cast_state, row.muted, "".into())
+                .as_str(),
+            "Connecting…"
+        );
+        assert_eq!(
+            strings
+                .invoke_cast_note(CastState::Playing, true, "".into())
+                .as_str(),
+            "Muted on the speaker"
+        );
+
+        let busy = NoticeMessage::CastCantPlay {
+            speaker: "Kitchen".to_owned(),
+            problem: ui_model::CastProblem::Busy,
+        };
+        assert!(notice_text(&strings, &busy).starts_with("Only one Google Cast speaker"));
+        assert_eq!(notice_title(&strings, &busy).as_str(), "Kitchen can't play");
+        let ahead = NoticeMessage::AirPlayAheadOfCast {
+            speaker: "Kitchen".to_owned(),
+            tenths: 15,
+        };
+        assert_eq!(
+            notice_text(&strings, &ahead).as_str(),
+            "AirPlay speakers can wait at most 20 s for a Google Cast speaker, so they play \
+             about 1.5 s ahead of Kitchen. Lower its offset to keep them together."
+        );
+        assert_eq!(
+            notice_title(&strings, &ahead).as_str(),
+            "AirPlay ahead of Kitchen"
+        );
+
+        speaker.cast = None;
+        let row = speaker_item(&state, &speaker, true, false, None);
+        assert!(!row.cast);
+        assert_eq!(row.volume_step, 1.0);
+    }
+
+    // covers: C68
+    #[test]
+    fn a_cast_row_with_a_fixed_volume_says_it_cannot_be_changed() {
+        let app = app_over(MockBackend::new());
+        let state = MockBackend::new().snapshot();
+        let mut speaker = state.speaker("local:desk").unwrap().clone();
+        speaker.kind = ui_model::SpeakerKind::Cast;
+        speaker.cast = Some(ui_model::CastRow {
+            state: ui_model::CastState::Playing,
+            muted: false,
+            volume_fixed: true,
+            volume_step: 1.0,
+            group: None,
+            added_by_address: false,
+            offline: false,
+            taken_over: false,
+        });
+        let row = speaker_item(&state, &speaker, true, false, None);
+        // The slider's `enabled` and the hint in widgets.slint key off this flag.
+        assert!(row.cast && row.volume_fixed);
+        assert_eq!(
+            app.strings().get_cast_volume_fixed().as_str(),
+            "This speaker's volume can't be changed from AudioSync."
+        );
+
+        speaker.cast.as_mut().unwrap().volume_fixed = false;
+        let row = speaker_item(&state, &speaker, true, false, None);
+        assert!(row.cast && !row.volume_fixed);
+    }
+
+    #[test]
+    fn a_reconnecting_cast_row_says_so_before_its_mute_or_group() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        assert_eq!(
+            strings
+                .invoke_cast_note(CastState::Reconnecting, true, "".into())
+                .as_str(),
+            "Reconnecting…",
+            "muted"
+        );
+        assert_eq!(
+            strings
+                .invoke_cast_note(
+                    CastState::Reconnecting,
+                    false,
+                    "Google Cast group: Kitchen and Living Room".into()
+                )
+                .as_str(),
+            "Reconnecting…",
+            "group"
+        );
+    }
+
+    #[test]
+    fn a_cast_group_row_names_its_members_or_says_they_are_unknown() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let state = MockBackend::new().snapshot();
+        let mut speaker = state.speaker("local:desk").unwrap().clone();
+        speaker.name = "Attic".to_owned();
+        speaker.kind = ui_model::SpeakerKind::Cast;
+        let group = |members| Some(ui_model::CastGroup { members });
+        speaker.cast = Some(ui_model::CastRow {
+            state: ui_model::CastState::Idle,
+            muted: false,
+            volume_fixed: false,
+            volume_step: 1.0,
+            group: group(ui_model::CastMembers::NotReported),
+            added_by_address: false,
+            offline: false,
+            taken_over: false,
+        });
+        let row = speaker_item(&state, &speaker, true, false, None);
+        assert!(row.cast && row.cast_group);
+        let note = |speaker: &ui_model::Speaker| cast_group_note(&strings, speaker);
+        let label = |note: SharedString| strings.invoke_cast_group_label("Attic".into(), note);
+        assert_eq!(
+            note(&speaker).as_str(),
+            "Google Cast group",
+            "before it plays"
+        );
+        assert_eq!(label(note(&speaker)).as_str(), "Attic, Google Cast group");
+
+        speaker.cast.as_mut().unwrap().group = group(ui_model::CastMembers::Unknown);
+        assert_eq!(
+            note(&speaker).as_str(),
+            "Google Cast group, members unknown"
+        );
+        assert_eq!(
+            label(note(&speaker)).as_str(),
+            "Attic, Google Cast group, members unknown"
+        );
+
+        speaker.cast.as_mut().unwrap().group = group(ui_model::CastMembers::Known(vec![
+            "Kitchen".to_owned(),
+            "Living Room".to_owned(),
+        ]));
+        assert_eq!(
+            note(&speaker).as_str(),
+            "Google Cast group: Kitchen and Living Room"
+        );
+        assert_eq!(
+            label(note(&speaker)).as_str(),
+            "Attic, Google Cast group: Kitchen and Living Room"
+        );
+        let cast_note = |state, muted| strings.invoke_cast_note(state, muted, note(&speaker));
+        assert_eq!(
+            cast_note(CastState::Connecting, false).as_str(),
+            "Connecting…",
+            "where it is comes first"
+        );
+        assert_eq!(
+            cast_note(CastState::Playing, true).as_str(),
+            "Muted on the group"
+        );
+        assert_eq!(
+            cast_note(CastState::Paused, true).as_str(),
+            "Paused on the speaker"
+        );
+        assert_eq!(
+            cast_note(CastState::Playing, false).as_str(),
+            "Google Cast group: Kitchen and Living Room"
+        );
+
+        let single = state.speaker("local:desk").unwrap();
+        assert!(!speaker_item(&state, single, true, false, None).cast_group);
+        assert_eq!(cast_group_note(&strings, single).as_str(), "");
+    }
+
+    #[test]
+    fn a_member_held_by_its_target_names_the_target() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let notice = NoticeMessage::AirPlayPlaysInGroup {
+            speaker: "Right".to_owned(),
+            target: "Living Room".to_owned(),
+        };
+        assert_eq!(
+            notice_text(&strings, &notice).as_str(),
+            "Right plays as part of Living Room, so it stays off by itself."
+        );
+        assert_eq!(notice_title(&strings, &notice).as_str(), "Right can't play");
+    }
+
+    // covers: S141
+    #[test]
+    fn the_switch_failed_notice_names_both_sources_and_no_retry() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let failed = NoticeMessage::SwitchFailed {
+            new: SwitchName::Source(SourceName::Named("Spotify".into())),
+            old: SwitchName::System,
+        };
+        assert_eq!(
+            notice_text(&strings, &failed).as_str(),
+            "Couldn't start Spotify, still on All System Audio."
+        );
+    }
+
+    // covers: S350
+    #[test]
+    fn the_waiting_notice_names_the_app_when_one_is_captured_and_reads_generic_otherwise() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let from_app = NoticeMessage::WaitingForAudio {
+            app: Some("Spotify".to_owned()),
+        };
+        assert_eq!(
+            notice_text(&strings, &from_app).as_str(),
+            "Waiting for audio from Spotify. Start playback there and it streams right away."
+        );
+        assert_eq!(
+            notice_text(&strings, &NoticeMessage::WaitingForAudio { app: None }).as_str(),
+            "Waiting for audio. Play something and it streams right away."
+        );
+        assert_eq!(
+            notice_title(&strings, &from_app).as_str(),
+            "waiting for audio"
+        );
+        assert!(from_app.reports_a_change(), "a calm notice: the info glyph");
+    }
+
+    #[test]
+    fn a_refusal_before_any_pairing_step_names_no_code() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let notice = NoticeMessage::AirPlayCantPlay {
+            speaker: "Samsung".to_owned(),
+            problem: ui_model::AirPlayProblem::NotAccepted,
+        };
+        let text = notice_text(&strings, &notice);
+        assert_eq!(
+            text.as_str(),
+            "Samsung didn't accept the connection, so it's off. Turn it on again to try once more."
+        );
+        assert!(
+            !["PIN", "code", "password"]
+                .iter()
+                .any(|word| text.contains(word))
+        );
+    }
+
+    #[test]
+    fn a_target_whose_member_asks_for_a_password_names_both() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let notice = NoticeMessage::AirPlayMemberNeedsPassword {
+            target: "Living Room".to_owned(),
+            member: "Right".to_owned(),
+        };
+        assert_eq!(
+            notice_text(&strings, &notice).as_str(),
+            "Right in Living Room asks for a password, so Living Room is off. Turn Living Room \
+             on again to enter it."
+        );
+        assert_eq!(
+            notice_title(&strings, &notice).as_str(),
+            "Living Room can't play"
+        );
+    }
+
+    #[test]
+    fn rows_show_the_speaker_state_kind_and_delay() {
+        let mut backend = MockBackend::new();
+        backend.set_running(true);
+        let state = backend.snapshot();
+        let desk = state.speaker("local:desk").unwrap();
+        let row = speaker_item(&state, desk, true, true, None);
+        assert_eq!(row.state, RowState::Off);
+        assert_eq!(row.kind, SpeakerKind::Usb);
+        assert!(row.has_delay && row.sync_open);
+        assert_eq!((row.delay_ms, row.delay_text.as_str()), (120, "+120"));
+
+        let kitchen = state.speaker("airplay:kitchen").unwrap();
+        let row = speaker_item(&state, kitchen, true, true, None);
+        assert_eq!(row.state, RowState::Playing);
+        assert!(
+            !row.has_delay && !row.sync_open,
+            "AirPlay rows have no sync controls"
+        );
+    }
+
+    // covers: S181
+    #[test]
+    fn the_reference_row_has_no_delay_and_the_others_show_a_signed_offset() {
+        let state = MockBackend::new().snapshot();
+        let row = |id: &str| speaker_item(&state, state.speaker(id).unwrap(), true, true, None);
+        let reference = row("local:speakers");
+        assert!(
+            !reference.has_delay && !reference.sync_open,
+            "the reference has no delay field"
+        );
+        let desk = row("local:desk");
+        assert_eq!((desk.delay_ms, desk.delay_text.as_str()), (120, "+120"));
+        assert_eq!(desk.reference_name.as_str(), "Speakers");
+        let headset = row("local:bt");
+        assert_eq!(
+            (headset.delay_ms, headset.delay_text.as_str()),
+            (-250, "−250")
+        );
+        let headphones = row("local:headphones");
+        assert_eq!(
+            (headphones.delay_ms, headphones.delay_text.as_str()),
+            (0, "0")
+        );
+    }
+
+    // covers: S181 (the hint beside the delay fields)
+    #[test]
+    fn the_sync_hint_names_the_reference_and_says_which_way_to_move_a_value() {
+        let app = app_over(MockBackend::new());
+        let strings = app.main.global::<Strings>();
+        assert_eq!(
+            strings.invoke_sync_hint("Speakers".into()),
+            "Relative to Speakers. Use a negative value for a speaker that sounds late, such as Bluetooth. Heard this speaker first? Raise the value. Heard it late? Lower it."
+        );
+        assert_eq!(
+            strings.invoke_sync_hint("".into()),
+            "The speaker with the lowest value plays first, and the others wait by the difference. Heard this speaker first? Raise the value. Heard it late? Lower it."
+        );
+
+        let mut state = MockBackend::new().snapshot();
+        let desk = state.speaker("local:desk").unwrap().clone();
+        assert_eq!(
+            speaker_item(&state, &desk, true, true, None).reference_name,
+            "Speakers"
+        );
+        state.reference_name = None;
+        assert_eq!(
+            speaker_item(&state, &desk, true, true, None).reference_name,
+            "",
+            "without a reference the row asks for the no-reference hint"
+        );
+
+        let widgets = include_str!("../ui/widgets.slint");
+        let controls = &widgets[widgets
+            .find("export component SyncControls")
+            .expect("the sync controls")..];
+        let field = controls
+            .find("text: root.delay-text;")
+            .expect("the delay field");
+        let hint = controls
+            .find("text: root.cast ? Strings.cast-sync-hint : Strings.sync-hint(root.reference-name);")
+            .expect("the hint beside the delay field");
+        let end = controls[1..]
+            .find("export component")
+            .map_or(controls.len(), |at| at + 1);
+        assert!(field < end && hint < end, "both in the sync controls");
+        assert!(widgets.contains("reference-name: root.item.reference-name;"));
+    }
+
+    // covers: S181 (other input is ignored and the stored value shows again)
+    #[test]
+    fn a_delay_that_is_not_a_signed_whole_number_applies_nothing_and_shows_the_stored_value() {
+        let app = app_over(MockBackend::new());
+        app.main.invoke_sync_toggled("local:desk".into());
+        assert_eq!(delay_of(&app, "local:desk"), Some(120.0));
+        for typed in ["", " ", "+", "\u{2212}", "-", "+x", "\u{2212}ms", "abc"] {
+            app.main
+                .invoke_delay_edited("local:desk".into(), typed.into());
+            app.main.invoke_delay_committed("local:desk".into());
+            assert_eq!(
+                delay_of(&app, "local:desk"),
+                Some(120.0),
+                "{typed:?} applies nothing"
+            );
+            assert_eq!(desk_delay_text(&app), "+120", "{typed:?}: the stored value");
+            assert!(!desk_row(&app).delay_pending, "{typed:?} leaves no draft");
+        }
+    }
+
+    // covers: S181 (other input is ignored and the stored value shows again)
+    #[test]
+    fn a_paste_holding_anything_but_a_signed_whole_number_is_blocked_whole() {
+        let app = app_over(MockBackend::new());
+        app.main.invoke_sync_toggled("local:desk".into());
+        for pasted in ["1,5", "12a", "1.5", "\u{2212}2x"] {
+            app.main
+                .invoke_delay_edited("local:desk".into(), pasted.into());
+            assert_eq!(desk_delay_text(&app), "+120", "{pasted:?}: no digits kept");
+            assert!(!desk_row(&app).delay_pending, "{pasted:?} leaves no draft");
+            app.main.invoke_delay_committed("local:desk".into());
+            assert_eq!(delay_of(&app, "local:desk"), Some(120.0), "{pasted:?}");
+        }
+
+        app.main
+            .invoke_delay_edited("local:desk".into(), "3".into());
+        app.main
+            .invoke_delay_edited("local:desk".into(), "31,5".into());
+        assert_eq!(desk_delay_text(&app), "3", "the typing before it stays");
+
+        let airplay = app.main.get_airplay_delay_text();
+        app.main.invoke_airplay_delay_edited("1,5".into());
+        assert_eq!(app.main.get_airplay_delay_text(), airplay);
+    }
+
+    // covers: S199 (the Windows app writes "13%" in every locale)
+    #[test]
+    fn the_device_volume_percent_reads_n_percent_without_a_space_in_every_locale() {
+        // No translation catalog is built in, so no locale can turn "{}%"
+        // into "13 %"; Slint writes an int the same way in every locale.
+        let manifest = include_str!("../Cargo.toml");
+        assert!(!manifest.contains("\"gettext\""), "no gettext catalogs");
+        assert!(
+            !include_str!("../build.rs").contains("translations"),
+            "no bundled translations"
+        );
+
+        let app = app_over(MockBackend::new());
+        let strings = app.main.global::<Strings>();
+        let system = if cfg!(target_os = "linux") {
+            "PipeWire"
+        } else {
+            "Windows"
+        };
+        for n in [0, 5, 13, 25] {
+            assert_eq!(
+                strings.invoke_device_volume_hint(DeviceVolumeHint::Low, n),
+                format!("{system} volume is {n}%")
+            );
+            assert_eq!(
+                strings.invoke_device_volume_hint(DeviceVolumeHint::MutedLow, n),
+                format!("Muted in {system}, volume {n}%")
+            );
+            assert_eq!(
+                strings.invoke_device_volume_hint_label(
+                    "Speakers".into(),
+                    DeviceVolumeHint::Low,
+                    n
+                ),
+                format!("Speakers: {system} volume is {n}%")
+            );
+        }
+        assert_eq!(
+            strings.invoke_device_volume_fix(DeviceVolumeHint::Low),
+            "Set to 75%"
+        );
+        assert_eq!(
+            strings.invoke_device_volume_fix(DeviceVolumeHint::MutedLow),
+            "Unmute at 75%"
+        );
+        assert_eq!(
+            strings.invoke_device_volume_fix_label("Speakers".into(), DeviceVolumeHint::MutedLow),
+            "Unmute at 75%, Speakers"
+        );
+    }
+
+    #[test]
+    fn a_typed_delay_stays_in_the_field() {
+        let state = MockBackend::new().snapshot();
+        let desk = state.speaker("local:desk").unwrap();
+        let row = speaker_item(&state, desk, true, true, Some("12"));
+        assert_eq!(row.delay_text.as_str(), "12");
+        assert_eq!(row.delay_ms, 120);
+    }
+
+    // covers: S220
+    #[test]
+    fn a_typed_airplay_delay_applies_only_when_committed() {
+        // With a sender latency above 2 s the delay can't go under 2100 ms,
+        // so applying "2", "25" and "250" on the way to "2500" would clamp
+        // each of them.
+        let shown = Some(2100.0);
+        let mut field = TypedDelay::default();
+        for text in ["2", "25", "250", "2500"] {
+            field.edit(text, shown);
+            assert_eq!(field.text(shown), Some(text), "the field keeps the text");
+        }
+        assert_eq!(field.commit(shown), Some(2500.0), "Enter applies it");
+        assert_eq!(field.text(shown), None, "then the field shows the value");
+        assert_eq!(
+            field.commit(shown),
+            None,
+            "leaving the field applies nothing more"
+        );
+
+        field.edit("abc", shown);
+        assert_eq!(field.commit(shown), None, "not a number: nothing applies");
+        field.edit("3000", shown);
+        assert_eq!(field.text(Some(2400.0)), None);
+        assert_eq!(
+            field.commit(Some(2400.0)),
+            None,
+            "a new sender latency replaced the typed text"
+        );
+    }
+
+    // covers: S220
+    #[test]
+    fn escape_drops_the_typed_airplay_delay() {
+        let shown = Some(2100.0);
+        let mut field = TypedDelay::default();
+        field.edit("9999", shown);
+        field.cancel();
+        assert_eq!(field.text(shown), None, "the field shows the value again");
+        assert_eq!(
+            field.commit(shown),
+            None,
+            "leaving the field after Escape applies nothing"
+        );
+    }
+
+    #[test]
+    fn a_listed_virtual_output_stays_listed_after_it_is_turned_off() {
+        let mut state = MockBackend::new().snapshot();
+        let mut cable = state.speaker("local:desk").unwrap().clone();
+        cable.kind = ui_model::SpeakerKind::Virtual;
+        cable.enabled = true;
+        let mut listed = ListedVirtual::default();
+        state.speakers = vec![cable.clone()];
+        listed.note(&state, false);
+        assert!(listed.lists(&cable, false), "on, it is listed");
+
+        cable.enabled = false;
+        state.speakers = vec![cable.clone()];
+        listed.note(&state, false);
+        assert!(
+            listed.lists(&cable, false),
+            "turned off, its row stays under the focus"
+        );
+
+        listed.forget();
+        assert!(
+            !listed.lists(&cable, false),
+            "until Show Virtual Devices changes"
+        );
+        let mut other = cable.clone();
+        other.id = "local:other".into();
+        assert!(
+            !listed.lists(&other, false),
+            "a virtual output that was never listed stays hidden"
+        );
+    }
+
+    // covers: S151
+    #[test]
+    fn a_virtual_output_set_to_auto_connect_or_in_a_zone_is_listed_after_a_restart() {
+        let mut backend = MockBackend::new();
+        backend.new_zone_with("local:desk", "Desk");
+        let mut state = backend.snapshot();
+        let mut zoned = state.speaker("local:desk").unwrap().clone();
+        zoned.kind = ui_model::SpeakerKind::Virtual;
+        zoned.enabled = false;
+        let mut auto = zoned.clone();
+        auto.id = "local:cable".into();
+        auto.auto_connect = true;
+        state.speakers = vec![zoned.clone(), auto.clone()];
+        let mut listed = ListedVirtual::default();
+        listed.note(&state, false);
+        assert!(listed.lists(&zoned, false), "a zone member keeps its row");
+        assert!(listed.lists(&auto, false), "auto-connect keeps its row");
+    }
+
+    #[test]
+    fn connected_speakers_say_when_only_virtual_outputs_are_hidden() {
+        let state = MockBackend::new().snapshot();
+        let mut cable = state.speaker("local:desk").unwrap().clone();
+        cable.kind = ui_model::SpeakerKind::Virtual;
+        cable.enabled = false;
+        let hiding = |s: &ui_model::Speaker| s.is_listed(false);
+        let showing = |s: &ui_model::Speaker| s.is_listed(true);
+        assert!(only_virtual_outputs_hidden(&[&cable], hiding));
+        assert!(
+            !only_virtual_outputs_hidden(&[&cable], showing),
+            "shown, it is listed"
+        );
+        assert!(!only_virtual_outputs_hidden(&[], hiding), "nothing at all");
+        let desk = state.speaker("local:desk").unwrap();
+        assert!(
+            !only_virtual_outputs_hidden(&[&cable, desk], hiding),
+            "another speaker is listed"
+        );
+    }
+
+    /// The flyout's content slides up into place as it opens, from the start
+    /// each time, and the flyout's height doesn't follow the slide.
+    #[test]
+    fn the_flyout_content_slides_up_as_it_opens() {
+        hold_clock();
+        let app = app_over(MockBackend::new());
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        let height = app.flyout.get_fit_height();
+        app.prepare_flyout_open(true);
+        assert_eq!(
+            app.flyout.get_content_offset(),
+            16.0,
+            "back to the start at once"
+        );
+        assert_eq!(app.flyout.get_fit_height(), height);
+        app.flyout.set_revealed(true);
+        draw_frames();
+        advance_clock(Duration::from_millis(80));
+        draw_frames();
+        let offset = app.flyout.get_content_offset();
+        assert!(offset > 0.0 && offset < 16.0, "it slides: {offset}");
+        advance_clock(Duration::from_millis(200));
+        draw_frames();
+        assert_eq!(app.flyout.get_content_offset(), 0.0);
+
+        app.prepare_flyout_open(false);
+        assert_eq!(
+            app.flyout.get_content_offset(),
+            0.0,
+            "with Animation effects off it opens in place"
+        );
+    }
+
+    /// The flyout shows the newest notice as the Mac's panel does: no time,
+    /// and cut to three lines while other notices wait (S438).
+    // covers: S438
+    #[test]
+    fn the_flyout_cuts_its_notice_to_three_lines_while_others_wait() {
+        let _ = slint::platform::set_platform(Box::new(Headless));
+        let flyout = TrayFlyout::new().expect("the flyout builds headless");
+        flyout.show().expect("the flyout shows headless");
+        let fit = |words: usize, count: i32| {
+            let notice = NoticeItem {
+                id: 1,
+                message: vec!["word"; words].join(" ").into(),
+                time: "10.42".into(),
+                title: "test".into(),
+                ..NoticeItem::default()
+            };
+            flyout.set_notices(ModelRc::new(VecModel::from(vec![notice])));
+            flyout.set_notice_count(count);
+            draw_frames();
+            flyout.get_fit_height()
+        };
+        assert_eq!(fit(80, 2), fit(160, 2), "cut to three lines");
+        assert!(fit(160, 1) > fit(80, 1), "alone, it shows in full");
+    }
+
+    /// Windows made the flyout at Slint's preferred height, which counts the
+    /// zones notice's wrapped text as one line: the Open and Exit buttons
+    /// were cut off at its bottom edge.
+    #[test]
+    fn the_flyout_shows_its_buttons_under_a_wrapped_notice() {
+        let app = app_over(MockBackend::zones_preview());
+        app.refresh();
+        draw_frames();
+        let flyout = &app.flyout;
+        let window = flyout.window();
+        let preferred = flyout.get_made_height();
+        window.set_size(slint::LogicalSize::new(340.0, preferred));
+        let height = app.fit_flyout(1000.0);
+        let size = window.size().to_logical(window.scale_factor());
+        assert_eq!(size.height, height);
+        let bottom = flyout.get_footer_bottom();
+        assert!(
+            bottom + 16.0 <= height,
+            "buttons end at {bottom}, window {height} high (Slint asked for {preferred})"
+        );
+        assert!(height <= bottom + 16.5, "no room left under the buttons");
+    }
+
+    /// The update notice's three buttons stack in the 340 px flyout, Not Now
+    /// on top and Download and Install at the bottom, on one left edge and
+    /// within the notice's text column, measured on a one-button notice
+    /// whose text fills that column; at 200% scaling too.
+    // covers: S308
+    #[test]
+    fn the_flyout_fits_the_update_notice_buttons() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        app.flyout.show().expect("the flyout shows headless");
+        let edges = |notice: ui_model::UpdaterNotice, label: &str| {
+            let item = notice_item(
+                &strings,
+                &ui_model::Notice {
+                    id: UPDATER_NOTICE_ID,
+                    subject: "update".to_owned(),
+                    message: NoticeMessage::Update(notice),
+                    time: String::new(),
+                    post: 0,
+                },
+            );
+            app.flyout
+                .set_notices(ModelRc::from(Rc::new(VecModel::from(vec![item]))));
+            draw_frames();
+            let element = ElementHandle::find_by_accessible_label(&app.flyout, label)
+                .next()
+                .unwrap_or_else(|| panic!("{label} is in the flyout"));
+            let at = element.absolute_position();
+            (at.x, at.x + element.size().width, at.y)
+        };
+        let installed = || ui_model::UpdaterNotice::Installed {
+            version: "0.9.0".to_owned(),
+        };
+        let text = strings.invoke_notice_update_installed("0.9.0".into());
+        let available = || ui_model::UpdaterNotice::Available {
+            new: "0.9.0".to_owned(),
+            running: "0.8.0".to_owned(),
+            last: None,
+        };
+        for scale_factor in [1.0, 2.0] {
+            app.flyout
+                .window()
+                .dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor });
+            let column = edges(installed(), &text);
+            let restart = edges(installed(), "Restart Now");
+            assert!(
+                restart.1 < column.1,
+                "a lone button keeps its label's width: {restart:?}, column {column:?}"
+            );
+            let stack = ["Not Now", "Skip This Version", "Download and Install"]
+                .map(|label| (label, edges(available(), label)));
+            for (label, (left, right, _)) in stack {
+                assert!(
+                    right <= column.1,
+                    "{label} at {scale_factor}x ends at {right}, the column at {}",
+                    column.1
+                );
+                assert_eq!(left, stack[0].1.0, "{label} shares the left edge");
+            }
+            assert!(
+                stack.windows(2).all(|pair| pair[0].1.2 < pair[1].1.2),
+                "top to bottom: {stack:?}"
+            );
+            // The flyout grows by the two rows above Download and Install.
+            let tall = app.fit_flyout(1000.0);
+            edges(installed(), &text);
+            let short = app.fit_flyout(1000.0);
+            let rows = stack[2].1.2 - stack[0].1.2;
+            assert!(tall - short >= rows, "{tall} vs {short}, rows {rows}");
+        }
+    }
+
+    /// On a screen too short for the whole flyout, the list scrolls and the
+    /// buttons still show.
+    #[test]
+    fn a_short_screen_shortens_the_flyout_list_not_the_buttons() {
+        let app = app_over(MockBackend::zones_preview());
+        app.refresh();
+        draw_frames();
+        let flyout = &app.flyout;
+        let window = flyout.window();
+        window.set_size(slint::LogicalSize::new(340.0, 400.0));
+        let full = app.fit_flyout(1000.0);
+        let room = full - 40.0;
+        let height = app.fit_flyout(room);
+        assert_eq!(height, room);
+        let bottom = flyout.get_footer_bottom();
+        assert!(bottom + 16.0 <= room, "buttons end at {bottom} in {room}");
+        assert_eq!(app.fit_flyout(1000.0), full, "the list gets its room back");
+    }
+
+    /// The refresh refits the flyout every 500 ms: a cut that still fits
+    /// stays, and a change in content or room starts over.
+    #[test]
+    fn the_flyout_keeps_its_cuts_while_they_still_fit() {
+        assert!(flyout_fit_holds(300.0, 300.0, true), "cut, fills the room");
+        assert!(flyout_fit_holds(300.2, 300.0, true), "rounding");
+        assert!(!flyout_fit_holds(340.0, 300.0, true), "the content grew");
+        assert!(
+            !flyout_fit_holds(260.0, 300.0, true),
+            "it shrank or the room grew"
+        );
+        assert!(flyout_fit_holds(260.0, 300.0, false), "no cut, fits");
+        assert!(!flyout_fit_holds(340.0, 300.0, false), "no cut, too tall");
+
+        let app = app_over(MockBackend::zones_preview());
+        app.refresh();
+        draw_frames();
+        let flyout = &app.flyout;
+        flyout
+            .window()
+            .set_size(slint::LogicalSize::new(340.0, 400.0));
+        let room = app.fit_flyout(1000.0) - 40.0;
+        assert_eq!(app.fit_flyout(room), room);
+        let cuts = (flyout.get_list_cut(), flyout.get_body_cut());
+        assert!(cuts.0 > 0.0, "the list is cut");
+        app.refresh();
+        draw_frames();
+        assert_eq!(app.fit_flyout(room), room);
+        assert_eq!(
+            (flyout.get_list_cut(), flyout.get_body_cut()),
+            cuts,
+            "nothing changed, the cuts stay"
+        );
+
+        let shorter = room - 40.0;
+        assert_eq!(app.fit_flyout(shorter), shorter);
+        let grown = flyout.get_list_cut() + flyout.get_body_cut();
+        assert!(grown > cuts.0 + cuts.1, "less room, a deeper cut");
+        assert!(
+            flyout.get_footer_bottom() + 16.0 <= shorter + 0.5,
+            "the buttons still show"
+        );
+        assert_eq!(app.fit_flyout(room), room);
+        assert_eq!(
+            (flyout.get_list_cut(), flyout.get_body_cut()),
+            cuts,
+            "the room back, the cuts as before"
+        );
+    }
+
+    /// A flyout with two notices, presets and an input's channel pairs, on a
+    /// screen as short as 1366x768 at 150%: the list stops shrinking at
+    /// three rows, or there is none, and the buttons still show.
+    fn crowded_flyout_keeps_its_buttons(mut backend: MockBackend, case: &str) {
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        backend.add_preset("evening", "Evening", &["local:desk"]);
+        backend.add_preset("party", "Party", &["local:desk"]);
+        let app = app_over(backend);
+        let line_in = app
+            .snapshot()
+            .sources
+            .iter()
+            .position(|source| source.id == "input:line")
+            .expect("listed");
+        app.flyout.invoke_source_selected(line_in as i32);
+        app.refresh();
+        draw_frames();
+        let flyout = &app.flyout;
+        assert!(
+            flyout.get_input_pairs().row_count() > 0,
+            "{case}: pairs show"
+        );
+        assert!(flyout.get_presets().row_count() > 0, "{case}: presets show");
+        flyout
+            .window()
+            .set_size(slint::LogicalSize::new(340.0, 400.0));
+        let full = app.fit_flyout(1000.0);
+        let room = 300.0;
+        assert!(full > room + 100.0, "{case}: {full} fits {room} anyway");
+        let height = app.fit_flyout(room);
+        assert_eq!(height, room, "{case}");
+        let bottom = flyout.get_footer_bottom();
+        assert!(
+            bottom + 16.0 <= room + 0.5,
+            "{case}: buttons end at {bottom} in {room}"
+        );
+        assert_eq!(app.fit_flyout(1000.0), full, "{case}: the room comes back");
+    }
+
+    #[test]
+    fn a_crowded_flyout_on_a_short_screen_keeps_its_buttons() {
+        crowded_flyout_keeps_its_buttons(MockBackend::zones_preview(), "zones");
+        let mut bare = MockBackend::new();
+        bare.retain_speakers(|s| s.kind.is_this_pc());
+        crowded_flyout_keeps_its_buttons(bare, "no list");
+    }
+
+    #[test]
+    fn a_zone_lists_its_members_and_the_other_lists_only_the_rest() {
+        let app = app_over(MockBackend::zones_preview());
+        let ids = |model: &VecModel<SpeakerItem>| -> Vec<String> {
+            model.iter().map(|row| row.id.to_string()).collect()
+        };
+        let m = &app.models;
+        let zoned = [
+            "airplay:kitchen",
+            "airplay:pair",
+            "cc:attic",
+            "local:desk",
+            "airplay:bedroom",
+            "airplay:left",
+        ];
+        for list in [ids(&m.this_pc), ids(&m.connected)] {
+            assert!(
+                list.iter().all(|id| !zoned.contains(&id.as_str())),
+                "{list:?}"
+            );
+        }
+        assert!(ids(&m.this_pc).iter().any(|id| id == "local:speakers"));
+        assert!(ids(&m.connected).iter().any(|id| id == "airplay:living"));
+        assert_eq!(
+            [ids(&m.flyout_this_pc), ids(&m.flyout_connected)],
+            [ids(&m.this_pc), ids(&m.connected)]
+        );
+        let living = m.zones.row_data(0).unwrap();
+        assert_eq!(
+            living
+                .members
+                .iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            [
+                "airplay:kitchen",
+                "airplay:pair",
+                "cc:attic",
+                "local:desk",
+                "airplay:theater:4C2D"
+            ],
+            "in zone order, the one not found too; the hidden one has no row"
+        );
+        assert_eq!(
+            (living.on, living.total, living.waiting, living.present),
+            (2, 5, 1, 4)
+        );
+        let upstairs = m.zones.row_data(1).unwrap();
+        let left = upstairs.members.row_data(1).unwrap();
+        assert_eq!(left.zone_note, "Plays as part of Living Room Pair");
+        assert!(left.zone_dimmed);
+        assert!(!left.zone_movable);
+        assert_eq!(
+            upstairs.targets.row_data(0).unwrap().member_id,
+            "airplay:left"
+        );
+        assert_eq!(m.zones.row_data(2).unwrap().total, 0, "Office is empty");
+        let compact = ids(&m.connected_zoned);
+        assert!(
+            compact.iter().any(|id| id == "airplay:kitchen"),
+            "{compact:?}"
+        );
+        assert!(
+            compact.iter().all(|id| zoned.contains(&id.as_str())),
+            "only zone members get a compact row"
+        );
+        let kitchen = m
+            .connected_zoned
+            .iter()
+            .find(|row| row.id == "airplay:kitchen")
+            .unwrap();
+        assert_eq!(kitchen.zone_name, "Living Room");
+        assert_eq!(kitchen.zone_id, "zone:living");
+    }
+
+    // covers: S245 (a zone's rows and its count agree; a hidden member has
+    // neither, one not found has a row)
+    #[test]
+    fn every_zone_member_but_the_hidden_ones_has_a_row_that_its_count_counts() {
+        let app = app_over(MockBackend::zones_preview());
+        for zone in app.models.zones.iter() {
+            assert_eq!(
+                zone.members.row_count(),
+                zone.total as usize,
+                "{}",
+                zone.name
+            );
+            // A row only its pair moves plays as part of the pair, which
+            // the Mac doesn't list.
+            assert_eq!(
+                zone.members
+                    .iter()
+                    .filter(|row| !row.missing && row.zone_movable)
+                    .count(),
+                zone.present as usize,
+                "{}",
+                zone.name
+            );
+        }
+        let living = app.models.zones.row_data(0).unwrap();
+        assert!(living.members.iter().all(|row| row.id != "airplay:den"));
+        let theater = living.members.row_data(4).unwrap();
+        assert!(theater.missing && theater.zone_dimmed && theater.zone_movable);
+        assert_eq!(theater.name, "Home Theater");
+        assert_eq!(theater.zone_note, "Not found");
+        assert_eq!(theater.zone_id, "zone:living");
+
+        // Remove from Zone still reaches it.
+        app.main
+            .invoke_speaker_remove_from_zone_requested("airplay:theater:4C2D".into());
+        let living = app.models.zones.row_data(0).unwrap();
+        assert_eq!((living.members.row_count(), living.total), (4, 4));
+    }
+
+    // covers: S246 (a Cast member a zone click left off says why), S247 (a
+    // pair needs AirPlay 2)
+    #[test]
+    fn zone_member_rows_say_why_they_dont_play() {
+        let app = app_over(MockBackend::zones_preview());
+        let living = || app.models.zones.row_data(0).unwrap();
+        let attic = living().members.row_data(2).unwrap();
+        assert_eq!(attic.id, "cc:attic");
+        assert_eq!(
+            attic.zone_note, "Stayed off, since one Cast speaker plays at a time",
+            "another member is on"
+        );
+        assert!(!attic.zone_dimmed);
+        let pair = living().members.row_data(1).unwrap();
+        assert_eq!(pair.zone_note, "", "AirPlay 2 can play it");
+
+        let strings = app.strings();
+        assert_eq!(
+            zone_note(&strings, ui_model::ZoneNote::NeedsAirPlay2),
+            "Needs AirPlay 2"
+        );
+        let mut state = app.snapshot();
+        let zone = state.zones[0].clone();
+        let pair = state
+            .speakers
+            .iter_mut()
+            .find(|s| s.id == "airplay:pair")
+            .unwrap();
+        pair.availability = ui_model::Availability::AirPlay2NotYet;
+        let pair = state.speaker("airplay:pair").unwrap();
+        assert_eq!(
+            state.zone_note(&zone, ui_model::ZoneRow::Listed(pair)),
+            Some(ui_model::ZoneNote::NeedsAirPlay2)
+        );
+        // One look for the note, listed or not.
+        assert!(zone_row_dimmed(
+            ui_model::ZoneRow::Listed(pair),
+            ui_model::ZoneNote::NeedsAirPlay2
+        ));
+        assert!(zone_row_dimmed(
+            ui_model::ZoneRow::NotFound("airplay:theater:4C2D"),
+            ui_model::ZoneNote::NeedsAirPlay2
+        ));
+        for speaker in &mut state.speakers {
+            if speaker.id != "cc:attic" {
+                speaker.enabled = false;
+            }
+        }
+        let attic = state.speaker("cc:attic").unwrap();
+        assert_eq!(
+            state.zone_note(&zone, ui_model::ZoneRow::Listed(attic)),
+            None,
+            "with nothing else on, a Cast speaker that is off is just off"
+        );
+    }
+
+    /// As on the Mac, the Cast note needs a Cast speaker on: a zone of the
+    /// PC's speakers and a Cast speaker that is off has no note.
+    // covers: S246
+    #[test]
+    fn a_cast_member_off_beside_a_local_speaker_has_no_note() {
+        let mut backend = MockBackend::zones_preview();
+        backend.add_zone("zone:pc", "PC", &["local:speakers", "cc:attic"]);
+        backend.retain_speakers(|s| s.id != "cc:porch");
+        let app = app_over(backend);
+        let state = app.snapshot();
+        let zone = state.zones.iter().find(|z| z.id == "zone:pc").unwrap();
+        assert!(state.speaker("local:speakers").unwrap().enabled);
+        let attic = state.speaker("cc:attic").unwrap();
+        assert!(!attic.enabled);
+        assert_eq!(
+            state.zone_note(zone, ui_model::ZoneRow::Listed(attic)),
+            None,
+            "no Cast speaker is on, so nothing kept this one off"
+        );
+    }
+
+    #[test]
+    fn a_zone_header_counts_its_speakers() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        assert_eq!(
+            strings.invoke_zone_count(2, 5, 1, 4, 0),
+            "2 of 5 on, 1 waiting"
+        );
+        assert_eq!(strings.invoke_zone_count(1, 3, 0, 2, 0), "1 of 3 on");
+        assert_eq!(strings.invoke_zone_count(0, 3, 0, 0, 0), "None of 3 found");
+        assert_eq!(strings.invoke_zone_count(0, 3, 0, 0, 2), "None of 3 found");
+        assert_eq!(
+            strings.invoke_zone_count(0, 1, 0, 0, 1),
+            "1 playing in a pair"
+        );
+        assert_eq!(
+            strings.invoke_zone_value(2, 5, 1),
+            "2 of 5 speakers on, 1 waiting"
+        );
+        assert_eq!(strings.invoke_zone_value(1, 1, 0), "1 of 1 speaker on");
+        assert_eq!(
+            strings.invoke_zone_value(1, 1, 1),
+            "1 of 1 speaker on, 1 waiting"
+        );
+        assert_eq!(
+            strings.invoke_zone_label("Living Room".into()),
+            "Living Room, zone"
+        );
+    }
+
+    // covers: S247
+    #[test]
+    fn a_zone_whose_members_all_play_in_a_pair_says_so() {
+        use i_slint_backend_testing::ElementHandle;
+        let pair = MockBackend::zones_preview()
+            .snapshot()
+            .speaker("airplay:left")
+            .and_then(|s| s.in_target.clone());
+        let mut backend = MockBackend::new();
+        let state = backend.snapshot();
+        let members = ["airplay:kitchen", "airplay:bedroom"];
+        backend.retain_speakers(|s| !members.contains(&s.id.as_str()));
+        for id in members {
+            let mut member = state.speaker(id).unwrap().clone();
+            member.enabled = false;
+            member.in_target = pair.clone();
+            backend.add_speaker(member);
+        }
+        backend.add_zone("zone:upstairs", "Upstairs", &members);
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        // What Narrator reads from the zone's arrow, folded or not.
+        fn arrow_values(window: &impl ComponentHandle) -> Vec<String> {
+            ["Hide speakers in Upstairs", "Show speakers in Upstairs"]
+                .into_iter()
+                .flat_map(|label| ElementHandle::find_by_accessible_label(window, label))
+                .map(|arrow| arrow.accessible_value().unwrap_or_default().into())
+                .collect()
+        }
+        assert_eq!(arrow_values(&app.main), ["2 playing in a pair"]);
+        assert_eq!(arrow_values(&app.flyout), ["2 playing in a pair"]);
+    }
+
+    // covers: S223
+    #[test]
+    fn a_zone_whose_speaker_waits_for_a_pin_names_the_speaker_not_the_zone() {
+        use i_slint_backend_testing::ElementHandle;
+        fn header_notes(window: &impl ComponentHandle) -> Vec<String> {
+            ElementHandle::find_by_accessible_label(window, "Living Room, zone")
+                .filter_map(|header| header.accessible_description())
+                .map(|note| note.to_string())
+                .collect()
+        }
+        let mut backend = MockBackend::new();
+        backend.set_running(true);
+        let mut tv = backend
+            .snapshot()
+            .speaker("airplay:kitchen")
+            .unwrap()
+            .clone();
+        tv.id = "airplay:tv".into();
+        tv.name = "Den TV".into();
+        tv.enabled = true;
+        tv.waiting = Some(ui_model::Waiting::ForPin);
+        backend.add_speaker(tv);
+        backend.add_zone("zone:living", "Living Room", &["airplay:tv"]);
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        let pin = "Enter the code shown on Den TV".to_owned();
+        assert_eq!(header_notes(&app.main), vec![pin.clone()]);
+        assert_eq!(header_notes(&app.flyout), vec![pin]);
+    }
+
+    // covers: S359
+    #[test]
+    fn go_to_zone_with_no_member_found_lands_on_the_arrow_which_folds_it() {
+        let mut backend = MockBackend::new();
+        backend.add_zone("zone:garage", "Garage", &["airplay:not-here"]);
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        draw_frames();
+        let expanded = || {
+            app.models
+                .zones
+                .iter()
+                .find(|zone| zone.id == "zone:garage")
+                .expect("the zone is listed")
+                .expanded
+        };
+        assert!(expanded());
+
+        app.main.set_focus_zone_part(RowPart::Toggle);
+        app.main.set_focus_zone_id("zone:garage".into());
+        draw_frames();
+        assert_eq!(
+            app.main_focus.borrow().zone,
+            Some(("zone:garage".into(), RowPart::Arrow)),
+            "the arrow stands in for the toggle, which has nothing to switch"
+        );
+        press(app.main.window(), " ");
+        assert!(!expanded(), "Space folded the zone");
+        press(app.main.window(), Key::Return);
+        assert!(expanded(), "Enter unfolded it");
+    }
+
+    // covers: S152, S383
+    #[test]
+    fn the_auto_connect_mark_is_read_by_narrator_and_follows_the_auto_connect_setting() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        app.main
+            .window()
+            .set_size(slint::PhysicalSize::new(1000, 2000));
+        draw_frames();
+        let marks = || {
+            ElementHandle::find_by_accessible_label(&app.main, "Auto-Connect When Available")
+                .count()
+        };
+        assert_eq!(marks(), 1, "Kitchen is set to auto-connect");
+
+        app.main
+            .invoke_auto_connect_toggled("local:desk".into(), true);
+        draw_frames();
+        assert_eq!(marks(), 2, "the USB speaker's mark shows right away");
+
+        app.main
+            .invoke_auto_connect_toggled("airplay:kitchen".into(), false);
+        app.main
+            .invoke_auto_connect_toggled("local:desk".into(), false);
+        draw_frames();
+        assert_eq!(marks(), 0, "both marks went with the setting");
+    }
+
+    // covers: S359
+    #[test]
+    fn a_zone_header_folds_and_unfolds_through_its_accessibility_actions() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::zones_preview());
+        app.main.show().unwrap();
+        draw_frames();
+        let expanded = || {
+            app.models
+                .zones
+                .iter()
+                .find(|zone| zone.id == "zone:living")
+                .expect("the zone is listed")
+                .expanded
+        };
+        let element = |label: &str| {
+            ElementHandle::find_by_accessible_label(&app.main, label)
+                .next()
+                .unwrap_or_else(|| panic!("nothing is labeled {label}"))
+        };
+        assert!(expanded());
+
+        // UI Automation offers Invoke only on a node with no expanded state,
+        // and Slint 1.18 passes no collapse action on.
+        let arrow = element("Hide speakers in Living Room");
+        assert_ne!(
+            arrow.accessible_expandable(),
+            Some(true),
+            "UI Automation can't fold through an expandable arrow"
+        );
+        arrow.invoke_accessible_default_action();
+        draw_frames();
+        assert!(!expanded(), "Invoke on the arrow folded the zone");
+
+        let arrow = element("Show speakers in Living Room");
+        assert_ne!(arrow.accessible_expandable(), Some(true));
+        arrow.invoke_accessible_default_action();
+        draw_frames();
+        assert!(expanded(), "Invoke on the arrow unfolded it");
+
+        app.main
+            .invoke_zone_expanded_changed("zone:living".into(), false);
+        draw_frames();
+        let toggle = element("Living Room, zone");
+        assert_eq!(toggle.accessible_expanded(), Some(false));
+        toggle.invoke_accessible_expand_action();
+        draw_frames();
+        assert!(expanded(), "Expand on the zone's toggle unfolded it");
+    }
+
+    // covers: S359
+    #[test]
+    fn a_flyout_zone_header_folds_and_unfolds_through_its_accessibility_actions() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::zones_preview());
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        let expanded = || {
+            app.models
+                .flyout_zones
+                .iter()
+                .find(|zone| zone.id == "zone:living")
+                .expect("the zone is listed")
+                .expanded
+        };
+        let element = |label: &str| {
+            ElementHandle::find_by_accessible_label(&app.flyout, label)
+                .next()
+                .unwrap_or_else(|| panic!("nothing in the flyout is labeled {label}"))
+        };
+        assert!(expanded());
+
+        let arrow = element("Hide speakers in Living Room");
+        assert_ne!(
+            arrow.accessible_expandable(),
+            Some(true),
+            "UI Automation can't fold through an expandable arrow"
+        );
+        arrow.invoke_accessible_default_action();
+        draw_frames();
+        assert!(!expanded(), "Invoke on the flyout's arrow folded the zone");
+
+        let arrow = element("Show speakers in Living Room");
+        assert_ne!(arrow.accessible_expandable(), Some(true));
+        arrow.invoke_accessible_default_action();
+        draw_frames();
+        assert!(expanded(), "Invoke on the flyout's arrow unfolded it");
+
+        app.flyout
+            .invoke_zone_expanded_changed("zone:living".into(), false);
+        draw_frames();
+        let toggle = element("Living Room, zone");
+        assert_eq!(toggle.accessible_expanded(), Some(false));
+        toggle.invoke_accessible_expand_action();
+        draw_frames();
+        assert!(expanded(), "Expand on the flyout zone's toggle unfolded it");
+    }
+
+    // covers: S359
+    #[test]
+    fn tab_stops_on_a_main_window_zone_arrow_with_a_member_present_where_space_and_enter_fold() {
+        let app = app_over(MockBackend::zones_preview());
+        app.main.show().unwrap();
+        draw_frames();
+        let window = app.main.window();
+        let mut zone = None;
+        for _ in 0..100 {
+            press(window, Key::Tab);
+            if let Some((id, RowPart::Arrow)) = app.main_focus.borrow().zone.clone() {
+                zone = Some(id);
+                break;
+            }
+        }
+        let zone = zone.expect("Tab reaches a zone header");
+        let item = || {
+            app.models
+                .zones
+                .iter()
+                .find(|item| item.id == zone)
+                .expect("the zone is listed")
+        };
+        assert!(item().present > 0, "a member is present");
+        assert!(item().expanded);
+
+        press(window, " ");
+        assert!(
+            !item().expanded,
+            "Space on the header's first stop folded the zone"
+        );
+        press(window, Key::Return);
+        assert!(item().expanded, "Enter unfolded it");
+    }
+
+    // covers: S359
+    #[test]
+    fn a_zone_arrow_keeps_the_focus_when_another_zone_is_deleted() {
+        let app = app_over(MockBackend::zones_preview());
+        app.main.show().unwrap();
+        draw_frames();
+        let window = app.main.window();
+        for _ in 0..100 {
+            press(window, Key::Tab);
+            if app.main_focus.borrow().zone.is_some() {
+                break;
+            }
+        }
+        let living = || {
+            app.models
+                .zones
+                .iter()
+                .find(|item| item.id == "zone:living")
+                .expect("the zone is listed")
+        };
+        assert!(living().present > 0, "a member is present");
+        assert!(living().expanded);
+
+        app.main.invoke_zone_deleted("zone:office".into());
+        draw_frames();
+        press(window, " ");
+        assert!(
+            !living().expanded,
+            "Space on the arrow folded the zone after the cards were rebuilt"
+        );
+    }
+
+    // covers: S359
+    #[test]
+    fn tab_stops_on_a_flyout_zone_arrow_with_a_member_present_where_space_and_enter_fold() {
+        let app = app_over(MockBackend::zones_preview());
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        app.flyout.invoke_take_focus();
+        let window = app.flyout.window();
+        for _ in 0..100 {
+            if app.flyout.get_zone_focused() {
+                break;
+            }
+            press(window, Key::Tab);
+        }
+        assert!(app.flyout.get_zone_focused(), "Tab reaches a zone header");
+        let item = || {
+            app.models
+                .flyout_zones
+                .iter()
+                .find(|item| item.id == "zone:living")
+                .expect("the zone is listed")
+        };
+        assert!(item().present > 0, "a member is present");
+        assert!(item().expanded);
+
+        press(window, " ");
+        assert!(
+            !item().expanded,
+            "Space on the header's first stop folded the zone"
+        );
+        press(window, Key::Return);
+        assert!(item().expanded, "Enter unfolded it");
+    }
+
+    // covers: S359
+    #[test]
+    fn a_zone_volume_works_while_none_of_its_members_is_present() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        backend.add_zone("zone:garage", "Garage", &["airplay:not-here"]);
+        backend.add_zone("zone:empty", "Empty", &[]);
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        draw_frames();
+        let enabled = |label: &str| {
+            ElementHandle::find_by_accessible_label(&app.main, label)
+                .next()
+                .unwrap_or_else(|| panic!("nothing is labeled {label}"))
+                .accessible_enabled()
+        };
+        assert_eq!(enabled("Garage volume"), Some(true), "as on the Mac");
+        assert_eq!(
+            enabled("Empty volume"),
+            Some(false),
+            "a zone with no member"
+        );
+    }
+
+    // covers: S359
+    #[test]
+    fn the_main_window_and_the_flyout_each_keep_their_own_zone_fold_state() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::zones_preview());
+        app.main.show().unwrap();
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        fn shows(window: &impl ComponentHandle, label: &str) -> bool {
+            ElementHandle::find_by_accessible_label(window, label)
+                .next()
+                .is_some()
+        }
+        let (main, flyout) = (&app.main, &app.flyout);
+        let fold = "Hide speakers in Living Room";
+        let unfold = "Show speakers in Living Room";
+
+        app.flyout
+            .invoke_zone_expanded_changed("zone:living".into(), false);
+        draw_frames();
+        assert!(shows(flyout, unfold), "the flyout folded the zone");
+        assert!(shows(main, fold), "the main window keeps it unfolded");
+
+        app.main
+            .invoke_zone_expanded_changed("zone:living".into(), false);
+        app.flyout
+            .invoke_zone_expanded_changed("zone:living".into(), true);
+        draw_frames();
+        assert!(shows(flyout, fold), "the flyout unfolded the zone");
+        assert!(shows(main, unfold), "the main window keeps it folded");
+    }
+
+    // covers: S245
+    #[test]
+    fn move_to_zone_lists_only_the_zones_the_speaker_is_not_in() {
+        let mut backend = MockBackend::new();
+        backend.add_zone("zone:office", "Office", &["local:desk"]);
+        backend.add_zone("zone:garage", "Garage", &["airplay:not-here"]);
+        let app = app_over(backend);
+        let names = |row: SpeakerItem| -> Vec<String> {
+            row.move_zones
+                .iter()
+                .map(|zone| zone.name.to_string())
+                .collect()
+        };
+        assert_eq!(names(zone_member_row(&app, "local:desk")), ["Garage"]);
+        assert_eq!(names(in_zones_row(&app, "local:desk")), ["Garage"]);
+        assert_eq!(names(zone_member_row(&app, "airplay:not-here")), ["Office"]);
+        assert_eq!(names(row_of(&app, "airplay:kitchen")), ["Office", "Garage"]);
+    }
+
+    // covers: S150, S245, S359
+    #[test]
+    fn speakers_move_between_zones_and_back_from_their_menus() {
+        let app = app_over(MockBackend::zones_preview());
+        let main = &app.main;
+        main.invoke_speaker_move_to_zone_requested("local:speakers".into(), "zone:office".into());
+        let state = app.snapshot();
+        assert_eq!(
+            state.zone_of("local:speakers").map(|zone| zone.id.as_str()),
+            Some("zone:office")
+        );
+        assert!(
+            app.models
+                .this_pc
+                .iter()
+                .all(|row| row.id != "local:speakers")
+        );
+        let office = app.models.zones.row_data(2).unwrap();
+        assert_eq!(office.members.row_data(0).unwrap().zone_id, "zone:office");
+
+        main.invoke_zone_expanded_changed("zone:office".into(), false);
+        assert!(!app.models.zones.row_data(2).unwrap().expanded);
+        main.invoke_zone_expanded_changed("zone:office".into(), true);
+        assert!(app.models.zones.row_data(2).unwrap().expanded);
+        app.flyout
+            .invoke_zone_expanded_changed("zone:office".into(), false);
+        assert!(!app.models.flyout_zones.row_data(2).unwrap().expanded);
+        app.flyout
+            .invoke_zone_expanded_changed("zone:office".into(), true);
+        assert!(app.models.flyout_zones.row_data(2).unwrap().expanded);
+
+        main.invoke_speaker_remove_from_zone_requested("local:speakers".into());
+        assert!(app.snapshot().zone_of("local:speakers").is_none());
+        assert!(
+            app.models
+                .this_pc
+                .iter()
+                .any(|row| row.id == "local:speakers")
+        );
+
+        main.invoke_speaker_new_zone_requested("local:headphones".into());
+        assert!(app.zone_dialog.window().is_visible());
+        app.confirm_dialog("  ");
+        let state = app.snapshot();
+        let zone = state
+            .zone_of("local:headphones")
+            .expect("a zone of its own");
+        assert_eq!(zone.name, "Zone 4", "named after the zones there are");
+
+        let id = zone.id.clone();
+        main.invoke_zone_deleted(id.as_str().into());
+        assert!(app.snapshot().zone_of("local:headphones").is_none());
+        assert_eq!(app.models.zones.row_count(), 3);
+    }
+
+    // covers: S150, S228
+    #[test]
+    fn a_zone_is_renamed_from_its_menu_in_its_header_like_a_speaker() {
+        let app = app_over(MockBackend::zones_preview());
+        let office = || app.models.zones.row_data(2).unwrap();
+        app.main.invoke_zone_rename_requested("zone:office".into());
+        assert!(!app.zone_dialog.window().is_visible(), "no dialog");
+        assert!(office().renaming && office().name_text == "Office");
+        slint::platform::update_timers_and_animations();
+        assert_eq!(app.main.get_focus_zone_part(), RowPart::Name);
+
+        app.main
+            .invoke_zone_rename_edited("zone:office".into(), "Study".into());
+        app.main.invoke_zone_rename_committed("zone:office".into());
+        assert_eq!(office().name, "Study");
+        assert!(!office().renaming);
+
+        app.main.invoke_zone_rename_requested("zone:office".into());
+        app.main
+            .invoke_zone_rename_edited("zone:office".into(), "Den".into());
+        app.main.invoke_zone_rename_cancelled("zone:office".into());
+        assert_eq!(office().name, "Study", "Escape keeps the name");
+
+        app.main.invoke_zone_rename_requested("zone:office".into());
+        app.main
+            .invoke_zone_rename_edited("zone:office".into(), "  ".into());
+        app.main.invoke_zone_rename_committed("zone:office".into());
+        assert_eq!(office().name, "Study", "a blank name keeps it too");
+
+        app.main.invoke_zone_rename_requested("zone:office".into());
+        app.main
+            .invoke_speaker_rename_requested("airplay:living".into());
+        assert_eq!(office().name, "Study");
+        assert!(
+            !office().renaming,
+            "a speaker's rename closes the zone's field"
+        );
+        assert!(row_of(&app, "airplay:living").renaming);
+        app.main.invoke_zone_rename_requested("zone:office".into());
+        assert!(!row_of(&app, "airplay:living").renaming, "and back");
+        assert!(office().renaming);
+
+        app.main.invoke_zone_deleted("zone:office".into());
+        assert!(
+            app.ui.borrow().rename.is_none(),
+            "a deleted zone's field goes"
+        );
+    }
+
+    // covers: S150
+    #[test]
+    fn the_zone_name_field_stops_at_sixty_characters_while_typing() {
+        let app = app_over(MockBackend::zones_preview());
+        app.main.show().unwrap();
+        draw_frames();
+        app.main.invoke_zone_rename_requested("zone:office".into());
+        draw_frames();
+        for _ in 0..65 {
+            press(app.main.window(), "a");
+        }
+        let sixty = "a".repeat(60);
+        assert_eq!(
+            app.ui.borrow().rename,
+            Some(("zone:office".to_owned(), sixty.clone()))
+        );
+        press(app.main.window(), Key::Return);
+        assert_eq!(app.models.zones.row_data(2).unwrap().name.as_str(), sixty);
+    }
+
+    // covers: S247
+    #[test]
+    fn use_target_instead_swaps_the_member_for_its_pair() {
+        let app = app_over(MockBackend::zones_preview());
+        app.main
+            .invoke_zone_use_target_requested("airplay:left".into());
+        let upstairs = app.models.zones.row_data(1).unwrap();
+        assert_eq!(upstairs.members.row_count(), 2);
+        assert_eq!(upstairs.targets.row_count(), 0);
+    }
+
+    // covers: S255
+    #[test]
+    fn a_zone_run_is_ticked_once_it_starts() {
+        let app = app_over(MockBackend::zones_preview());
+        app.main
+            .invoke_zone_calibrate_requested("zone:living".into());
+        assert!(app.snapshot().calibration.busy);
+        assert!(
+            app.calibration_timer.running(),
+            "a run that no tick moves on stalls at its first step"
+        );
+    }
+
+    // covers: S255
+    #[test]
+    fn calibrate_zone_is_offered_for_a_zone_with_a_member_here() {
+        let app = app_over(MockBackend::zones_preview());
+        assert!(app.models.zones.row_data(0).unwrap().can_calibrate);
+        assert!(
+            !app.models.zones.row_data(2).unwrap().can_calibrate,
+            "none of the office's members is here"
+        );
+    }
+
+    // covers: S255
+    #[test]
+    fn the_calibrate_all_card_of_a_zone_run_names_the_zone() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let mut state = app.snapshot();
+        state.calibrate_all.phase = AllPhase::Failed(Failure::NothingToMeasure);
+        state.calibrate_all.zone = Some(ui_model::ZoneSheet {
+            name: "Upstairs".into(),
+            off_rows: Vec::new(),
+            airplay_moves: AirPlayMoves {
+                zones: vec!["Kitchen".into(), "Garden".into()],
+                no_zone: true,
+            },
+        });
+        let card = calibrate_all_card(&strings, &state);
+        assert_eq!(
+            card.status,
+            "Nothing to measure in “Upstairs”. Turn on a speaker in this zone first. No delay was changed."
+        );
+        assert!(
+            card.zone.starts_with("Bring the PC into “Upstairs”"),
+            "{}",
+            card.zone
+        );
+        let moves = |zones: &[&str], no_zone| {
+            let moves = AirPlayMoves {
+                zones: zones.iter().map(|name| (*name).to_owned()).collect(),
+                no_zone,
+            };
+            airplay_moves_line(&strings, &moves).map(|line| line.to_string())
+        };
+        let share = "AirPlay speakers share one delay, so a new AirPlay delay applies to ";
+        assert_eq!(moves(&[], false), None);
+        assert_eq!(
+            moves(&[], true).unwrap(),
+            format!("{share}the AirPlay speakers in no zone too.")
+        );
+        assert_eq!(
+            moves(&["Kitchen", "Garden"], true).unwrap(),
+            format!(
+                "{share}the AirPlay speakers in “Kitchen” and “Garden”, and those in no zone too."
+            )
+        );
+
+        let row = |name: &str, state| SheetRow {
+            name: name.into(),
+            class: Class::Local,
+            old_ms: Some(0.0),
+            state,
+            can_measure_again: true,
+        };
+        state.calibrate_all.phase = AllPhase::Idle;
+        state.calibrate_all.sheet = Some(SheetState {
+            rows: vec![
+                row("Speakers", SheetRowState::Reference),
+                row("TV", SheetRowState::NotMeasured),
+                row("Desk", SheetRowState::NotMeasured),
+            ],
+            airplay: None,
+            ended: None,
+            failure: None,
+            again_ended: None,
+            can_apply: false,
+            applied: false,
+            can_undo: false,
+            undone: false,
+        });
+        if let Some(zone) = state.calibrate_all.zone.as_mut() {
+            zone.off_rows = vec![1];
+        }
+        let card = calibrate_all_card(&strings, &state);
+        assert_eq!(
+            card.rows[1].detail,
+            "Off, so it wasn't measured. Turn it on and choose Measure Again."
+        );
+        assert_eq!(
+            card.rows[2].detail,
+            strings.get_calibrate_all_not_measured()
+        );
+
+        state.calibrate_all.zone = None;
+        let card = calibrate_all_card(&strings, &state);
+        assert!(card.zone.is_empty());
+        assert_eq!(
+            card.rows[1].detail,
+            strings.get_calibrate_all_not_measured()
+        );
+        assert!(!card.status.contains("Upstairs"), "a whole run's text");
+    }
+
+    #[test]
+    fn the_flyout_lists_only_the_newest_notice() {
+        let mut backend = MockBackend::new();
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        backend.post("start", NoticeMessage::NoSpeaker, "09.41");
+        let notices = backend.snapshot().notices;
+        let flyout = newest_notices(&notices, FLYOUT_NOTICE_LIMIT);
+        let messages: Vec<_> = flyout.iter().map(|n| n.message.clone()).collect();
+        // One row: the stack draws no Dismiss All row under it, and the
+        // flyout's button opens the main window for the other notice.
+        assert_eq!(messages, [NoticeMessage::NoSpeaker]);
+        assert_eq!(newest_notices(&notices, MAIN_NOTICE_LIMIT).len(), 2);
+    }
+
+    #[test]
+    fn the_pin_field_keeps_four_digits_at_most() {
+        assert_eq!(pin_digits("4821"), "4821");
+        assert_eq!(pin_digits("48a2-1"), "4821");
+        assert_eq!(pin_digits("482199"), "4821");
+        assert_eq!(pin_digits(" ١٢ "), "", "ASCII digits only");
+        assert_eq!(pin_digits(""), "");
+    }
+
+    #[test]
+    fn output_names_read_as_a_list() {
+        let and = |head: &str, last: &str| format!("{head} and {last}");
+        let names =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|name| (*name).to_owned()).collect() };
+        assert_eq!(join_names(&names(&[]), ", ", and), "");
+        assert_eq!(join_names(&names(&["TV"]), ", ", and), "TV");
+        assert_eq!(
+            join_names(&names(&["TV", "Speakers"]), ", ", and),
+            "TV and Speakers"
+        );
+        assert_eq!(
+            join_names(&names(&["TV", "Speakers", "Monitor"]), ", ", and),
+            "TV, Speakers and Monitor"
+        );
+    }
+
+    #[test]
+    fn list_commas_and_zone_quotes_come_from_the_strings() {
+        let view = include_str!("view.rs");
+        let code: String = view[..view.find("#[cfg(test)]").expect("the tests")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        for written in [concat!("\"", ", ", "\""), "}, {", "\u{201c}", "\u{201d}"] {
+            assert!(!code.contains(written), "{written:?} is written in view.rs");
+        }
+    }
+
+    #[test]
+    fn guide_buttons_ask_for_the_page_their_step_names() {
+        for page in [
+            None,
+            Some(SettingsPage::VolumeMixer),
+            Some(SettingsPage::Sound),
+        ] {
+            assert_eq!(settings_page(guide_page(page)), page);
+        }
+        let message = guide::preview("app").unwrap();
+        let pages: Vec<GuidePage> = guide::guide(&message)
+            .unwrap()
+            .steps
+            .iter()
+            .map(|step| guide_page(step.page()))
+            .collect();
+        assert_eq!(
+            pages,
+            [GuidePage::VolumeMixer, GuidePage::Sound, GuidePage::None]
+        );
+    }
+
+    #[test]
+    fn models_update_in_place_when_the_length_is_unchanged() {
+        let model = VecModel::from(vec![1, 2, 3]);
+        sync_model(&model, vec![1, 5, 3]);
+        assert_eq!(model.iter().collect::<Vec<_>>(), [1, 5, 3]);
+        sync_model(&model, vec![4]);
+        assert_eq!(model.iter().collect::<Vec<_>>(), [4]);
+    }
+
+    /// The flyout with two notices (it lists the newest), one zone, one
+    /// speaker of this PC's and three connected ones.
+    const FLYOUT: FlyoutCounts = FlyoutCounts {
+        notices: 2,
+        listed_notices: 1,
+        zones: 1,
+        this_pc: 1,
+        speakers: 3,
+        zone_members: 1,
+        add_address: false,
+        network_settings: false,
+    };
+
+    #[test]
+    fn a_refresh_removes_the_flyout_lists_whose_length_changes() {
+        assert_eq!(FLYOUT.removed_by(FLYOUT), FlyoutParts::default());
+        // A Google Cast speaker is found: the Add by Address link goes.
+        let add_address = FlyoutCounts {
+            add_address: true,
+            ..FLYOUT
+        };
+        assert_eq!(
+            add_address.removed_by(FLYOUT),
+            FlyoutParts {
+                add_address: true,
+                ..FlyoutParts::default()
+            }
+        );
+        assert_eq!(FLYOUT.removed_by(add_address), FlyoutParts::default());
+        // A speaker is found: the Open Network Settings link goes.
+        let network_settings = FlyoutCounts {
+            network_settings: true,
+            ..FLYOUT
+        };
+        assert_eq!(
+            network_settings.removed_by(FLYOUT),
+            FlyoutParts {
+                network_settings: true,
+                ..FlyoutParts::default()
+            }
+        );
+        let unplugged = FlyoutCounts {
+            speakers: 2,
+            ..FLYOUT
+        };
+        assert_eq!(
+            FLYOUT.removed_by(unplugged),
+            FlyoutParts {
+                speakers: true,
+                ..FlyoutParts::default()
+            }
+        );
+        let headphones_unplugged = FlyoutCounts {
+            this_pc: 0,
+            ..FLYOUT
+        };
+        assert!(
+            FLYOUT.removed_by(headphones_unplugged).speakers,
+            "this PC's rows are speaker rows too"
+        );
+        let zone_added = FlyoutCounts { zones: 2, ..FLYOUT };
+        assert!(FLYOUT.removed_by(zone_added).zones, "rows are rebuilt");
+        let member_moved = FlyoutCounts {
+            zone_members: 2,
+            ..FLYOUT
+        };
+        assert!(
+            FLYOUT.removed_by(member_moved).speakers,
+            "a zone's member rows are rebuilt"
+        );
+    }
+
+    // covers: S359
+    #[test]
+    fn folding_a_zone_in_the_flyout_removes_its_member_rows() {
+        assert_eq!(listed_members(true, 3), 3);
+        assert_eq!(listed_members(false, 3), 0);
+        let open = FlyoutCounts {
+            zone_members: zone_shape([listed_members(true, 2)].into_iter()),
+            ..FLYOUT
+        };
+        let folded = FlyoutCounts {
+            zone_members: zone_shape([listed_members(false, 2)].into_iter()),
+            ..FLYOUT
+        };
+        assert!(
+            open.removed_by(folded).speakers,
+            "a member that had the focus gives it back"
+        );
+        let empty_open = FlyoutCounts {
+            zone_members: zone_shape([listed_members(true, 0)].into_iter()),
+            ..FLYOUT
+        };
+        let empty_folded = FlyoutCounts {
+            zone_members: zone_shape([listed_members(false, 0)].into_iter()),
+            ..FLYOUT
+        };
+        assert_eq!(
+            empty_open.removed_by(empty_folded),
+            FlyoutParts::default(),
+            "an empty zone has no rows to remove"
+        );
+    }
+
+    #[test]
+    fn dismissing_notices_removes_the_more_button_then_the_last_notice() {
+        // The newest notice is dismissed: the next one takes its row, and
+        // the button for the rest goes.
+        let one_left = FlyoutCounts {
+            notices: 1,
+            ..FLYOUT
+        };
+        assert_eq!(
+            FLYOUT.removed_by(one_left),
+            FlyoutParts {
+                more_notices: true,
+                ..FlyoutParts::default()
+            }
+        );
+        let none_left = FlyoutCounts {
+            notices: 0,
+            listed_notices: 0,
+            ..FLYOUT
+        };
+        assert_eq!(
+            one_left.removed_by(none_left),
+            FlyoutParts {
+                notices: true,
+                ..FlyoutParts::default()
+            }
+        );
+        assert!(!none_left.removed_by(FLYOUT).more_notices, "it came back");
+    }
+
+    #[test]
+    fn the_flyout_takes_the_focus_back_only_from_a_removed_part() {
+        let notice = FlyoutParts {
+            notices: true,
+            ..FlyoutParts::default()
+        };
+        let speakers = FlyoutParts {
+            speakers: true,
+            ..FlyoutParts::default()
+        };
+        assert!(notice.overlaps(notice));
+        assert!(
+            !speakers.overlaps(FlyoutParts {
+                notices: true,
+                more_notices: true,
+                zones: true,
+                speakers: false,
+                add_address: true,
+                network_settings: true,
+            }),
+            "a focused speaker row keeps its focus when other parts change"
+        );
+        assert!(!FlyoutParts::default().overlaps(notice), "nothing focused");
+    }
+
+    #[test]
+    fn escape_on_the_pin_dialog_buttons_cancels() {
+        let app = app_over(MockBackend::new());
+        app.preview_pin(false);
+        let window = app.pin_dialog.window();
+        assert!(window.is_visible());
+        // From the field to Cancel: Pair waits for four digits.
+        tab(window, 1);
+        press(window, "5");
+        assert_eq!(app.pin_dialog.get_pin(), "", "the field lost the focus");
+        press(window, Key::Escape);
+        assert!(!window.is_visible(), "Escape on Cancel closed the dialog");
+        assert!(!app.pin_preview.get(), "through its Cancel path");
+    }
+
+    /// The App over the example data with Kitchen asking for its password.
+    fn app_asking_password(wrong: bool) -> Rc<App> {
+        let mut backend = MockBackend::new();
+        backend.ask_password("airplay:kitchen", wrong);
+        app_over(backend)
+    }
+
+    #[test]
+    fn the_password_dialog_pairs_with_what_was_typed() {
+        let app = app_asking_password(false);
+        let window = app.password_dialog.window();
+        assert!(window.is_visible(), "it opens with the prompt");
+        assert!(!app.password_dialog.get_wrong());
+        press(window, Key::Return);
+        assert!(window.is_visible(), "Enter waits for a password");
+        for key in ["p", "w"] {
+            press(window, key);
+        }
+        press(window, Key::Return);
+        assert!(!window.is_visible());
+        assert_eq!(
+            app.password_dialog.get_password(),
+            "",
+            "not kept in the field"
+        );
+        let state = app.snapshot();
+        assert_eq!(state.password_prompt, None);
+        assert!(state.speaker("airplay:kitchen").unwrap().enabled);
+    }
+
+    /// Moves the main window's focus without running its `changed has-focus`
+    /// handlers, as a UI Automation client's focus and toggle in one turn
+    /// leave them, then turns `id` on: showing a dialog runs those handlers.
+    fn turn_on_with_a_focus_change_pending(app: &App, id: &str) {
+        app.main.show().unwrap();
+        draw_frames();
+        app.main.invoke_focus_streaming_switch();
+        app.main.invoke_speaker_toggled(id.into());
+    }
+
+    #[test]
+    fn a_focus_change_pending_as_the_pin_dialog_opens_is_handled() {
+        let app = app_over(MockBackend::new());
+        turn_on_with_a_focus_change_pending(&app, "airplay:living");
+        assert!(app.pin_dialog.window().is_visible());
+    }
+
+    #[test]
+    fn a_focus_change_pending_as_the_password_dialog_opens_is_handled() {
+        let mut backend = MockBackend::new();
+        backend.ask_password_when_on("airplay:kitchen");
+        let app = app_over(backend);
+        turn_on_with_a_focus_change_pending(&app, "airplay:kitchen");
+        assert!(app.password_dialog.window().is_visible());
+    }
+
+    #[test]
+    fn escape_on_the_password_dialog_cancels_from_the_field_or_a_button() {
+        for tabs in [0, 2] {
+            let app = app_asking_password(true);
+            let window = app.password_dialog.window();
+            assert!(app.password_dialog.get_wrong(), "says it was turned down");
+            press(window, "x");
+            tab(window, tabs);
+            press(window, Key::Escape);
+            assert!(!window.is_visible(), "Escape closed it ({tabs} tabs)");
+            assert_eq!(app.password_dialog.get_password(), "");
+            let state = app.snapshot();
+            assert_eq!(state.password_prompt, None);
+            assert!(!state.speaker("airplay:kitchen").unwrap().enabled);
+        }
+    }
+
+    fn type_text(window: &slint::Window, text: &str) {
+        for character in text.chars() {
+            press(window, character.to_string());
+        }
+    }
+
+    // covers: C18
+    #[test]
+    fn add_by_address_keeps_a_turned_down_address_open_with_the_reason() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        app.main.invoke_cast_add_address_requested();
+        let dialog = &app.cast_address_dialog;
+        let window = dialog.window();
+        assert!(window.is_visible(), "Speakers > Add by Address… opens it");
+        assert_eq!(dialog.get_error(), "");
+
+        type_text(window, "not an address");
+        press(window, Key::Return);
+        assert!(window.is_visible(), "stays open");
+        assert_eq!(dialog.get_error(), strings.get_cast_address_invalid());
+        assert_eq!(
+            dialog.get_error(),
+            "That isn't an IP address or host name. Check it and try again."
+        );
+
+        // The field took the cursor back with its text selected.
+        type_text(window, "speaker.invalid");
+        press(window, Key::Return);
+        settle_cast_check(&app);
+        assert!(window.is_visible());
+        assert_eq!(
+            dialog.get_error(),
+            "AudioSync couldn't find a speaker at that address. Check that it's on and try again."
+        );
+
+        type_text(window, "speaker.local");
+        press(window, Key::Return);
+        settle_cast_check(&app);
+        assert!(!window.is_visible(), "Enter added it");
+        assert_eq!(dialog.get_address(), "", "the field is cleared");
+        let state = app.snapshot();
+        let row = state.speaker("cc:speaker.local").expect("listed");
+        assert!(row.cast.as_ref().is_some_and(|cast| cast.added_by_address));
+    }
+
+    /// Waits for the address check Add by Address… started, if any, and
+    /// takes its answer.
+    fn settle_cast_check(app: &App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.cast_check.borrow().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            app.take_cast_check();
+        }
+        draw_frames();
+    }
+
+    /// A probe wake later than this means the process went unscheduled; a
+    /// coarse timer oversleeps 1 ms by up to 15.6 ms (Windows).
+    const STALL: Duration = Duration::from_millis(20);
+
+    /// Wakes every millisecond until stopped and returns when it woke, so a
+    /// gap the whole process spent unscheduled on a loaded host shows.
+    fn scheduling_probe(
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<std::time::Instant>> {
+        std::thread::spawn(move || {
+            let mut wakes = vec![std::time::Instant::now()];
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+                wakes.push(std::time::Instant::now());
+            }
+            wakes
+        })
+    }
+
+    /// How much of `from..to` fell in probe waits longer than `STALL`.
+    fn unscheduled(
+        wakes: &[std::time::Instant],
+        from: std::time::Instant,
+        to: std::time::Instant,
+    ) -> Duration {
+        wakes
+            .windows(2)
+            .filter(|wait| wait[1].duration_since(wait[0]) > STALL)
+            .map(|wait| wait[1].min(to).saturating_duration_since(wait[0].max(from)))
+            .sum()
+    }
+
+    /// What the dialog's two live regions hold, in order.
+    fn cast_address_said(app: &App) -> (String, String) {
+        let dialog = &app.cast_address_dialog;
+        (dialog.get_said_odd().into(), dialog.get_said_even().into())
+    }
+
+    #[test]
+    fn every_turned_down_address_is_announced_even_with_the_same_reason() {
+        let app = app_over(MockBackend::new());
+        let invalid: String = app.strings().get_cast_address_invalid().into();
+        let not_found: String = app.strings().get_cast_address_not_found().into();
+        app.main.invoke_cast_add_address_requested();
+        let window = app.cast_address_dialog.window();
+        assert_eq!(cast_address_said(&app), (String::new(), String::new()));
+
+        type_text(window, "not an address");
+        press(window, Key::Return);
+        assert_eq!(cast_address_said(&app), (invalid.clone(), String::new()));
+
+        // The same reason again moves to the other region, which Narrator
+        // reads as new; text that only stayed the same it would skip.
+        type_text(window, "still not one");
+        press(window, Key::Return);
+        assert_eq!(cast_address_said(&app), (String::new(), invalid.clone()));
+
+        press(window, Key::Return);
+        assert_eq!(
+            cast_address_said(&app),
+            (invalid, String::new()),
+            "Enter on the same address"
+        );
+
+        type_text(window, "speaker.invalid");
+        press(window, Key::Return);
+        settle_cast_check(&app);
+        assert_eq!(cast_address_said(&app), (String::new(), not_found));
+
+        press(window, Key::Escape);
+        assert_eq!(cast_address_said(&app), (String::new(), String::new()));
+        app.main.invoke_cast_add_address_requested();
+        assert_eq!(
+            cast_address_said(&app),
+            (String::new(), String::new()),
+            "reopened with nothing to say"
+        );
+    }
+
+    #[test]
+    fn add_waits_for_an_address_and_enter_on_a_blank_field_does_nothing() {
+        let app = app_over(MockBackend::new());
+        app.main.invoke_cast_add_address_requested();
+        let dialog = &app.cast_address_dialog;
+        let window = dialog.window();
+        assert!(!dialog.get_can_add(), "Add is off on an empty field");
+        press(window, Key::Return);
+        type_text(window, "   ");
+        assert!(!dialog.get_can_add(), "spaces alone are no address");
+        press(window, Key::Return);
+        assert!(window.is_visible(), "Enter didn't add or close");
+        assert_eq!(dialog.get_error(), "", "no reason for an empty field");
+        assert_eq!(cast_address_said(&app), (String::new(), String::new()));
+
+        type_text(window, "speaker.local");
+        assert!(dialog.get_can_add());
+        press(window, Key::Return);
+        settle_cast_check(&app);
+        assert!(!window.is_visible(), "Enter added it");
+        assert!(app.snapshot().speaker("cc:speaker.local").is_some());
+    }
+
+    #[test]
+    fn add_by_address_waits_for_the_check_off_the_ui_thread_and_cancel_drops_its_answer() {
+        let stop_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = scheduling_probe(stop_probe.clone());
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let speakers = app.snapshot().speakers.len();
+        let dialog = &app.cast_address_dialog;
+        let window = dialog.window();
+        let hold = || {
+            MOCK_CAST_HOLD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+
+        let held = hold();
+        app.main.invoke_cast_add_address_requested();
+        type_text(window, "speaker.held");
+        press(window, Key::Return);
+        assert!(window.is_visible(), "open while the address is checked");
+        assert!(dialog.get_checking());
+        assert!(!dialog.get_can_add(), "Add is off during the check");
+        assert_eq!(strings.get_cast_address_checking(), "Checking…");
+        press(window, Key::Return);
+        assert!(app.snapshot().speaker("cc:speaker.held").is_none());
+        press(window, Key::Escape);
+        assert!(!window.is_visible(), "Escape closes it during the check");
+        assert!(!dialog.get_checking());
+        drop(held);
+        std::thread::sleep(Duration::from_millis(200));
+        draw_frames();
+        assert_eq!(
+            app.snapshot().speakers.len(),
+            speakers,
+            "the late answer is dropped"
+        );
+
+        let held = hold();
+        app.main.invoke_cast_add_address_requested();
+        assert!(!dialog.get_checking());
+        assert_eq!(dialog.get_error(), "");
+        type_text(window, "speaker.held");
+        press(window, Key::Return);
+        assert!(dialog.get_checking());
+        drop(held);
+        let let_go = std::time::Instant::now();
+        settle_cast_check(&app);
+        stop_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        let wakes = probe.join().expect("the probe");
+        if window.is_visible() {
+            let span = let_go.elapsed();
+            let starved = unscheduled(&wakes, let_go, let_go + span);
+            let what = format!(
+                "not added {span:?} after the check was let go (checking {}, error {:?})",
+                dialog.get_checking(),
+                dialog.get_error()
+            );
+            assert!(
+                starved * 2 <= span,
+                "inconclusive: {what}, the process went unscheduled for {starved:?} of it"
+            );
+            panic!("{what}, {starved:?} of it unscheduled");
+        }
+        assert!(!dialog.get_checking());
+        assert!(app.snapshot().speaker("cc:speaker.held").is_some());
+    }
+
+    #[test]
+    fn reopening_add_by_address_during_a_check_drops_the_old_answer() {
+        let app = app_over(MockBackend::new());
+        let speakers = app.snapshot().speakers.len();
+        let window = app.cast_address_dialog.window();
+        let held = MOCK_CAST_HOLD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        app.main.invoke_cast_add_address_requested();
+        type_text(window, "speaker.held");
+        press(window, Key::Return);
+        assert!(app.cast_address_dialog.get_checking());
+
+        app.ask_cast_address();
+        drop(held);
+        settle_cast_check(&app);
+        draw_frames();
+        assert!(window.is_visible(), "the reopened dialog stays open");
+        assert!(app.snapshot().speaker("cc:speaker.held").is_none());
+        assert_eq!(app.snapshot().speakers.len(), speakers);
+    }
+
+    #[test]
+    fn escape_on_the_add_by_address_dialog_cancels_from_the_field_or_a_button() {
+        for tabs in [0, 1, 2] {
+            let app = app_over(MockBackend::new());
+            let speakers = app.snapshot().speakers.len();
+            app.main.invoke_cast_add_address_requested();
+            let window = app.cast_address_dialog.window();
+            type_text(window, "speaker.local");
+            tab(window, tabs);
+            press(window, Key::Escape);
+            assert!(!window.is_visible(), "Escape closed it ({tabs} tabs)");
+            assert_eq!(app.snapshot().speakers.len(), speakers, "nothing added");
+        }
+    }
+
+    // covers: C18
+    #[test]
+    fn a_speaker_added_by_address_says_so_and_can_be_removed() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        app.update(|b| {
+            b.add_cast_address("192.0.2.20").expect("added");
+        });
+        let state = app.snapshot();
+        let speaker = state.speaker("cc:192.0.2.20").expect("listed");
+        let row = speaker_item(&state, speaker, true, false, None);
+        assert!(row.cast && row.cast_added_by_address);
+        assert!(!row.cast_group);
+        assert_eq!(strings.get_cast_added_by_address(), "Added by address");
+        assert_eq!(strings.get_cast_remove(), "Remove");
+        let desk = state.speaker("local:desk").unwrap();
+        assert!(!speaker_item(&state, desk, true, false, None).cast_added_by_address);
+
+        app.main
+            .invoke_cast_remove_requested("cc:192.0.2.20".into());
+        assert!(app.snapshot().speaker("cc:192.0.2.20").is_none());
+    }
+
+    /// A tray flyout row gives the note its main window row gives, for a
+    /// speaker that asks for a code every time and for a Google Cast speaker
+    /// added by address: Narrator hears it on the row's toggle, whose name
+    /// starts with the speaker's. The note's own text is hidden from Narrator.
+    #[test]
+    fn a_flyout_row_reads_the_main_windows_availability_and_cast_notes() {
+        use i_slint_backend_testing::ElementQuery;
+        let mut backend = MockBackend::new();
+        backend.set_code_every_time("airplay:bedroom");
+        let app = app_over(backend);
+        app.update(|b| {
+            b.add_cast_address("192.0.2.20").expect("added");
+        });
+        app.main.show().unwrap();
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        let state = app.snapshot();
+        for (id, note) in [
+            ("airplay:bedroom", "Asks for a code every time"),
+            ("cc:192.0.2.20", "Added by address"),
+        ] {
+            let name = state.speaker(id).expect("listed").name.clone();
+            let reads = |root: ElementQuery| {
+                let name = name.clone();
+                !root
+                    .match_predicate(move |e| {
+                        let label = e.accessible_label().unwrap_or_default();
+                        let description = e.accessible_description().unwrap_or_default();
+                        label.starts_with(name.as_str())
+                            && (label.contains(note) || description.contains(note))
+                    })
+                    .find_all()
+                    .is_empty()
+            };
+            assert!(
+                reads(ElementQuery::from_root(&app.main)),
+                "the main window's {name} row reads {note}"
+            );
+            assert!(
+                reads(ElementQuery::from_root(&app.flyout)),
+                "the flyout's {name} row reads {note}"
+            );
+        }
+    }
+
+    /// The longer help behind a code note shows on hover only; Narrator
+    /// hears it after the note on the row's toggle.
+    #[test]
+    fn a_code_notes_hover_help_is_read_on_the_rows_toggle() {
+        use i_slint_backend_testing::ElementQuery;
+        let mut backend = MockBackend::new();
+        backend.set_code_every_time("airplay:bedroom");
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        draw_frames();
+        let name = app
+            .snapshot()
+            .speaker("airplay:bedroom")
+            .expect("listed")
+            .name
+            .clone();
+        let read = !ElementQuery::from_root(&app.main)
+            .match_predicate(move |e| {
+                e.accessible_label()
+                    .unwrap_or_default()
+                    .starts_with(name.as_str())
+                    && e.accessible_description().unwrap_or_default()
+                        == "Asks for a code every time. This speaker asks for a code each time it \
+                            connects, so auto-connect leaves it off. AudioSync asks you for the \
+                            code when you turn the speaker on."
+            })
+            .find_all()
+            .is_empty();
+        assert!(read, "the note, then its help");
+    }
+
+    #[test]
+    fn escape_on_the_zone_dialog_buttons_cancels() {
+        let app = app_over(MockBackend::new());
+        let zones = app.snapshot().zones.len();
+        app.ask_new_zone();
+        let window = app.zone_dialog.window();
+        assert!(window.is_visible());
+        assert!(app.zone_dialog.get_show_field(), "a speaker is on");
+        // From the name field to Create.
+        tab(window, 1);
+        press(window, "x");
+        assert_eq!(app.zone_dialog.get_name(), "", "the field lost the focus");
+        press(window, Key::Escape);
+        assert!(!window.is_visible(), "Escape on Create closed the dialog");
+        assert_eq!(app.snapshot().zones.len(), zones, "and made no zone");
+    }
+
+    // covers: S270
+    #[test]
+    fn ctrl_n_while_a_curve_is_named_keeps_the_open_dialog() {
+        let app = app_over(MockBackend::new());
+        let zones = app.snapshot().zones.len();
+        app.equalizer.invoke_save_curve();
+        app.zone_dialog.set_name("Late night".into());
+        let heading = app.zone_dialog.get_heading();
+
+        app.main.invoke_new_zone_requested();
+        assert!(app.zone_dialog.window().is_visible());
+        assert_eq!(app.zone_dialog.get_heading(), heading);
+        assert_eq!(app.zone_dialog.get_name(), "Late night");
+        app.zone_dialog.invoke_confirmed("Late night".into());
+        assert_eq!(app.snapshot().equalizer_curves[0].name, "Late night");
+        assert_eq!(app.snapshot().zones.len(), zones, "no zone was made");
+    }
+
+    // covers: S270
+    #[test]
+    fn curves_are_saved_picked_renamed_and_deleted_and_custom_is_no_entry() {
+        let mut mock = MockBackend::new();
+        mock.add_zone("zone:office", "Office", &[]);
+        let app = app_over(mock);
+        let eq_window = &app.equalizer;
+        let presets = eq::PRESETS.len();
+        let names = || eq_window.get_preset_names().iter().collect::<Vec<_>>();
+        assert_eq!(names().len(), presets);
+        assert_eq!(eq_window.get_preset_index(), 0, "Flat");
+
+        eq_window.invoke_gain_changed(3, 2.5);
+        eq_window.invoke_preamp_changed(-3.0);
+        assert_eq!(eq_window.get_preset_index(), -1);
+        assert_eq!(names().len(), presets, "Custom is not an entry");
+        assert_eq!(app.main.get_equalizer_curve(), "Custom");
+        assert!(!eq_window.get_saved_curve_shown());
+
+        eq_window.invoke_save_curve();
+        assert!(app.zone_dialog.window().is_visible());
+        assert_eq!(app.zone_dialog.get_name(), "Curve 1");
+        app.zone_dialog.invoke_confirmed("Desk".into());
+        let state = app.snapshot();
+        assert_eq!(state.equalizer_curves.len(), 1);
+        assert_eq!(state.equalizer.preamp_db, -3.0, "a save leaves the preamp");
+        assert_eq!(eq_window.get_preset_index(), presets as i32);
+        assert_eq!(names()[presets], "Desk");
+        slint::platform::update_timers_and_animations();
+        assert_eq!(eq_window.get_picker_shown_index(), presets as i32);
+        assert_eq!(app.main.get_equalizer_curve(), "Desk");
+        assert!(eq_window.get_saved_curve_shown());
+        for label in [
+            "Rename \u{201c}Desk\u{201d}\u{2026}",
+            "Delete \u{201c}Desk\u{201d}",
+        ] {
+            let found =
+                i_slint_backend_testing::ElementHandle::find_by_accessible_label(eq_window, label);
+            assert_eq!(found.count(), 1, "{label}");
+        }
+
+        eq_window.invoke_preset_selected(0);
+        assert_eq!(eq_window.get_preset_index(), 0);
+        eq_window.invoke_preset_selected(presets as i32);
+        let state = app.snapshot();
+        assert_eq!(state.equalizer.gains_db[3], 2.5);
+        assert_eq!(state.equalizer.preamp_db, -3.0, "a curve leaves the preamp");
+        assert!(state.equalizer.enabled, "picking a curve turns it on");
+
+        eq_window.invoke_rename_curve();
+        assert_eq!(app.zone_dialog.get_name(), "Desk");
+        assert_eq!(app.zone_dialog.get_field_label(), "Curve name");
+        app.zone_dialog.invoke_confirmed("Office".into());
+        assert_eq!(app.snapshot().equalizer_curves[0].name, "Office");
+
+        // The curve dialogs share the zone name dialog.
+        app.ask_new_zone();
+        assert_eq!(app.zone_dialog.get_field_label(), "Zone name");
+        app.zone_dialog.invoke_cancelled();
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_cancelled();
+        let speaker = app.snapshot().speakers[0].id.clone();
+        app.ask_new_zone_with(&speaker);
+        assert_eq!(app.zone_dialog.get_field_label(), "Zone name");
+        app.zone_dialog.invoke_cancelled();
+
+        eq_window.invoke_delete_curve();
+        assert!(app.snapshot().equalizer_curves.is_empty());
+        assert_eq!(eq_window.get_preset_index(), -1, "the gains stay");
+        slint::platform::update_timers_and_animations();
+        assert_eq!(
+            eq_window.get_picker_shown_index(),
+            -1,
+            "a shorter list leaves the picker on Custom"
+        );
+        assert_eq!(names().len(), presets);
+
+        eq_window.invoke_reset();
+        let state = app.snapshot();
+        assert_eq!(state.equalizer.preamp_db, 0.0);
+        assert_eq!(eq_window.get_preset_index(), 0, "Reset reads Flat");
+    }
+
+    // covers: S270
+    #[test]
+    fn the_curve_buttons_are_disabled_while_the_name_dialog_is_open() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        let eq_window = &app.equalizer;
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Bass".into());
+        let assert_enabled = |enabled: bool, after: &str| {
+            let curve = app.snapshot().equalizer_curves[0].name.clone();
+            let buttons = [
+                "Save curve".to_owned(),
+                format!("Rename \u{201c}{curve}\u{201d}\u{2026}"),
+                format!("Delete \u{201c}{curve}\u{201d}"),
+            ];
+            for label in &buttons {
+                let button = ElementHandle::find_by_accessible_label(eq_window, label)
+                    .next()
+                    .unwrap_or_else(|| panic!("nothing is labeled {label}"));
+                assert_eq!(
+                    button.accessible_enabled(),
+                    Some(enabled),
+                    "{label} {after}"
+                );
+            }
+        };
+        assert_enabled(true, "with no dialog open");
+
+        eq_window.invoke_rename_curve();
+        assert_enabled(false, "while the name dialog is open");
+        // A button that kept the keyboard focus still reaches the handler.
+        eq_window.invoke_delete_curve();
+        app.zone_dialog.invoke_confirmed("Low end".into());
+        assert_eq!(app.snapshot().equalizer_curves[0].name, "Low end");
+        assert_enabled(true, "after Rename");
+
+        eq_window.invoke_rename_curve();
+        app.zone_dialog.invoke_cancelled();
+        assert_enabled(true, "after Cancel");
+
+        eq_window.invoke_rename_curve();
+        press(app.zone_dialog.window(), Key::Escape);
+        assert!(!app.zone_dialog.window().is_visible());
+        assert_enabled(true, "after Escape");
+
+        eq_window.invoke_rename_curve();
+        app.zone_dialog
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::CloseRequested);
+        assert!(!app.zone_dialog.window().is_visible());
+        assert_enabled(true, "after the dialog's close button");
+    }
+
+    // covers: S270
+    #[test]
+    fn a_full_list_still_saves_over_a_curve_from_a_preset_and_refuses_a_new_name() {
+        let app = app_over(MockBackend::new());
+        let eq_window = &app.equalizer;
+        let curves = (1..=eq::MAX_USER_CURVES)
+            .map(|n| eq::UserCurve {
+                name: if n == 1 {
+                    "Warm".into()
+                } else {
+                    format!("Curve {n}")
+                },
+                gains_db: [0.0; eq::BAND_COUNT],
+            })
+            .collect();
+        app.update(|b| b.set_equalizer_curves(curves));
+        let rock = eq::PRESETS.iter().position(|p| p.id == "rock").unwrap();
+        eq_window.invoke_preset_selected(rock as i32);
+
+        eq_window.invoke_save_curve();
+        assert_eq!(*app.dialog_purpose.borrow(), DialogPurpose::SaveCurve);
+        app.zone_dialog.invoke_confirmed("warm".into());
+        let state = app.snapshot();
+        assert_eq!(state.equalizer_curves.len(), eq::MAX_USER_CURVES);
+        assert_eq!(
+            state.equalizer_curves[0].gains_db,
+            eq::PRESETS[rock].gains_db
+        );
+
+        eq_window.invoke_preset_selected(0);
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Late night".into());
+        assert_eq!(*app.dialog_purpose.borrow(), DialogPurpose::Message);
+        assert_eq!(
+            app.zone_dialog.get_message(),
+            app.strings().invoke_curves_full(count(eq::MAX_USER_CURVES))
+        );
+        let state = app.snapshot();
+        assert_eq!(state.equalizer_curves.len(), eq::MAX_USER_CURVES);
+        assert!(
+            state
+                .equalizer_curves
+                .iter()
+                .all(|c| c.name != "Late night")
+        );
+    }
+
+    // covers: S270
+    #[test]
+    fn the_curve_saved_has_the_gains_shown_when_save_was_chosen() {
+        let app = app_over(MockBackend::new());
+        let eq_window = &app.equalizer;
+        let warm = [3.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0];
+        for (band, gain) in warm.iter().enumerate() {
+            eq_window.invoke_gain_changed(band as i32, *gain as f32);
+        }
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Warm".into());
+
+        eq_window.invoke_save_curve();
+        let rock = eq::PRESETS.iter().position(|p| p.id == "rock").unwrap();
+        eq_window.invoke_preset_selected(rock as i32);
+        eq_window.invoke_gain_changed(0, -6.0);
+        eq_window.invoke_reset();
+        app.zone_dialog.invoke_confirmed("Warm".into());
+        let state = app.snapshot();
+        assert_eq!(state.equalizer_curves.len(), 1);
+        assert_eq!(state.equalizer_curves[0].gains_db, warm);
+        assert_eq!(state.equalizer.gains_db, [0.0; eq::BAND_COUNT]);
+    }
+
+    // covers: S270
+    #[test]
+    fn a_saved_curve_with_a_presets_gains_can_be_picked_renamed_and_deleted() {
+        let app = app_over(MockBackend::new());
+        let eq_window = &app.equalizer;
+        let presets = eq::PRESETS.len() as i32;
+        let rock = eq::PRESETS.iter().position(|p| p.id == "rock").unwrap() as i32;
+        eq_window.invoke_preset_selected(rock);
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Mine".into());
+        assert_eq!(
+            eq_window.get_preset_index(),
+            presets,
+            "a save shows the curve"
+        );
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Twin".into());
+        assert_eq!(eq_window.get_preset_index(), presets + 1);
+
+        eq_window.invoke_preset_selected(rock);
+        assert_eq!(eq_window.get_preset_index(), rock);
+        assert!(!eq_window.get_saved_curve_shown());
+        eq_window.invoke_preset_selected(presets);
+        assert_eq!(eq_window.get_preset_index(), presets);
+        assert_eq!(app.main.get_equalizer_curve(), "Mine");
+        assert!(eq_window.get_saved_curve_shown());
+        eq_window.invoke_rename_curve();
+        assert_eq!(app.zone_dialog.get_name(), "Mine");
+        app.zone_dialog.invoke_confirmed("Ours".into());
+        assert_eq!(
+            app.main.get_equalizer_curve(),
+            "Ours",
+            "a rename keeps it shown"
+        );
+
+        eq_window.invoke_delete_curve();
+        let names: Vec<_> = app
+            .snapshot()
+            .equalizer_curves
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["Twin"]);
+        assert_eq!(
+            eq_window.get_preset_index(),
+            presets,
+            "the gains stay, shown by the saved curve's name"
+        );
+
+        eq_window.invoke_preset_selected(presets);
+        eq_window.invoke_reset();
+        assert_eq!(eq_window.get_preset_index(), 0, "Reset reads Flat");
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Netral".into());
+        assert_eq!(eq_window.get_preset_index(), presets + 1);
+        eq_window.invoke_reset();
+        assert_eq!(
+            eq_window.get_preset_index(),
+            0,
+            "Reset reads Flat beside a saved flat curve"
+        );
+    }
+
+    // covers: S270
+    #[test]
+    fn a_preset_recall_lets_go_of_the_picked_curve() {
+        let app = app_over(MockBackend::new());
+        app.update(|b| b.set_speaker_enabled("local:desk", true));
+        app.save_preset("Flat");
+        let eq_window = &app.equalizer;
+        let rock = eq::PRESETS.iter().position(|p| p.id == "rock").unwrap() as i32;
+        eq_window.invoke_preset_selected(rock);
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Mine".into());
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Twin".into());
+        app.save_preset("Rock");
+        let ids = preset_ids(&app);
+
+        app.recall_preset(&ids[0]);
+        app.recall_preset(&ids[1]);
+        assert_eq!(
+            eq_window.get_preset_index(),
+            eq::PRESETS.len() as i32,
+            "the first saved curve with the gains, not the picked Twin"
+        );
+    }
+
+    // covers: S270
+    #[test]
+    fn a_recall_or_band_move_with_the_same_gains_keeps_rock_picked() {
+        let app = app_over(MockBackend::new());
+        app.update(|b| b.set_speaker_enabled("local:desk", true));
+        let eq_window = &app.equalizer;
+        let rock = eq::PRESETS.iter().position(|p| p.id == "rock").unwrap();
+        eq_window.invoke_preset_selected(rock as i32);
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Mine".into());
+        app.save_preset("Rock");
+        eq_window.invoke_preset_selected(rock as i32);
+
+        app.recall_preset(&preset_ids(&app)[0]);
+        assert_eq!(eq_window.get_preset_index(), rock as i32, "recall");
+        eq_window.invoke_gain_changed(0, eq::PRESETS[rock].gains_db[0] as f32);
+        assert_eq!(eq_window.get_preset_index(), rock as i32, "band");
+        assert!(!eq_window.get_saved_curve_shown());
+    }
+
+    // covers: S270
+    #[test]
+    fn a_band_moved_off_the_picked_curve_and_back_shows_the_first_match() {
+        let app = app_over(MockBackend::new());
+        let eq_window = &app.equalizer;
+        let presets = eq::PRESETS.len() as i32;
+        let rock = eq::PRESETS.iter().position(|p| p.id == "rock").unwrap();
+        let first_gain = eq::PRESETS[rock].gains_db[0] as f32;
+        eq_window.invoke_preset_selected(rock as i32);
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Mine".into());
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("Twin".into());
+
+        for (picked, name) in [(rock as i32, "Rock"), (presets + 1, "Twin")] {
+            eq_window.invoke_preset_selected(picked);
+            assert_eq!(eq_window.get_preset_index(), picked, "{name} picked");
+            eq_window.invoke_gain_changed(0, first_gain + 3.0);
+            assert_eq!(eq_window.get_preset_index(), -1, "{name} left: Custom");
+            eq_window.invoke_gain_changed(0, first_gain);
+            assert_eq!(
+                eq_window.get_preset_index(),
+                presets,
+                "{name} forgotten: the first saved curve with the gains"
+            );
+            assert_eq!(app.main.get_equalizer_curve(), "Mine");
+        }
+    }
+
+    // covers: S270
+    #[test]
+    fn a_full_list_saves_over_a_taken_name_and_refuses_a_new_one() {
+        let app = app_over(MockBackend::new());
+        let eq_window = &app.equalizer;
+        let rock = eq::PRESETS.iter().position(|p| p.id == "rock").unwrap();
+        let mut curves = Vec::new();
+        eq::save_curve(&mut curves, "Mine", &eq::PRESETS[rock].gains_db);
+        for n in 1..eq::MAX_USER_CURVES {
+            eq::save_curve(&mut curves, &format!("Other {n}"), &[0.0; eq::BAND_COUNT]);
+        }
+        app.update(|b| b.set_equalizer_curves(curves));
+        eq_window.invoke_preset_selected(eq::PRESETS.len() as i32);
+        let moved = eq::PRESETS[rock].gains_db[0] as f32 + 3.0;
+        eq_window.invoke_gain_changed(0, moved);
+        assert_eq!(eq_window.get_preset_index(), -1, "Custom");
+
+        eq_window.invoke_save_curve();
+        assert_eq!(*app.dialog_purpose.borrow(), DialogPurpose::SaveCurve);
+        app.zone_dialog.invoke_confirmed("Mine".into());
+        assert!(!app.zone_dialog.window().is_visible(), "no full message");
+        let state = app.snapshot();
+        assert_eq!(state.equalizer_curves.len(), eq::MAX_USER_CURVES);
+        assert_eq!(state.equalizer_curves[0].gains_db[0], f64::from(moved));
+
+        eq_window.invoke_gain_changed(0, 0.0);
+        eq_window.invoke_save_curve();
+        app.zone_dialog.invoke_confirmed("New".into());
+        assert_eq!(*app.dialog_purpose.borrow(), DialogPurpose::Message);
+        assert_eq!(
+            app.zone_dialog.get_message(),
+            "You can keep up to 50 saved curves. Delete one, then save again."
+        );
+        assert_eq!(app.snapshot().equalizer_curves.len(), eq::MAX_USER_CURVES);
+    }
+
+    fn first_band_gain(app: &App) -> f64 {
+        app.snapshot().equalizer.gains_db[0]
+    }
+
+    #[test]
+    fn an_equalizer_band_moves_with_the_left_and_right_arrow_keys() {
+        let app = app_over(MockBackend::new());
+        app.equalizer.show().expect("the equalizer shows headless");
+        app.equalizer.invoke_take_focus();
+        draw_frames();
+        let window = app.equalizer.window();
+        // The switch, the curve picker, the preamp, then the first band.
+        tab(window, 4);
+        press(window, Key::UpArrow);
+        assert_eq!(first_band_gain(&app), 0.5, "the first band has the focus");
+
+        press(window, Key::RightArrow);
+        assert_eq!(first_band_gain(&app), 1.0, "Right moves it up");
+        press(window, Key::LeftArrow);
+        press(window, Key::LeftArrow);
+        assert_eq!(first_band_gain(&app), 0.0, "Left moves it down");
+    }
+
+    // covers: S453
+    #[test]
+    fn home_and_end_leave_an_equalizer_band_where_it_is() {
+        let app = app_over(MockBackend::new());
+        app.equalizer.show().expect("the equalizer shows headless");
+        app.equalizer.invoke_take_focus();
+        draw_frames();
+        let window = app.equalizer.window();
+        tab(window, 4);
+        press(window, Key::UpArrow);
+        assert_eq!(first_band_gain(&app), 0.5, "the first band has the focus");
+        press(window, Key::Home);
+        assert_eq!(first_band_gain(&app), 0.5, "Home");
+        press(window, Key::End);
+        assert_eq!(first_band_gain(&app), 0.5, "End");
+    }
+
+    /// The left, top, width and height of the slider Narrator calls `label`.
+    fn slider_box(component: &impl ComponentHandle, label: &str) -> (f32, f32, f32, f32) {
+        use i_slint_backend_testing::ElementHandle;
+        let slider = ElementHandle::find_by_accessible_label(component, label)
+            .next()
+            .unwrap_or_else(|| panic!("{label} is there"));
+        let (at, size) = (slider.absolute_position(), slider.size());
+        (at.x, at.y, size.width, size.height)
+    }
+
+    /// The RGBA color `window` shows now at a logical point.
+    fn pixels(window: &slint::Window) -> impl Fn(f32, f32) -> [u8; 4] {
+        let shot = window
+            .take_snapshot()
+            .expect("the software renderer draws it");
+        let scale = window.scale_factor();
+        move |x, y| {
+            let (x, y) = ((x * scale) as usize, (y * scale) as usize);
+            let at = (y * shot.width() as usize + x) * 4;
+            shot.as_bytes()[at..at + 4].try_into().unwrap()
+        }
+    }
+
+    // covers: S453
+    #[test]
+    fn a_flat_equalizer_band_is_empty_with_its_0_db_tick_showing() {
+        let app = app_over(MockBackend::new());
+        app.equalizer.show().expect("the equalizer shows headless");
+        draw_frames();
+        let (x, y, width, height) = slider_box(&app.equalizer, "32 Hz");
+        let pixel = pixels(app.equalizer.window());
+        let center = x + width / 2.0;
+        assert_eq!(
+            pixel(center, y + height - 14.0),
+            pixel(center, y + 14.0),
+            "the track below the thumb looks as it does above"
+        );
+        let beside = center + width / 2.0 + 3.0;
+        let zero = (y + height / 2.0).round();
+        let background = pixel(beside, zero + 8.0);
+        assert!(
+            (-1..=1).any(|row| pixel(beside, zero + row as f32) != background),
+            "the 0 dB tick shows beside the thumb"
+        );
+    }
+
+    // covers: S453
+    #[test]
+    fn a_raised_equalizer_band_fills_from_0_db_to_its_thumb() {
+        let app = app_over(MockBackend::new());
+        app.equalizer.show().expect("the equalizer shows headless");
+        app.equalizer.invoke_gain_changed(0, 6.0);
+        draw_frames();
+        let (x, y, width, height) = slider_box(&app.equalizer, "32 Hz");
+        let pixel = pixels(app.equalizer.window());
+        let center = x + width / 2.0;
+        let zero = y + height / 2.0;
+        let thumb = y + 10.0 + (height - 20.0) / 4.0;
+        let bottom = pixel(center, y + height - 14.0);
+        assert_eq!(
+            pixel(center, zero + 14.0),
+            bottom,
+            "nothing fills below 0 dB"
+        );
+        assert_ne!(
+            pixel(center, (zero + thumb) / 2.0),
+            bottom,
+            "0 dB to the thumb fills"
+        );
+    }
+
+    /// "Custom" in the curve picker is in the text color, as a curve's name is.
+    // covers: S453
+    #[test]
+    fn the_curve_picker_shows_custom_in_the_text_color() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.apply_appearance(ui_model::Appearance::Light);
+        app.equalizer.show().expect("the equalizer shows headless");
+        app.equalizer.invoke_gain_changed(0, 6.0);
+        draw_frames();
+        assert_eq!(app.equalizer.get_preset_index(), -1);
+        let picker = ElementHandle::find_by_element_id(&app.equalizer, "EqualizerWindow::presets")
+            .next()
+            .expect("the curve picker");
+        let (at, size) = (picker.absolute_position(), picker.size());
+        let pixel = pixels(app.equalizer.window());
+        let darkest = (0..size.height as i32)
+            .flat_map(|dy| (12..(size.width - 36.0) as i32).map(move |dx| (dx, dy)))
+            .map(|(dx, dy)| pixel(at.x + dx as f32, at.y + dy as f32)[0])
+            .min()
+            .unwrap();
+        // Tokens.text is #292929 in light mode; the secondary text color is far lighter.
+        assert!(darkest <= 0x29 + 12, "darkest red channel {darkest:#x}");
+    }
+
+    /// While a slider has the keyboard focus a ring shows around it: an
+    /// equalizer band and a speaker's volume.
+    // covers: S452
+    #[test]
+    fn a_focused_slider_shows_a_focus_ring() {
+        let app = app_over(MockBackend::new());
+        app.equalizer.show().expect("the equalizer shows headless");
+        app.equalizer.invoke_take_focus();
+        draw_frames();
+        let window = app.equalizer.window();
+        let (x, y, _, height) = slider_box(&app.equalizer, "32 Hz");
+        let (left, middle) = (x - 2.0, y + height / 2.0);
+        let before = pixels(window)(left, middle);
+        tab(window, 4);
+        assert_ne!(pixels(window)(left, middle), before, "an equalizer band");
+
+        // Off, its volume is not there to take the focus.
+        app.toggle_speaker("local:desk");
+        app.main.show().unwrap();
+        draw_frames();
+        let name = app.snapshot().speaker("local:desk").unwrap().name.clone();
+        let (x, y, width, _) = slider_box(&app.main, &format!("{name} volume"));
+        let (center, above) = (x + width / 2.0, y - 2.0);
+        let before = pixels(app.main.window())(center, above);
+        focus_speaker_volume(&app, "local:desk");
+        assert_ne!(
+            pixels(app.main.window())(center, above),
+            before,
+            "a speaker's volume"
+        );
+    }
+
+    fn speaker_volume(app: &App, id: &str) -> f64 {
+        app.snapshot().speaker(id).unwrap().volume
+    }
+
+    /// Shows the main window with the keyboard focus on `id`'s volume.
+    fn focus_speaker_volume(app: &App, id: &str) {
+        app.main.show().unwrap();
+        draw_frames();
+        app.main.set_focus_speaker_part(RowPart::Volume);
+        app.main.set_focus_speaker_id(id.into());
+        draw_frames();
+    }
+
+    #[test]
+    fn a_volume_slider_moves_with_the_up_and_down_arrow_keys() {
+        use i_slint_backend_testing::ElementHandle;
+        let backend = MockBackend::new();
+        let editing = backend.volume_editing.clone();
+        let app = app_over(backend);
+        // Off, its volume is not there to take the focus.
+        app.toggle_speaker("local:desk");
+        focus_speaker_volume(&app, "local:desk");
+        let window = app.main.window();
+        let start = speaker_volume(&app, "local:desk");
+
+        press(window, Key::RightArrow);
+        let right = speaker_volume(&app, "local:desk");
+        assert_ne!(right, start, "the volume has the focus");
+        press(window, Key::LeftArrow);
+        assert_eq!(speaker_volume(&app, "local:desk"), start);
+
+        press(window, Key::UpArrow);
+        assert_eq!(
+            speaker_volume(&app, "local:desk"),
+            right,
+            "Up moves it like Right"
+        );
+        press(window, Key::DownArrow);
+        assert_eq!(
+            speaker_volume(&app, "local:desk"),
+            start,
+            "Down moves it like Left"
+        );
+        assert_eq!(
+            editing.borrow().last(),
+            Some(&("local:desk".to_owned(), false)),
+            "releasing Down ends the move"
+        );
+        for modifier in [Key::Control, Key::Shift, Key::Alt] {
+            window.dispatch_event(WindowEvent::KeyPressed {
+                text: modifier.into(),
+            });
+            press(window, Key::UpArrow);
+            window.dispatch_event(WindowEvent::KeyReleased {
+                text: modifier.into(),
+            });
+            assert_eq!(speaker_volume(&app, "local:desk"), start, "{modifier:?}");
+        }
+
+        let master = ElementHandle::find_by_accessible_label(&app.main, "Master volume")
+            .next()
+            .expect("the master volume");
+        let (at, size) = (master.absolute_position(), master.size());
+        click(window, at.x + size.width / 2.0, at.y + size.height / 2.0);
+        let master = app.snapshot().master_volume;
+        press(window, Key::UpArrow);
+        assert_ne!(
+            app.snapshot().master_volume,
+            master,
+            "Up moves the master volume"
+        );
+        press(window, Key::DownArrow);
+        assert_eq!(app.snapshot().master_volume, master);
+    }
+
+    #[test]
+    fn the_master_volume_speaker_shows_the_rounded_level_in_waves() {
+        for (volume, waves) in [
+            (0.0, 0),
+            (0.49, 0),
+            (0.5, 1),
+            (33.4, 1),
+            (33.5, 2),
+            (66.4, 2),
+            (66.5, 3),
+            (100.0, 3),
+        ] {
+            assert_eq!(volume_waves(volume), waves, "{volume}");
+        }
+        let app = app_over(MockBackend::new());
+        app.update(|b| b.set_master_volume(50.0));
+        assert_eq!(app.main.get_master_volume_waves(), 2);
+        assert_eq!(app.flyout.get_master_volume_waves(), 2);
+        app.main.invoke_master_volume_changed(0.4);
+        assert_eq!(app.snapshot().master_volume, 0.0, "a trace snaps to 0");
+        assert_eq!(app.main.get_master_volume_waves(), 0);
+        assert_eq!(app.flyout.get_master_volume_waves(), 0);
+    }
+
+    // covers: S429
+    #[test]
+    fn a_volume_key_moves_the_master_and_the_switch_is_kept() {
+        let app = app_over(MockBackend::new());
+        app.update(|b| b.set_master_volume(40.0));
+        app.volume_key(VolumeKey::Up);
+        assert_eq!(app.snapshot().master_volume, 42.0);
+        app.volume_key(VolumeKey::Mute);
+        assert_eq!(app.snapshot().master_volume, 0.0);
+        app.volume_key(VolumeKey::Up);
+        assert_eq!(
+            app.snapshot().master_volume,
+            42.0,
+            "up at 0 brings the level back"
+        );
+        assert_eq!(app.main.get_volume_keys_available(), cfg!(windows));
+        app.main.invoke_volume_keys_toggled(true);
+        assert!(app.main.get_volume_keys());
+        app.main.invoke_volume_keys_toggled(false);
+        assert!(!app.main.get_volume_keys());
+        assert!(!app.backend.borrow().view_settings().volume_keys);
+    }
+
+    #[test]
+    fn a_click_on_the_master_volume_speaker_mutes_and_the_next_brings_the_level_back() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        Backend::set_master_volume(&mut backend, 0.0);
+        let app = app_over(backend);
+        app.main.show().expect("the main window shows");
+        let speaker = |label: &str| {
+            draw_frames();
+            ElementHandle::find_by_accessible_label(&app.main, label).next()
+        };
+
+        speaker("Unmute Master Volume")
+            .expect("the muted speaker")
+            .invoke_accessible_default_action();
+        assert_eq!(
+            app.snapshot().master_volume,
+            50.0,
+            "no level heard yet this run"
+        );
+
+        app.update(|b| b.set_master_volume(64.0));
+        speaker("Mute Master Volume")
+            .expect("the speaker")
+            .invoke_accessible_default_action();
+        assert_eq!(
+            app.snapshot().master_volume,
+            0.0,
+            "a real 0, as the web remote reads it"
+        );
+        assert!(speaker("Mute Master Volume").is_none());
+        speaker("Unmute Master Volume")
+            .expect("the muted speaker")
+            .invoke_accessible_default_action();
+        assert_eq!(app.snapshot().master_volume, 64.0);
+
+        app.flyout.invoke_master_mute_toggled();
+        assert_eq!(
+            app.snapshot().master_volume,
+            0.0,
+            "the tray panel's speaker too"
+        );
+        app.main.invoke_master_volume_changed(12.0);
+        assert!(
+            speaker("Mute Master Volume").is_some(),
+            "dragging up from 0 unmutes"
+        );
+        assert_eq!(app.main.get_master_volume_waves(), 1);
+        app.flyout.invoke_master_mute_toggled();
+        app.flyout.invoke_master_mute_toggled();
+        assert_eq!(app.snapshot().master_volume, 12.0);
+    }
+
+    #[test]
+    fn stepping_the_master_volume_down_to_0_then_unmute_brings_back_5() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.main.show().expect("the main window shows");
+        draw_frames();
+        let window = app.main.window();
+        let master = ElementHandle::find_by_accessible_label(&app.main, "Master volume")
+            .next()
+            .expect("the master volume");
+        let (at, size) = (master.absolute_position(), master.size());
+        click(window, at.x + size.width / 2.0, at.y + size.height / 2.0);
+        app.update(|b| b.set_master_volume(8.0));
+        for _ in 0..8 {
+            press(window, Key::DownArrow);
+        }
+        assert_eq!(app.snapshot().master_volume, 0.0, "Down reached 0");
+        app.main.invoke_master_mute_toggled();
+        assert_eq!(
+            app.snapshot().master_volume,
+            UNMUTE_FLOOR,
+            "the last level of at least 5, not 1"
+        );
+    }
+
+    /// A backend with the playing Cast speaker "cc:attic", which steps by 5.
+    fn cast_backend(volume_fixed: bool) -> MockBackend {
+        let mut backend = MockBackend::new();
+        let mut speaker = backend.snapshot().speaker("local:desk").unwrap().clone();
+        speaker.id = "cc:attic".into();
+        speaker.name = "Attic".into();
+        speaker.system_name = "Attic".into();
+        speaker.kind = ui_model::SpeakerKind::Cast;
+        speaker.enabled = true;
+        speaker.cast = Some(ui_model::CastRow {
+            state: ui_model::CastState::Playing,
+            muted: false,
+            volume_fixed,
+            volume_step: 5.0,
+            group: None,
+            added_by_address: false,
+            offline: false,
+            taken_over: false,
+        });
+        backend.add_speaker(speaker);
+        backend
+    }
+
+    #[test]
+    fn up_on_a_cast_volume_sends_the_same_step_as_right() {
+        let app = app_over(cast_backend(false));
+        focus_speaker_volume(&app, "cc:attic");
+        let window = app.main.window();
+        let start = speaker_volume(&app, "cc:attic");
+
+        press(window, Key::RightArrow);
+        let right = speaker_volume(&app, "cc:attic");
+        assert_ne!(right, start, "the Cast volume has the focus");
+        press(window, Key::LeftArrow);
+        assert_eq!(speaker_volume(&app, "cc:attic"), start);
+        press(window, Key::UpArrow);
+        assert_eq!(
+            speaker_volume(&app, "cc:attic"),
+            right,
+            "Up sends what Right sends"
+        );
+        press(window, Key::DownArrow);
+        assert_eq!(
+            speaker_volume(&app, "cc:attic"),
+            start,
+            "Down sends what Left sends"
+        );
+    }
+
+    #[test]
+    fn up_and_down_send_nothing_once_the_focused_cast_volume_is_fixed() {
+        let app = app_over(cast_backend(false));
+        focus_speaker_volume(&app, "cc:attic");
+        let fixed = cast_backend(true);
+        let editing = fixed.volume_editing.clone();
+        *app.backend.borrow_mut() = Box::new(fixed);
+        app.refresh();
+        draw_frames();
+        let window = app.main.window();
+        let start = speaker_volume(&app, "cc:attic");
+
+        press(window, Key::UpArrow);
+        press(window, Key::DownArrow);
+        press(window, Key::DownArrow);
+        assert_eq!(speaker_volume(&app, "cc:attic"), start);
+        assert!(editing.borrow().is_empty(), "{:?}", editing.borrow());
+    }
+
+    #[test]
+    fn an_equalizer_band_ignores_the_left_and_right_arrows_with_a_modifier() {
+        let app = app_over(MockBackend::new());
+        app.equalizer.show().expect("the equalizer shows headless");
+        app.equalizer.invoke_take_focus();
+        draw_frames();
+        let window = app.equalizer.window();
+        tab(window, 4);
+        press(window, Key::UpArrow);
+        for modifier in [Key::Control, Key::Shift, Key::Alt] {
+            window.dispatch_event(WindowEvent::KeyPressed {
+                text: modifier.into(),
+            });
+            press(window, Key::RightArrow);
+            press(window, Key::LeftArrow);
+            press(window, Key::LeftArrow);
+            window.dispatch_event(WindowEvent::KeyReleased {
+                text: modifier.into(),
+            });
+            assert_eq!(first_band_gain(&app), 0.5, "{modifier:?}");
+        }
+    }
+
+    /// Shows the equalizer and finds where a click above the middle of the
+    /// first band's track raises it; the double-click time has run out after.
+    fn first_band_point(app: &App) -> (f32, f32) {
+        app.equalizer.show().expect("the equalizer shows headless");
+        draw_frames();
+        let window = app.equalizer.window();
+        let y = 250.0;
+        let x = (0..1000)
+            .step_by(8)
+            .map(|x| x as f32)
+            .find(|&x| {
+                click(window, x, y);
+                advance_clock(Duration::from_secs(1));
+                draw_frames();
+                first_band_gain(app) > 0.0
+            })
+            .expect("a click raises the first band");
+        (x, y)
+    }
+
+    #[test]
+    fn a_double_click_on_an_equalizer_band_sets_it_to_0_db() {
+        hold_clock();
+        let app = app_over(MockBackend::new());
+        let (x, y) = first_band_point(&app);
+        let window = app.equalizer.window();
+        click(window, x, y);
+        click(window, x, y);
+        assert_eq!(first_band_gain(&app), 0.0);
+    }
+
+    #[test]
+    fn the_equalizer_preamp_moves_with_left_and_right_and_a_double_click_sets_it_to_0_db() {
+        hold_clock();
+        let app = app_over(MockBackend::new());
+        let preamp = || app.snapshot().equalizer.preamp_db;
+        app.equalizer.show().expect("the equalizer shows headless");
+        app.equalizer.invoke_take_focus();
+        draw_frames();
+        let window = app.equalizer.window();
+        // The switch, the curve picker, then the preamp.
+        tab(window, 3);
+        press(window, Key::UpArrow);
+        assert_eq!(preamp(), 0.5, "the preamp has the focus");
+        press(window, Key::RightArrow);
+        assert_eq!(preamp(), 1.0, "Right moves it up");
+        press(window, Key::LeftArrow);
+        press(window, Key::LeftArrow);
+        assert_eq!(preamp(), 0.0, "Left moves it down");
+
+        advance_clock(Duration::from_secs(1));
+        draw_frames();
+        let y = 250.0;
+        let x = (0..1000)
+            .step_by(8)
+            .map(|x| x as f32)
+            .find(|&x| {
+                click(window, x, y);
+                advance_clock(Duration::from_secs(1));
+                draw_frames();
+                preamp() > 0.0
+            })
+            .expect("a click raises the preamp");
+        click(window, x, y);
+        click(window, x, y);
+        assert_eq!(preamp(), 0.0, "a double-click sets it to 0 dB");
+    }
+
+    #[test]
+    fn two_slow_clicks_or_a_drag_and_a_click_leave_an_equalizer_band_where_it_is() {
+        hold_clock();
+        let app = app_over(MockBackend::new());
+        let (x, y) = first_band_point(&app);
+        let window = app.equalizer.window();
+        let raised = first_band_gain(&app);
+        click(window, x, y);
+        advance_clock(Duration::from_secs(1));
+        draw_frames();
+        click(window, x, y);
+        assert_eq!(first_band_gain(&app), raised, "two slow clicks");
+
+        advance_clock(Duration::from_secs(1));
+        draw_frames();
+        let button = PointerEventButton::Left;
+        let from = slint::LogicalPosition::new(x, y);
+        let to = slint::LogicalPosition::new(x, y + 60.0);
+        window.dispatch_event(WindowEvent::PointerMoved { position: from });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position: from,
+            button,
+        });
+        for step in [20.0, 40.0, 60.0] {
+            let position = slint::LogicalPosition::new(x, y + step);
+            window.dispatch_event(WindowEvent::PointerMoved { position });
+        }
+        window.dispatch_event(WindowEvent::PointerReleased {
+            position: to,
+            button,
+        });
+        draw_frames();
+        assert!(first_band_gain(&app) < raised, "the drag lowers it");
+        click(window, x, y);
+        assert_eq!(first_band_gain(&app), raised, "a drag and a click");
+    }
+
+    #[test]
+    fn a_dragged_equalizer_band_reads_the_gain_it_applies() {
+        use i_slint_backend_testing::ElementHandle;
+        hold_clock();
+        let app = app_over(MockBackend::new());
+        let (x, y) = first_band_point(&app);
+        let window = app.equalizer.window();
+        let shown = || {
+            let value = ElementHandle::find_by_accessible_label(&app.equalizer, "32 Hz")
+                .find_map(|band| band.accessible_value())
+                .expect("the 32 Hz band");
+            value
+                .trim_end_matches(" dB")
+                .replace('−', "-")
+                .replace('+', "")
+                .parse::<f64>()
+                .expect("a gain")
+        };
+        let button = PointerEventButton::Left;
+        let from = slint::LogicalPosition::new(x, y);
+        window.dispatch_event(WindowEvent::PointerMoved { position: from });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position: from,
+            button,
+        });
+        for step in 1..=40 {
+            let position = slint::LogicalPosition::new(x, y - step as f32);
+            window.dispatch_event(WindowEvent::PointerMoved { position });
+            draw_frames();
+            assert_eq!(shown(), first_band_gain(&app), "{step} px up");
+        }
+        window.dispatch_event(WindowEvent::PointerReleased {
+            position: slint::LogicalPosition::new(x, y - 40.0),
+            button,
+        });
+    }
+
+    #[test]
+    fn a_delete_while_a_rename_is_open_keeps_the_curve_being_renamed() {
+        let app = app_over(MockBackend::new());
+        let eq_window = &app.equalizer;
+        let presets = eq::PRESETS.len();
+        for (gain, name) in [(1.0, "A"), (2.0, "B"), (3.0, "C")] {
+            eq_window.invoke_gain_changed(0, gain);
+            eq_window.invoke_save_curve();
+            app.zone_dialog.invoke_confirmed(name.into());
+        }
+        eq_window.invoke_preset_selected(presets as i32 + 1);
+        assert_eq!(eq_window.get_preset_index(), presets as i32 + 1, "B");
+
+        eq_window.invoke_rename_curve();
+        eq_window.invoke_delete_curve();
+        app.zone_dialog.invoke_confirmed("X".into());
+        let names: Vec<String> = app
+            .snapshot()
+            .equalizer_curves
+            .into_iter()
+            .map(|curve| curve.name)
+            .collect();
+        assert_eq!(names, ["A", "X", "C"]);
+    }
+
+    #[test]
+    fn a_zone_name_longer_than_its_field_keeps_the_cursor_in_view() {
+        let app = app_over(MockBackend::new());
+        app.ask_new_zone();
+        let window = app.zone_dialog.window();
+        // Wider than the 1000 px the headless windows draw at.
+        let name = "Living Room and Kitchen and Bedroom and Office Speakers, ".repeat(4);
+        let name = name.trim_end();
+        for character in name.chars() {
+            press(window, character.to_string());
+            assert!(
+                app.zone_dialog.get_name_caret_in_view(),
+                "the cursor is in view after {:?}",
+                app.zone_dialog.get_name()
+            );
+        }
+        assert_eq!(app.zone_dialog.get_name(), name);
+        press(window, Key::Home);
+        assert!(app.zone_dialog.get_name_caret_in_view(), "at the start");
+        press(window, Key::End);
+        assert!(app.zone_dialog.get_name_caret_in_view(), "at the end");
+    }
+
+    #[test]
+    fn escape_closes_the_about_dialog() {
+        let app = app_over(MockBackend::new());
+        let window = app.about.window();
+        app.main.invoke_about_requested();
+        assert!(window.is_visible());
+        press(window, Key::Escape);
+        assert!(!window.is_visible(), "Escape right after it opened");
+
+        app.main.invoke_about_requested();
+        assert!(window.is_visible());
+        tab(window, 1);
+        press(window, Key::Escape);
+        assert!(!window.is_visible(), "Escape on a focused button");
+    }
+
+    #[test]
+    fn enter_closes_the_about_dialog() {
+        let app = app_over(MockBackend::new());
+        let window = app.about.window();
+        app.main.invoke_about_requested();
+        assert!(window.is_visible());
+        press(window, Key::Return);
+        assert!(!window.is_visible(), "Enter right after it opened");
+    }
+
+    /// Command-W closes whichever window is in front on the Mac; on Windows
+    /// the windows without a menu bar take Ctrl+W themselves, as Escape, and
+    /// a dialog cancels on it.
+    #[test]
+    fn ctrl_w_closes_the_windows_without_a_menu_bar() {
+        type Open = fn() -> Rc<App>;
+        type Find = fn(&App) -> &slint::Window;
+        type Close = fn(&slint::Window);
+        let windows: [(&str, Open, Find); 9] = [
+            (
+                "equalizer",
+                || {
+                    let app = app_over(MockBackend::new());
+                    app.show_equalizer();
+                    app
+                },
+                |app| app.equalizer.window(),
+            ),
+            (
+                "AudioSync Guide",
+                || {
+                    let app = app_over(MockBackend::new());
+                    app.show_help();
+                    app
+                },
+                |app| app.help.window(),
+            ),
+            (
+                "double-audio guide",
+                || {
+                    let app = app_over(MockBackend::new());
+                    app.guide.show().expect("the guide shows headless");
+                    app.guide.invoke_take_focus();
+                    app
+                },
+                |app| app.guide.window(),
+            ),
+            (
+                "About dialog",
+                || {
+                    let app = app_over(MockBackend::new());
+                    app.main.invoke_about_requested();
+                    app
+                },
+                |app| app.about.window(),
+            ),
+            (
+                "Web Remote window",
+                || {
+                    let app = app_over(MockBackend::new());
+                    app.show_remote();
+                    app
+                },
+                |app| app.remote_window.window(),
+            ),
+            (
+                "zone name dialog",
+                || {
+                    let app = app_over(MockBackend::new());
+                    app.ask_new_zone();
+                    app
+                },
+                |app| app.zone_dialog.window(),
+            ),
+            (
+                "PIN dialog",
+                || {
+                    let app = app_over(MockBackend::new());
+                    app.preview_pin(false);
+                    app
+                },
+                |app| app.pin_dialog.window(),
+            ),
+            (
+                "password dialog",
+                || app_asking_password(false),
+                |app| app.password_dialog.window(),
+            ),
+            (
+                "Add by Address dialog",
+                || {
+                    let app = app_over(MockBackend::new());
+                    app.main.invoke_cast_add_address_requested();
+                    app
+                },
+                |app| app.cast_address_dialog.window(),
+            ),
+        ];
+        assert_eq!(
+            include_str!("../ui/dialogs.slint")
+                .matches("if event.text == Key.Escape")
+                .count(),
+            4,
+            "a new dialog that closes on Escape gets a row above"
+        );
+        let keys: [(&str, Close); 2] = [
+            ("Escape", |window| press(window, Key::Escape)),
+            ("Ctrl+W", |window| ctrl(window, "w")),
+        ];
+        for (name, open, find) in windows {
+            for (key, close) in keys {
+                let app = open();
+                draw_frames();
+                let window = find(&app);
+                assert!(window.is_visible(), "the {name} opens");
+                close(window);
+                assert!(!window.is_visible(), "{key} closes the {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn enter_closes_the_zone_message_without_a_field() {
+        let app = app_over(MockBackend::new());
+        for speaker in app.snapshot().speakers {
+            app.update(|b| b.set_speaker_enabled(&speaker.id, false));
+        }
+        app.ask_new_zone();
+        let window = app.zone_dialog.window();
+        assert!(window.is_visible());
+        assert!(!app.zone_dialog.get_show_field());
+        press(window, Key::Return);
+        assert!(!window.is_visible(), "Enter on the message closed it");
+    }
+
+    #[test]
+    fn a_stereo_pair_or_home_theater_row_names_its_members_or_the_missing_one() {
+        use crate::audio::backend::AirPlayGroup;
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let mut row = MockBackend::new()
+            .snapshot()
+            .speakers
+            .into_iter()
+            .find(|speaker| speaker.id == "airplay:kitchen")
+            .expect("the mock lists Kitchen");
+        assert_eq!(group_note(&strings, &row), "", "a single speaker");
+        let mut note = |kind, members: &[&str], missing: &[&str], incomplete| {
+            row.group = Some(AirPlayGroup {
+                kind,
+                members: members.iter().map(|name| (*name).to_owned()).collect(),
+                member_ids: Vec::new(),
+                missing: missing.iter().map(|name| (*name).to_owned()).collect(),
+                missing_ids: Vec::new(),
+                incomplete,
+            });
+            group_note(&strings, &row).to_string()
+        };
+        use AirPlayGroupKind::{HomeTheater, StereoPair};
+        assert_eq!(
+            note(StereoPair, &["Left", "Right"], &[], false),
+            "Stereo pair: Left and Right"
+        );
+        assert_eq!(
+            note(StereoPair, &["Left", "Right"], &["Right"], true),
+            "Stereo pair, missing Right"
+        );
+        assert_eq!(
+            note(StereoPair, &["Left"], &[], true),
+            "Stereo pair, a speaker is missing",
+            "a partner reported unreachable that was never seen"
+        );
+        assert_eq!(
+            note(HomeTheater, &["Left", "Right", "Sub"], &[], false),
+            "Home theater group: Left, Right and Sub"
+        );
+        assert_eq!(
+            note(HomeTheater, &["Left", "Right"], &["Left", "Right"], true),
+            "Home theater group, missing Left and Right"
+        );
+        assert_eq!(
+            note(StereoPair, &[], &[], false),
+            "Stereo pair",
+            "no member names known yet"
+        );
+        assert_eq!(note(HomeTheater, &[], &[], false), "Home theater group");
+        // Narrator reads the note before what the toggle does.
+        assert_eq!(
+            strings
+                .invoke_with_group_note("Stereo pair: Left and Right".into(), "Turn on".into())
+                .to_string(),
+            "Stereo pair: Left and Right. Turn on"
+        );
+        assert_eq!(
+            strings
+                .invoke_with_group_note("".into(), "Turn on".into())
+                .to_string(),
+            "Turn on"
+        );
+        for (problem, speaker, says) in [
+            (
+                ui_model::AirPlayProblem::PlaysThroughSpeakers,
+                "Den TV",
+                "Den TV plays through its home theater speakers",
+            ),
+            (
+                ui_model::AirPlayProblem::AppleTvPlays,
+                "Den",
+                "AudioSync already plays to Den's Apple TV",
+            ),
+            (
+                ui_model::AirPlayProblem::PlaysInGroup,
+                "Right",
+                "Right plays as part of its stereo pair or home theater group",
+            ),
+            (
+                ui_model::AirPlayProblem::ReceiverUnverified,
+                "Den TV",
+                "Den TV didn't answer as the speaker you paired, so it's off. If it's yours, use Forget Pairing and turn it on to pair again with its code.",
+            ),
+        ] {
+            let text = notice_text(
+                &strings,
+                &NoticeMessage::AirPlayCantPlay {
+                    speaker: speaker.into(),
+                    problem,
+                },
+            );
+            assert!(text.starts_with(says), "{text}");
+            assert!(!text.contains('\u{2014}'), "no em dash: {text}");
+        }
+    }
+
+    #[test]
+    fn a_refusing_airplay_speaker_promises_a_retry_only_while_it_stays_on() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let problem = ui_model::AirPlayProblem::Refused;
+        let speaker = "Den TV".to_owned();
+        let retrying = notice_text(
+            &strings,
+            &NoticeMessage::AirPlayRetrying {
+                speaker: speaker.clone(),
+                problem,
+            },
+        );
+        assert_eq!(
+            retrying,
+            "Den TV declined the stream. AudioSync tries again shortly."
+        );
+        let off = notice_text(
+            &strings,
+            &NoticeMessage::AirPlayCantPlay { speaker, problem },
+        );
+        assert_eq!(
+            off,
+            "Den TV declined the stream, so it's off. Turn it on again to try once more."
+        );
+    }
+
+    /// A speaker the sender gave up on is off, so its notice promises no
+    /// retry, in the Mac's words.
+    // covers: S356
+    #[test]
+    fn an_airplay_speaker_given_up_on_says_it_is_off() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let unreachable = "Den TV couldn't be reached, so it's off. Check that the speaker is on and on the same network, then turn it on again.";
+        for (problem, says) in [
+            (ui_model::AirPlayProblem::NotResponding, unreachable),
+            (ui_model::AirPlayProblem::ConnectionLost, unreachable),
+            (
+                ui_model::AirPlayProblem::Busy,
+                "Den TV seems to be busy with another device, so it's off. Turn it on again once it's free.",
+            ),
+        ] {
+            let off = notice_text(
+                &strings,
+                &NoticeMessage::AirPlayCantPlay {
+                    speaker: "Den TV".into(),
+                    problem,
+                },
+            );
+            assert_eq!(off, says, "{problem:?}");
+        }
+    }
+
+    /// The TV's own controls end the stream too, so the notice blames no
+    /// other app, as on the Mac.
+    // covers: C43, C114
+    #[test]
+    fn a_cast_speaker_that_ends_the_stream_says_it_stopped_it() {
+        let app = app_over(MockBackend::new());
+        let text = notice_text(
+            &app.strings(),
+            &NoticeMessage::CastCantPlay {
+                speaker: "Den TV".to_owned(),
+                problem: ui_model::CastProblem::TakenOver,
+            },
+        );
+        assert_eq!(
+            text,
+            "Den TV stopped AudioSync's stream, so it's off. Turn it on again to stream to it."
+        );
+    }
+
+    #[test]
+    fn source_notices_agree_with_several_apps_and_lowercase_all_apps_except_mid_sentence() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let several = NoticeMessage::SourceNotRunning {
+            source: SourceName::Apps(vec!["Chrome".into(), "Spotify".into()]),
+        };
+        assert_eq!(
+            notice_text(&strings, &several),
+            "Chrome and Spotify are not running. Open them first, or pick another source."
+        );
+        let one = NoticeMessage::SourceNotRunning {
+            source: SourceName::Apps(vec!["Chrome".into()]),
+        };
+        assert_eq!(
+            notice_text(&strings, &one),
+            "Chrome is not running. Open it first, or pick another source."
+        );
+        let refused = NoticeMessage::SourceRefused {
+            source: SourceName::AllAppsExcept(vec!["Chrome".into()]),
+        };
+        assert!(
+            notice_text(&strings, &refused)
+                .starts_with("AudioSync can't capture all apps except Chrome without")
+        );
+        assert_eq!(
+            notice_title(&strings, &refused),
+            "can't capture all apps except Chrome"
+        );
+    }
+
+    // covers: S242
+    #[test]
+    fn double_audio_from_all_apps_except_some_names_the_source_in_the_uis_words() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let source = SourceName::AllAppsExcept(vec!["Spotify".into(), "Chrome".into()]);
+        let text = notice_text(
+            &strings,
+            &NoticeMessage::HeardTwice {
+                source: Some(source.clone()),
+                mute: vec!["TV".into()],
+                shared: Vec::new(),
+                default_output: None,
+            },
+        );
+        let named = strings.invoke_source_all_except("Spotify and Chrome".into());
+        assert_eq!(named, "All Apps Except Spotify and Chrome");
+        assert!(text.contains(named.as_str()), "{text}");
+        let guide = Guide {
+            source: Some(source.clone()),
+            outputs: vec!["TV".into()],
+            steps: Vec::new(),
+        };
+        assert!(
+            guide_intro(&strings, &guide).contains(named.as_str()),
+            "the guide names it the same way"
+        );
+        // The steps say what the user does per app, not the menu's name.
+        let route = guide_step_text(
+            &strings,
+            &GuideStep::RouteApp {
+                app: source.clone(),
+            },
+        );
+        assert!(
+            route
+                .contains("find every app other than Spotify and Chrome and set each one's output"),
+            "{route}"
+        );
+        let unmuted = guide_step_text(&strings, &GuideStep::KeepAppUnmuted { app: source });
+        let expected = if cfg!(target_os = "linux") {
+            "Don't mute or turn down any app other than Spotify and Chrome in a volume control"
+        } else {
+            "Don't mute any app other than Spotify and Chrome in the Volume mixer"
+        };
+        assert!(unmuted.starts_with(expected), "{unmuted}");
+        let several = SourceName::Apps(vec!["Spotify".into(), "Chrome".into()]);
+        let route = guide_step_text(&strings, &GuideStep::RouteApp { app: several });
+        assert!(route.contains("find Spotify and Chrome and set"), "{route}");
+    }
+
+    #[test]
+    fn a_several_apps_source_that_is_not_running_is_named_in_the_uis_words() {
+        let mut audio = crate::audio::mock::MockBackend::empty();
+        audio.connect_output("speakers", "Speakers");
+        audio.add_app(2000, "Spotify.exe");
+        audio.add_app(3000, "Chrome.exe");
+        audio.refuse_captures(Some(crate::audio::backend::BackendError::SourceGone));
+        let adapter =
+            crate::adapter::AudioAdapter::new(audio, || "09.41".to_owned(), DebugLog::default());
+        let app = app_over(adapter);
+        app.main.invoke_mix_app_toggled(0);
+        app.main.invoke_mix_app_toggled(1);
+        app.main.invoke_speaker_toggled("lc:speakers".into());
+        app.main.invoke_power_toggled(true);
+        let notice = app.main.get_notices().row_data(0).expect("a notice");
+        assert!(
+            notice.message.starts_with("Chrome and Spotify "),
+            "{}",
+            notice.message
+        );
+        assert!(
+            notice.title.contains("Chrome and Spotify"),
+            "{}",
+            notice.title
+        );
+    }
+
+    // covers: S197, S198
+    #[test]
+    fn calibrate_alls_volume_fix_unmutes_the_reference_and_keeps_the_focus() {
+        use crate::audio::backend::OutputKind;
+        use crate::audio::mock::VolumeWrite;
+        for can_start in [false, true] {
+            let mut audio = crate::audio::mock::MockBackend::empty();
+            audio.connect_output_as("speakers", "Speakers", OutputKind::BuiltIn);
+            audio.connect_output_as("usb", "USB Speakers", OutputKind::UsbSpeakers);
+            audio.mute_output("speakers", true);
+            let record = audio.volume_record();
+            let mut adapter = crate::adapter::AudioAdapter::new(
+                audio,
+                || "09.41".to_owned(),
+                DebugLog::default(),
+            );
+            adapter.set_speaker_enabled("lc:speakers", true);
+            if can_start {
+                adapter.set_speaker_enabled("lc:usb", true);
+                adapter.set_running(true);
+            }
+            let app = app_over(adapter);
+            app.main.show().expect("the main window shows headless");
+            draw_frames();
+            assert_eq!(app.main.get_calibrate_all_can_start(), can_start);
+            assert_eq!(app.main.get_calibrate_all_volume(), DeviceVolumeHint::Muted);
+
+            // The card's stops: Calibrate All while it is enabled, then the fix.
+            let window = app.main.window();
+            let mut tabs = 0;
+            while app.main_focus.borrow().control != Some(MainControl::Calibration) {
+                assert!(tabs < 40, "the card takes the focus");
+                tab(window, 1);
+                tabs += 1;
+            }
+            if can_start {
+                tab(window, 1);
+            }
+            press(window, " ");
+            app.poll();
+            draw_frames();
+            assert_eq!(
+                record.writes(),
+                [VolumeWrite::Unmute {
+                    id: "speakers".to_owned()
+                }],
+                "can start: {can_start}"
+            );
+            assert_eq!(app.main.get_calibrate_all_volume(), DeviceVolumeHint::None);
+            if can_start {
+                // The fix's late focus-lost note clears the slot, so where the
+                // focus is shows by Shift+Tab: from Calibrate All, the card above.
+                press(window, Key::Backtab);
+            }
+            assert_eq!(
+                app.main_focus.borrow().control,
+                Some(MainControl::Equalizer),
+                "can start: {can_start}"
+            );
+        }
+    }
+
+    // covers: S353, S354
+    #[test]
+    fn an_app_only_the_last_mix_holds_is_listed_as_not_running() {
+        let mut audio = crate::audio::mock::MockBackend::empty();
+        audio.add_app(2000, "Spotify.exe");
+        audio.add_app(3000, "Chrome.exe");
+        let mut adapter =
+            crate::adapter::AudioAdapter::new(audio, || "09.41".to_owned(), DebugLog::default());
+        adapter.toggle_mix_app("Spotify.exe");
+        adapter.toggle_mix_app("Chrome.exe");
+        adapter.select_source("system");
+        adapter.audio_mut().quit_app(3000);
+        adapter.refresh_devices();
+        let app = app_over(adapter);
+        let names: Vec<String> = app
+            .main
+            .get_mix_apps()
+            .iter()
+            .map(|app| app.name.to_string())
+            .collect();
+        assert_eq!(names, ["Chrome (not running)", "Spotify"]);
+    }
+
+    #[test]
+    fn a_several_apps_source_that_quits_is_named_in_the_uis_words() {
+        use audiosync_core::policy::source_quit::WhenSourceQuits;
+        for setting in [WhenSourceQuits::Stop, WhenSourceQuits::SwitchToSystem] {
+            let mut audio = crate::audio::mock::MockBackend::empty();
+            audio.connect_output("speakers", "Speakers");
+            audio.add_app(2000, "Spotify.exe");
+            audio.add_app(3000, "Chrome.exe");
+            let mut adapter = crate::adapter::AudioAdapter::new(
+                audio,
+                || "09.41".to_owned(),
+                DebugLog::default(),
+            );
+            adapter.set_when_source_quits(setting);
+            adapter.toggle_mix_app("Spotify.exe");
+            adapter.toggle_mix_app("Chrome.exe");
+            adapter.set_speaker_enabled("lc:speakers", true);
+            adapter.set_running(true);
+            adapter.audio_mut().quit_app(2000);
+            adapter.audio_mut().quit_app(3000);
+            adapter.poll();
+            adapter.audio_mut().pass_mix_follow();
+            adapter.poll();
+            let app = app_over(adapter);
+            let notice = app.main.get_notices().row_data(0).expect("a notice");
+            assert!(
+                notice.message.starts_with("Spotify and Chrome "),
+                "{setting:?}: {}",
+                notice.message
+            );
+            assert!(
+                notice.title.contains("Spotify and Chrome"),
+                "{setting:?}: {}",
+                notice.title
+            );
+        }
+    }
+
+    #[test]
+    fn a_notices_dismiss_button_names_it_in_a_few_words() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let dismiss_label = |message: NoticeMessage| {
+            let notice = ui_model::Notice {
+                id: 1,
+                subject: "test".into(),
+                message,
+                time: "09.40".into(),
+                post: 0,
+            };
+            let item = notice_item(&strings, &notice);
+            strings.invoke_dismiss_notice(item.title).to_string()
+        };
+        assert_eq!(
+            dismiss_label(NoticeMessage::HeardTwice {
+                source: Some(SourceName::Named("Music Player".into())),
+                mute: vec!["Speakers".into()],
+                shared: vec!["Headphones".into()],
+                default_output: None,
+            }),
+            "Dismiss: double audio"
+        );
+        assert_eq!(
+            dismiss_label(NoticeMessage::AirPlayRetrying {
+                speaker: "Kitchen".into(),
+                problem: ui_model::AirPlayProblem::ConnectionLost,
+            }),
+            "Dismiss: Kitchen reconnecting"
+        );
+        assert_eq!(
+            dismiss_label(NoticeMessage::AirPlayRetrying {
+                speaker: "Kitchen".into(),
+                problem: ui_model::AirPlayProblem::TooManyAirPlay2Speakers,
+            }),
+            "Dismiss: Kitchen waiting"
+        );
+        // Its notice is titled waiting too, as on the Mac.
+        assert_eq!(
+            dismiss_label(NoticeMessage::AirPlayRetrying {
+                speaker: "Kitchen".into(),
+                problem: ui_model::AirPlayProblem::PtpOtherNetwork,
+            }),
+            "Dismiss: Kitchen waiting"
+        );
+        // The names say what happened: the speaker was turned off, and the
+        // unreadable file was kept.
+        assert_eq!(
+            dismiss_label(NoticeMessage::SpeakerFailed {
+                speaker: "Kitchen".into(),
+            }),
+            "Dismiss: Kitchen didn't start, turned off"
+        );
+        assert_eq!(
+            dismiss_label(NoticeMessage::SettingsKeptAside {
+                file: "f".into(),
+                newer: false,
+            }),
+            "Dismiss: settings unreadable, copy kept"
+        );
+        // A file a newer AudioSync wrote reads fine; Narrator must not call it unreadable.
+        assert_eq!(
+            dismiss_label(NoticeMessage::SettingsKeptAside {
+                file: "f".into(),
+                newer: true,
+            }),
+            "Dismiss: settings from a newer version"
+        );
+        assert_eq!(
+            dismiss_label(NoticeMessage::PairingsKeptAside { file: "f".into() }),
+            "Dismiss: pairings unreadable, copy kept"
+        );
+        // Every kind gets a name of a few words, never the whole message.
+        let messages = [
+            NoticeMessage::NoSpeaker,
+            NoticeMessage::SourceQuit {
+                source: SourceName::Named("A".into()),
+            },
+            NoticeMessage::SourceNotRunning {
+                source: SourceName::Named("A".into()),
+            },
+            NoticeMessage::SourceRefused {
+                source: SourceName::Named("A".into()),
+            },
+            NoticeMessage::InputNotConnected { source: "A".into() },
+            NoticeMessage::InputDisconnected { source: "A".into() },
+            NoticeMessage::MicrophoneBlocked { source: "A".into() },
+            NoticeMessage::CaptureFailed,
+            NoticeMessage::CaptureLost,
+            NoticeMessage::WaitingForAudio { app: None },
+            NoticeMessage::SpeakerFailed {
+                speaker: "A".into(),
+            },
+            NoticeMessage::SpeakerLost {
+                speaker: "A".into(),
+            },
+            NoticeMessage::SpeakerBusy {
+                speaker: "A".into(),
+            },
+            NoticeMessage::SpeakerStruggling {
+                speaker: "A".into(),
+            },
+            NoticeMessage::PairFirst {
+                speaker: "A".into(),
+            },
+            NoticeMessage::AirPlayCantPlay {
+                speaker: "A".into(),
+                problem: ui_model::AirPlayProblem::Refused,
+            },
+            NoticeMessage::AirPlayStopped,
+            NoticeMessage::AirPlayPtpPortsTaken,
+            NoticeMessage::SettingsNotSaved,
+            NoticeMessage::PairingsNotSaved,
+            NoticeMessage::SettingsKeptAside {
+                file: "f".into(),
+                newer: false,
+            },
+            NoticeMessage::SettingsKeptAside {
+                file: "f".into(),
+                newer: true,
+            },
+            NoticeMessage::PairingsKeptAside { file: "f".into() },
+            NoticeMessage::NoSoundOutput,
+            NoticeMessage::LaunchAtLoginFailed,
+            NoticeMessage::LaunchAtLoginNotRemoved,
+            NoticeMessage::LaunchAtLoginOffInSettings,
+            NoticeMessage::RemoteOnPublicNetwork,
+        ];
+        for message in messages {
+            let label = dismiss_label(message.clone());
+            let words = label.split_whitespace().count();
+            assert!(
+                (3..=6).contains(&words),
+                "{message:?}: \"{label}\" is not a short name"
+            );
+        }
+    }
+
+    // covers: S385
+    #[test]
+    fn settings_from_a_newer_version_get_their_own_text() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let text = |newer| {
+            notice_text(
+                &strings,
+                &NoticeMessage::SettingsKeptAside {
+                    file: "settings.newer-1.json".into(),
+                    newer,
+                },
+            )
+        };
+        let newer = text(true);
+        assert!(
+            newer.starts_with("Your saved settings are from a newer version of AudioSync")
+                && newer.contains("kept as settings.newer-1.json")
+                && newer.ends_with("Update AudioSync to get your settings back."),
+            "{newer}"
+        );
+        let ignored = text(false);
+        assert!(
+            ignored.starts_with("AudioSync couldn't read your saved settings when it started"),
+            "{ignored}"
+        );
+        let pairings = notice_text(
+            &strings,
+            &NoticeMessage::PairingsKeptAside { file: "f".into() },
+        );
+        assert!(
+            pairings.starts_with("AudioSync couldn't read your AirPlay pairings"),
+            "{pairings}"
+        );
+    }
+
+    /// The App over `backend`, with its main window shown and drawn once.
+    fn main_window_over(backend: MockBackend) -> Rc<App> {
+        let app = app_over(backend);
+        app.main.show().expect("the main window shows headless");
+        draw_frames();
+        app
+    }
+
+    /// Lets a dismissed notice fade and close, which it does before the
+    /// main window drops it; the clock is held.
+    pub(super) fn let_notice_close() {
+        advance_clock(Duration::from_millis(400));
+        draw_frames();
+    }
+
+    #[test]
+    fn dismissing_a_notice_with_the_keyboard_focuses_the_next_then_the_switch() {
+        let mut backend = MockBackend::new();
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        backend.post("start", NoticeMessage::NoSpeaker, "09.41");
+        let app = main_window_over(backend);
+        let window = app.main.window();
+        hold_clock();
+        // The streaming switch, then the newest notice's dismiss button.
+        tab(window, 3);
+        press(window, " ");
+        let_notice_close();
+        assert_eq!(app.snapshot().notices.len(), 1, "Space dismissed it");
+        press(window, " ");
+        let_notice_close();
+        assert_eq!(
+            app.snapshot().notices.len(),
+            0,
+            "the focus moved to the next notice, which Space dismissed"
+        );
+        assert!(!app.snapshot().running);
+        press(window, " ");
+        assert!(
+            app.snapshot().running,
+            "with no notice left, the streaming switch has the focus"
+        );
+    }
+
+    /// The example speakers plus a virtual output that is off, so it is
+    /// listed only while Show Virtual Devices is on.
+    fn main_window_with_listed_cable() -> Rc<App> {
+        let mut backend = MockBackend::new();
+        let mut cable = backend.snapshot().speaker("local:desk").unwrap().clone();
+        cable.id = "local:cable".into();
+        cable.name = "Cable Input".into();
+        cable.kind = ui_model::SpeakerKind::Virtual;
+        cable.enabled = false;
+        backend.add_speaker(cable);
+        let app = app_over(backend);
+        app.main.invoke_show_virtual_devices_toggled(true);
+        app.main.show().expect("the main window shows headless");
+        draw_frames();
+        app
+    }
+
+    fn enabled(app: &App, id: &str) -> bool {
+        app.snapshot().speaker(id).unwrap().enabled
+    }
+
+    #[test]
+    fn a_focused_speaker_row_that_goes_hands_the_focus_to_the_next_rows_options() {
+        let app = main_window_with_listed_cable();
+        let window = app.main.window();
+        // Switch, Several apps, source, Mute, master volume, Save as Preset…,
+        // Equalizer, Calibrate All, the reference's volume fix, then the
+        // rows: This PC's, then the connected speakers' by name.
+        tab(window, 19);
+        press(window, " ");
+        assert!(enabled(&app, "local:cable"), "the cable row has the focus");
+        press(window, " ");
+        assert!(!enabled(&app, "local:cable"));
+
+        // Off and no longer shown, its row goes: the focus moves to the
+        // options of the row after it, the desk speaker's, not to a control
+        // whose Space acts on every speaker.
+        app.main.invoke_show_virtual_devices_toggled(false);
+        draw_frames();
+        app.update(|b| b.set_running(false));
+        draw_frames();
+        let headset = enabled(&app, "local:bt");
+        tab(window, 1);
+        press(window, " ");
+        assert_ne!(
+            enabled(&app, "local:bt"),
+            headset,
+            "the next stop after the desk row's options is the headset's toggle"
+        );
+    }
+
+    #[test]
+    fn typing_in_a_delay_field_keeps_the_focus_there_when_its_list_is_rebuilt() {
+        let app = main_window_with_listed_cable();
+        let window = app.main.window();
+        app.main.invoke_sync_toggled("local:desk".into());
+        draw_frames();
+        // The cable row's toggle, delay and options, then the desk row's
+        // toggle, delay, options, two steps and its field.
+        tab(window, 27);
+        press(window, "5");
+        let draft = || {
+            let shown = app.snapshot().speaker("local:desk").unwrap().delay_ms;
+            app.ui
+                .borrow()
+                .delay_drafts
+                .get("local:desk")
+                .and_then(|typed| typed.text(shown).map(str::to_owned))
+        };
+        assert_eq!(
+            draft().as_deref(),
+            Some("5"),
+            "the desk's field has the focus"
+        );
+
+        // The cable row goes, so Connected Speakers is rebuilt.
+        app.main.invoke_show_virtual_devices_toggled(false);
+        draw_frames();
+        press(window, "0");
+        assert_eq!(
+            draft().as_deref(),
+            Some("50"),
+            "the rebuilt row's field has the focus, the typed text and the cursor at its end"
+        );
+        let applied = || app.snapshot().speaker("local:desk").unwrap().delay_ms;
+        assert_eq!(applied(), Some(120.0), "typing applied nothing");
+        press(window, Key::Return);
+        assert!(!enabled(&app, "local:desk"), "Enter left the speaker off");
+        assert_eq!(applied(), Some(50.0), "Enter applied the typed delay");
+        assert!(
+            app.ui.borrow().sync_open.contains("local:desk"),
+            "and kept the controls open"
+        );
+        assert_eq!(
+            app.main_focus.borrow().speaker,
+            Some(("local:desk".into(), RowPart::Sync)),
+            "the desk's field keeps the focus"
+        );
+    }
+
+    #[test]
+    fn the_several_apps_list_opens_from_the_keyboard_and_checks_apps_and_the_mode() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        let window = app.main.window();
+        assert!(!app.main.get_mix_open(), "folded until asked for");
+        // The main switch, the source, then Several apps under it.
+        tab(window, 3);
+        press(window, " ");
+        draw_frames();
+        assert!(app.main.get_mix_open());
+        assert_eq!(app.main.get_mix_apps().row_count(), 2);
+
+        app.main.invoke_mix_app_toggled(1);
+        app.main.invoke_mix_app_toggled(0);
+        let state = app.snapshot();
+        assert!(state.mix_apps.iter().all(|a| a.checked));
+        assert!(app.main.get_mix_apps().row_data(1).unwrap().checked);
+        app.main.invoke_mix_mode_selected(true);
+        assert!(app.snapshot().mix_all_except);
+        assert!(app.main.get_mix_all_except());
+
+        // Folded again by the user, it stays folded while the mix plays on.
+        press(window, " ");
+        draw_frames();
+        assert!(!app.main.get_mix_open());
+        app.refresh();
+        assert!(!app.main.get_mix_open(), "a refresh never reopens it");
+    }
+
+    /// A click on a flyout row's name, not only on its round mark, switches
+    /// the speaker, as the Mac panel's rows do (S439).
+    // covers: S439
+    #[test]
+    fn a_click_anywhere_on_a_flyout_row_switches_its_speaker() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.refresh();
+        app.flyout.show().unwrap();
+        draw_frames();
+        let off = ElementHandle::find_by_element_type_name(&app.flyout, "FlyoutRow")
+            .find(|row| row.accessible_checked() == Some(false))
+            .expect("a flyout row that is off");
+        let name = off.accessible_label().unwrap();
+        let (at, size) = (off.absolute_position(), off.size());
+        click(
+            app.flyout.window(),
+            at.x + size.width - 12.0,
+            at.y + size.height / 2.0,
+        );
+        app.refresh();
+        draw_frames();
+        let row = ElementHandle::find_by_accessible_label(&app.flyout, &name)
+            .find(|row| row.accessible_checked().is_some())
+            .expect("the row again");
+        assert_eq!(row.accessible_checked(), Some(true), "{name} switched on");
+    }
+
+    /// A speaker name too long for its flyout row ends in "…" inside the
+    /// row and stays put, as in the tray panel's drawing; the tooltip and
+    /// Narrator still give the whole name (S439).
+    // covers: S439
+    #[test]
+    fn a_long_name_in_a_flyout_row_ends_in_an_ellipsis() {
+        use i_slint_backend_testing::ElementHandle;
+        let name = "A speaker whose name is far too long for the row the tray panel gives it";
+        let mut backend = MockBackend::new();
+        let mut long = backend.snapshot().speaker("local:desk").unwrap().clone();
+        long.id = "local:long".into();
+        long.name = name.into();
+        backend.add_speaker(long);
+        hold_clock();
+        let app = app_over(backend);
+        app.refresh();
+        app.flyout.show().unwrap();
+        app.flyout.global::<Motion>().set_on(true);
+        draw_frames();
+        let row = || {
+            ElementHandle::find_by_element_type_name(&app.flyout, "FlyoutRow")
+                .find(|row| {
+                    row.accessible_label()
+                        .is_some_and(|label| label.contains(name))
+                })
+                .expect("the long name's row")
+        };
+        // Everything the row draws, as (left, right) edges.
+        let edges = || -> Vec<(f32, f32)> {
+            row()
+                .query_descendants()
+                .find_all()
+                .into_iter()
+                .map(|part| {
+                    let x = part.absolute_position().x;
+                    (x, x + part.size().width)
+                })
+                .collect()
+        };
+        let right = row().absolute_position().x + row().size().width;
+        let start = edges();
+        assert!(
+            start.iter().all(|&(_, end)| end <= right + 0.5),
+            "nothing runs past the row's end at {right}: {start:?}"
+        );
+        advance_clock(Duration::from_millis(3000));
+        draw_frames();
+        assert_eq!(edges(), start, "the name stays put");
+    }
+
+    /// The flyout's mark and name are a button and the first stop for Tab:
+    /// Space on it opens the main window, as a click does (S439).
+    // covers: S439
+    #[test]
+    fn the_flyout_brand_is_the_first_tab_stop_and_opens_the_app() {
+        let app = app_over(MockBackend::new());
+        app.flyout.show().unwrap();
+        app.flyout.invoke_take_focus();
+        draw_frames();
+        let window = app.flyout.window();
+        tab(window, 1);
+        press(window, " ");
+        assert!(app.main.window().is_visible());
+    }
+
+    /// The logo and wordmark at the top of the flyout open the main window,
+    /// with Open AudioSync as their tooltip, as in the Mac panel.
+    #[test]
+    fn the_flyout_logo_opens_the_main_window() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.flyout.show().unwrap();
+        draw_frames();
+        hold_clock();
+        let logo = ElementHandle::find_by_element_type_name(&app.flyout, "BrandMark")
+            .next()
+            .expect("the flyout's logo");
+        let (at, size) = (logo.absolute_position(), logo.size());
+        let position =
+            slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
+        let window = app.flyout.window();
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        advance_clock(Duration::from_secs(2));
+        slint::platform::update_timers_and_animations();
+        assert!(
+            ElementHandle::find_by_element_id(&app.flyout, "TrayFlyout::brand-tip")
+                .next()
+                .is_some(),
+            "a tooltip on the logo"
+        );
+        let switch = ElementHandle::find_by_accessible_label(&app.flyout, "Streaming")
+            .next()
+            .expect("the flyout's streaming switch");
+        click(window, switch.absolute_position().x - 5.0, position.y);
+        assert!(
+            !app.main.window().is_visible(),
+            "a click beside the switch opens nothing"
+        );
+        click(window, position.x, position.y);
+        assert!(app.main.window().is_visible());
+        assert!(!app.flyout.window().is_visible());
+    }
+
+    /// Resting on the flyout's streaming switch shows a tooltip, Turn On or
+    /// Turn Off by its state, as the Mac panel's power switch does.
+    #[test]
+    fn the_flyout_streaming_switch_has_a_tooltip() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.flyout.show().unwrap();
+        draw_frames();
+        hold_clock();
+        let switch = ElementHandle::find_by_accessible_label(&app.flyout, "Streaming")
+            .next()
+            .expect("the flyout's streaming switch");
+        let (at, size) = (switch.absolute_position(), switch.size());
+        let position =
+            slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
+        app.flyout
+            .window()
+            .dispatch_event(WindowEvent::PointerMoved { position });
+        advance_clock(Duration::from_secs(2));
+        slint::platform::update_timers_and_animations();
+        assert!(
+            ElementHandle::find_by_element_id(&app.flyout, "TrayFlyout::power-tip")
+                .next()
+                .is_some(),
+            "a tooltip on the streaming switch"
+        );
+    }
+
+    /// With no notice, the block holding the source drop-down starts the
+    /// flyout's body: no line sits between it and the header, as in the Mac
+    /// panel.
+    #[test]
+    fn no_line_sits_between_the_flyout_header_and_its_source() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        app.flyout.show().unwrap();
+        draw_frames();
+        assert_eq!(app.flyout.get_notices().row_count(), 0);
+        let source = ElementHandle::find_by_accessible_label(&app.flyout, "Audio Source")
+            .next()
+            .expect("the flyout's source drop-down");
+        let body = ElementHandle::find_by_element_id(&app.flyout, "TrayFlyout::body")
+            .next()
+            .expect("the flyout's body");
+        assert_eq!(
+            source.absolute_position().y,
+            body.absolute_position().y + 10.0,
+            "inside the block's padding"
+        );
+    }
+
+    /// Several Apps… is a link under the flyout's source drop-down, as the
+    /// Mac panel's source menu ends in its submenu: the drop-down holds the
+    /// sources only, and the link opens the main window's list and leaves the
+    /// source as it was.
+    // covers: S419
+    #[test]
+    fn several_apps_under_the_flyout_sources_opens_the_main_windows_list() {
+        use i_slint_backend_testing::ElementHandle;
+        let app = app_over(MockBackend::new());
+        let sources = app.snapshot().sources.len();
+        let chosen = app.snapshot().source_id;
+        assert_eq!(app.flyout.get_sources().row_count(), sources);
+        assert_eq!(app.main.get_sources().row_count(), sources);
+
+        app.flyout.show().unwrap();
+        let links: Vec<_> =
+            ElementHandle::find_by_accessible_label(&app.flyout, "Several Apps…").collect();
+        assert_eq!(links.len(), 1);
+        links[0].invoke_accessible_default_action();
+        assert!(app.main.get_mix_open());
+        assert!(app.main.window().is_visible());
+        assert!(!app.flyout.window().is_visible());
+        assert_eq!(app.snapshot().source_id, chosen);
+    }
+
+    #[test]
+    fn the_several_apps_list_opens_by_itself_once_as_the_source_becomes_a_mix() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        assert!(!app.main.get_mix_open());
+        app.main.invoke_mix_app_toggled(0);
+        assert!(!app.main.get_mix_open(), "one app is no mix yet");
+        app.main.invoke_mix_app_toggled(1);
+        assert!(app.main.get_mix_open());
+        app.main.set_mix_open(false);
+        app.main.invoke_mix_app_toggled(1);
+        app.main.invoke_mix_app_toggled(1);
+        assert!(
+            app.main.get_mix_open(),
+            "back to a mix after one app opens it again"
+        );
+        app.main.set_mix_open(false);
+        app.refresh();
+        assert!(!app.main.get_mix_open());
+    }
+
+    #[test]
+    fn a_focused_speaker_row_keeps_the_focus_when_its_list_is_rebuilt() {
+        let app = main_window_with_listed_cable();
+        let window = app.main.window();
+        tab(window, 17);
+        let bedroom = enabled(&app, "airplay:bedroom");
+        press(window, " ");
+        assert_ne!(
+            enabled(&app, "airplay:bedroom"),
+            bedroom,
+            "it has the focus"
+        );
+        press(window, " ");
+        assert_eq!(enabled(&app, "airplay:bedroom"), bedroom);
+
+        // The cable row goes, so Connected Speakers is rebuilt.
+        app.main.invoke_show_virtual_devices_toggled(false);
+        draw_frames();
+        press(window, " ");
+        assert_ne!(
+            enabled(&app, "airplay:bedroom"),
+            bedroom,
+            "the rebuilt row has the focus back"
+        );
+    }
+
+    #[test]
+    fn the_presets_previews_fill_the_card_and_the_notice() {
+        use crate::ui_model::PresetsPreview;
+        let app = app_over(MockBackend::presets_preview(PresetsPreview::List));
+        assert_eq!(
+            preset_rows(&app),
+            [
+                ("Evening".to_owned(), true),
+                ("Movie Night".to_owned(), false),
+                ("Whole House".to_owned(), false)
+            ]
+        );
+        assert_eq!(app.main.get_notices().row_count(), 0);
+
+        let app = app_over(MockBackend::presets_preview(PresetsPreview::LeftOff));
+        let notice = app.main.get_notices().row_data(0).expect("a notice");
+        assert!(
+            notice.message.contains("Whole House")
+                && notice.message.contains("Den")
+                && notice.message.contains("Patio"),
+            "{}",
+            notice.message
+        );
+
+        let app = app_over(MockBackend::presets_preview(PresetsPreview::Empty));
+        assert!(
+            preset_rows(&app).is_empty(),
+            "the card shows its empty line"
+        );
+    }
+
+    fn preset_rows(app: &App) -> Vec<(String, bool)> {
+        app.main
+            .get_presets()
+            .iter()
+            .map(|row| (row.name.to_string(), row.current))
+            .collect()
+    }
+
+    fn preset_ids(app: &App) -> Vec<String> {
+        app.snapshot().presets.into_iter().map(|p| p.id).collect()
+    }
+
+    fn ctrl(window: &slint::Window, key: &str) {
+        window.dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
+        press(window, key);
+        window.dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
+    }
+
+    /// Presses `key` in `window` while `modifiers` are held.
+    fn held(window: &slint::Window, modifiers: &[Key], key: impl Into<SharedString>) {
+        for &modifier in modifiers {
+            window.dispatch_event(WindowEvent::KeyPressed {
+                text: modifier.into(),
+            });
+        }
+        press(window, key);
+        for &modifier in modifiers.iter().rev() {
+            window.dispatch_event(WindowEvent::KeyReleased {
+                text: modifier.into(),
+            });
+        }
+    }
+
+    // covers: S259, S260, S263, S264
+    #[test]
+    fn the_presets_card_and_the_flyout_list_the_presets_and_mark_the_current_one() {
+        let app = app_over(MockBackend::new());
+        assert!(
+            preset_rows(&app).is_empty(),
+            "the card shows its empty line"
+        );
+        assert_eq!(app.flyout.get_presets().row_count(), 0, "no flyout row");
+
+        app.save_preset("Evening");
+        app.update(|b| b.set_master_volume(30.0));
+        app.save_preset("  ");
+        assert_eq!(
+            preset_rows(&app),
+            [("Evening".into(), false), ("Preset 2".into(), true)],
+            "list order, a blank name numbered, what plays now marked"
+        );
+        assert_eq!(app.flyout.get_presets().row_count(), 2);
+        assert_eq!(app.flyout.get_current_preset(), "Preset 2");
+
+        app.update(|b| b.set_master_volume(31.0));
+        assert!(preset_rows(&app).iter().all(|(_, current)| !current));
+        assert_eq!(
+            app.flyout.get_current_preset(),
+            "",
+            "the flyout says Choose a Preset"
+        );
+    }
+
+    // covers: S261, S266
+    #[test]
+    fn ctrl_and_a_digit_recalls_the_preset_in_that_place_in_every_window() {
+        let app = app_over(MockBackend::new());
+        app.save_preset("Evening");
+        app.update(|b| b.set_master_volume(30.0));
+        app.save_preset("Party");
+        app.update(|b| b.set_master_volume(55.0));
+
+        app.equalizer.show().expect("the equalizer shows headless");
+        draw_frames();
+        ctrl(app.equalizer.window(), "1");
+        assert_eq!(preset_rows(&app)[0], ("Evening".into(), true));
+        assert!(!app.main.window().is_visible(), "a recall opens nothing");
+        assert!(!app.zone_dialog.window().is_visible());
+
+        ctrl(app.equalizer.window(), "2");
+        assert_eq!(preset_rows(&app)[1], ("Party".into(), true));
+        app.update(|b| b.set_master_volume(55.0));
+        ctrl(app.equalizer.window(), "3");
+        assert!(
+            preset_rows(&app).iter().all(|(_, current)| !current),
+            "an empty place does nothing"
+        );
+        assert_eq!(app.snapshot().master_volume, 55.0);
+
+        app.help.invoke_preset_shortcut(1);
+        assert_eq!(preset_rows(&app)[0], ("Evening".into(), true));
+        app.remote_window.invoke_preset_shortcut(2);
+        assert_eq!(preset_rows(&app)[1], ("Party".into(), true));
+    }
+
+    #[test]
+    fn f1_ctrl_n_and_f5_alone_work_in_the_equalizer_the_guides_and_the_web_remote() {
+        let backend = MockBackend::new();
+        let refreshes = backend.refreshes.clone();
+        let app = app_over(backend);
+        type Open = fn(&App) -> &slint::Window;
+        let windows: [(&str, Open); 4] = [
+            ("equalizer", |app| {
+                app.show_equalizer();
+                app.equalizer.window()
+            }),
+            ("Guide", |app| {
+                app.show_help();
+                app.help.window()
+            }),
+            ("notice guide", |app| {
+                app.guide.show().expect("the guide shows headless");
+                app.guide.invoke_take_focus();
+                app.guide.window()
+            }),
+            ("web remote", |app| {
+                app.show_remote();
+                app.remote_window.window()
+            }),
+        ];
+        for (name, open) in windows {
+            let _ = app.help.hide();
+            let window = open(&app);
+            draw_frames();
+            let before = refreshes.get();
+            held(window, &[Key::Shift], Key::F1);
+            held(window, &[Key::Control, Key::Shift], "n");
+            held(window, &[Key::Shift], Key::F5);
+            held(window, &[Key::Control, Key::Shift], "w");
+            assert!(window.is_visible(), "Ctrl+Shift+W in the {name}");
+            assert_eq!(
+                app.help.window().is_visible(),
+                name == "Guide",
+                "Shift+F1 in the {name}"
+            );
+            assert!(
+                !app.zone_dialog.window().is_visible(),
+                "Ctrl+Shift+N in the {name}"
+            );
+            assert_eq!(refreshes.get(), before, "Shift+F5 in the {name}");
+            press(window, Key::F1);
+            assert!(app.help.window().is_visible(), "F1 in the {name}");
+            ctrl(window, "n");
+            assert!(
+                app.zone_dialog.window().is_visible(),
+                "Ctrl+N in the {name}"
+            );
+            let _ = app.zone_dialog.hide();
+            let before = refreshes.get();
+            press(window, Key::F5);
+            assert_eq!(refreshes.get(), before + 1, "F5 in the {name}");
+        }
+
+        // T33: an open name dialog comes to the front as it is.
+        app.ask_save_preset();
+        let heading = app.zone_dialog.get_heading();
+        ctrl(app.equalizer.window(), "n");
+        assert_eq!(app.zone_dialog.get_heading(), heading);
+    }
+
+    #[test]
+    fn ctrl_win_and_a_digit_recalls_nothing_and_ctrl_shift_w_leaves_a_dialog_open() {
+        let app = app_over(MockBackend::new());
+        app.save_preset("Evening");
+        app.update(|b| b.set_master_volume(30.0));
+
+        app.equalizer.show().expect("the equalizer shows headless");
+        draw_frames();
+        held(app.equalizer.window(), &[Key::Control, Key::Meta], "1");
+        assert!(!preset_rows(&app)[0].1, "Ctrl+Win+1 in the equalizer");
+
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        app.flyout.invoke_take_focus();
+        draw_frames();
+        held(app.flyout.window(), &[Key::Control, Key::Meta], "1");
+        assert!(!preset_rows(&app)[0].1, "Ctrl+Win+1 in the flyout");
+
+        app.ask_save_preset();
+        draw_frames();
+        held(app.zone_dialog.window(), &[Key::Control, Key::Shift], "w");
+        assert!(app.zone_dialog.window().is_visible(), "Ctrl+Shift+W");
+        ctrl(app.zone_dialog.window(), "w");
+        assert!(!app.zone_dialog.window().is_visible(), "Ctrl+W");
+    }
+
+    #[test]
+    fn ctrl_shift_w_and_ctrl_shift_q_do_nothing_in_the_about_dialog() {
+        let app = app_over(MockBackend::new());
+        let exits = Rc::new(Cell::new(0));
+        let counted = exits.clone();
+        app.about
+            .on_exit_requested(move || counted.set(counted.get() + 1));
+        let window = app.about.window();
+        app.main.invoke_about_requested();
+        draw_frames();
+        held(window, &[Key::Control, Key::Shift], "w");
+        assert!(window.is_visible(), "Ctrl+Shift+W");
+        held(window, &[Key::Control, Key::Shift], "q");
+        assert_eq!(exits.get(), 0, "Ctrl+Shift+Q");
+        ctrl(window, "q");
+        assert_eq!(exits.get(), 1, "Ctrl+Q");
+    }
+
+    // covers: S260, S266
+    #[test]
+    fn a_recall_from_the_flyout_opens_nothing_and_leaves_the_flyout_as_it_is() {
+        let app = app_over(MockBackend::new());
+        app.save_preset("Evening");
+        app.update(|b| b.set_master_volume(30.0));
+        let id = preset_ids(&app)[0].clone();
+
+        app.flyout.invoke_preset_recall_requested(id.into());
+        assert_eq!(app.flyout.get_current_preset(), "Evening");
+        assert!(!app.main.window().is_visible());
+        assert!(!app.zone_dialog.window().is_visible());
+        assert_eq!(app.flyout.get_presets().row_count(), 1);
+    }
+
+    // covers: S261, S262, S269
+    #[test]
+    fn save_rename_update_and_delete_ask_nothing_and_say_what_they_did() {
+        let app = main_window_over(MockBackend::new());
+        app.ask_save_preset();
+        assert_eq!(*app.dialog_purpose.borrow(), DialogPurpose::SavePreset);
+        assert_eq!(app.zone_dialog.get_heading(), "Save Preset");
+        assert_eq!(app.zone_dialog.get_field_label(), "Preset name");
+        assert_eq!(app.zone_dialog.get_placeholder(), "Evening, Party…");
+        app.confirm_dialog("Evening");
+        assert_eq!(preset_rows(&app), [("Evening".into(), true)]);
+        assert_eq!(app.main.get_notice_announcement(), "Evening saved");
+
+        let id = preset_ids(&app)[0].clone();
+        app.ask_rename_preset(&id);
+        assert_eq!(app.zone_dialog.get_heading(), "Rename Preset");
+        assert_eq!(app.zone_dialog.get_name(), "Evening");
+        app.confirm_dialog("   ");
+        assert_eq!(preset_rows(&app)[0].0, "Evening", "a blank name keeps it");
+        app.ask_rename_preset(&id);
+        app.confirm_dialog("Late");
+        assert_eq!(preset_rows(&app)[0].0, "Late");
+
+        app.save_preset("Party");
+        app.update(|b| b.set_master_volume(30.0));
+        app.update_preset(&id);
+        assert!(
+            !app.zone_dialog.window().is_visible(),
+            "Update asks nothing"
+        );
+        assert_eq!(preset_ids(&app)[0], id, "it keeps its ID and place");
+        assert_eq!(preset_rows(&app)[0], ("Late".into(), true));
+        assert_eq!(app.main.get_notice_announcement(), "Late updated");
+
+        app.delete_preset(&id);
+        assert!(
+            !app.zone_dialog.window().is_visible(),
+            "Delete asks nothing"
+        );
+        assert_eq!(preset_rows(&app), [("Party".into(), false)]);
+        assert_eq!(app.main.get_notice_announcement(), "Late deleted");
+    }
+
+    // covers: S262
+    #[test]
+    fn save_as_preset_with_no_speaker_on_says_what_to_do_first() {
+        let app = main_window_over(MockBackend::new());
+        for speaker in app.snapshot().speakers {
+            app.update(|b| b.set_speaker_enabled(&speaker.id, false));
+        }
+        app.ask_save_preset();
+        assert_eq!(*app.dialog_purpose.borrow(), DialogPurpose::Message);
+        assert_eq!(
+            app.zone_dialog.get_message(),
+            "Turn on the speakers you want in the preset first, then save it."
+        );
+        assert!(preset_rows(&app).is_empty());
+    }
+
+    #[test]
+    fn an_update_that_fails_while_a_name_is_typed_says_why_and_keeps_the_dialog() {
+        let app = main_window_over(MockBackend::new());
+        app.save_preset("Evening");
+        let id = preset_ids(&app)[0].clone();
+        for speaker in app.snapshot().speakers {
+            app.update(|b| b.set_speaker_enabled(&speaker.id, false));
+        }
+        app.equalizer.invoke_save_curve();
+        app.zone_dialog.set_name("Late night".into());
+        let heading = app.zone_dialog.get_heading();
+
+        app.update_preset(&id);
+        let why = "Turn on the speakers you want in the preset first, then save it.";
+        assert!(app.zone_dialog.window().is_visible());
+        assert_eq!(app.zone_dialog.get_heading(), heading);
+        assert_eq!(app.zone_dialog.get_name(), "Late night");
+        assert_eq!(*app.dialog_purpose.borrow(), DialogPurpose::SaveCurve);
+        assert_eq!(app.main.get_notice_announcement(), why);
+        let notices = app.snapshot().notices;
+        let notice = notices.last().expect("a notice says it");
+        assert_eq!(notice_text(&app.strings(), &notice.message), why);
+
+        app.dismiss_notice(notice.id);
+        assert!(app.snapshot().notices.is_empty());
+    }
+
+    // covers: S267
+    #[test]
+    fn after_a_delete_the_focus_goes_back_to_the_presets_row() {
+        let app = main_window_over(MockBackend::new());
+        app.save_preset("Evening");
+        app.save_preset("Party");
+        draw_frames();
+        let ids = preset_ids(&app);
+        let window = app.main.window();
+
+        app.delete_preset(&ids[0]);
+        draw_frames();
+        assert!(!app.main.get_focus_presets(), "the row took it");
+        app.update(|b| b.set_master_volume(12.0));
+        assert!(!preset_rows(&app)[0].1);
+        press(window, " ");
+        draw_frames();
+        press(window, Key::DownArrow);
+        press(window, Key::Return);
+        assert_eq!(
+            preset_rows(&app),
+            [("Party".into(), true)],
+            "Space on the focused row opened its menu, and its first item recalls Party"
+        );
+
+        app.delete_preset(&ids[1]);
+        draw_frames();
+        press(window, " ");
+        draw_frames();
+        // Past the empty line, which can't be chosen.
+        press(window, Key::DownArrow);
+        press(window, Key::DownArrow);
+        press(window, Key::Return);
+        assert_eq!(
+            *app.dialog_purpose.borrow(),
+            DialogPurpose::SavePreset,
+            "with no preset left, the menu still offers Save as Preset…"
+        );
+    }
+
+    // covers: S265
+    #[test]
+    fn a_recall_that_leaves_a_hidden_speaker_off_says_so_in_one_notice() {
+        let app = app_over(MockBackend::new());
+        app.update(|b| b.set_speaker_enabled("local:desk", true));
+        app.save_preset("Evening");
+        app.update(|b| b.hide_speaker("local:desk", "USB"));
+        let id = preset_ids(&app)[0].clone();
+
+        app.recall_preset(&id);
+        let notices = app.snapshot().notices;
+        assert_eq!(notices.len(), 1);
+        let text = notice_text(&app.strings(), &notices[0].message);
+        assert_eq!(
+            text, "“Evening” is on. Stayed off: Desk Speaker (Hidden).",
+            "a hidden speaker stays hidden"
+        );
+        assert_eq!(
+            notice_title(&app.strings(), &notices[0].message),
+            "some speakers stayed off"
+        );
+
+        app.update(|b| b.rename_preset(&id, "Late"));
+        let notices = app.snapshot().notices;
+        assert_eq!(notices.len(), 1, "renamed in place");
+        assert!(notice_text(&app.strings(), &notices[0].message).starts_with("“Late” is on."));
+
+        app.update(|b| b.unhide_speaker("local:desk"));
+        app.recall_preset(&id);
+        assert!(app.snapshot().notices.is_empty(), "a full recall clears it");
+    }
+
+    // covers: S252
+    #[test]
+    fn a_preset_notice_calls_a_member_with_no_known_name_unknown_device() {
+        let app = app_over(MockBackend::new());
+        let message = NoticeMessage::PresetLeftOff {
+            preset: "Evening".to_owned(),
+            left_off: vec![(String::new(), PresetLeftOff::NotFound)],
+            nothing_changed: false,
+        };
+        assert_eq!(
+            notice_text(&app.strings(), &message),
+            "“Evening” is on. Stayed off: Unknown device (Not found)."
+        );
+        let pair_first = NoticeMessage::PairFirst {
+            speaker: String::new(),
+        };
+        assert_eq!(
+            notice_text(&app.strings(), &pair_first),
+            "Unknown device stayed off. Pair it on this PC first."
+        );
+    }
+
+    #[test]
+    fn an_input_notice_calls_an_input_with_no_name_unknown_device() {
+        let app = app_over(MockBackend::new());
+        let not_connected = NoticeMessage::InputNotConnected {
+            source: String::new(),
+        };
+        assert_eq!(
+            notice_text(&app.strings(), &not_connected),
+            "Unknown device is not connected. Plug it in, or pick another source."
+        );
+        assert_eq!(
+            notice_title(&app.strings(), &not_connected),
+            "Unknown device not connected"
+        );
+        let disconnected = NoticeMessage::InputDisconnected {
+            source: String::new(),
+        };
+        assert_eq!(
+            notice_text(&app.strings(), &disconnected),
+            "Unknown device was disconnected, so streaming has stopped. Plug it in again, or pick another source."
+        );
+        assert_eq!(
+            notice_title(&app.strings(), &disconnected),
+            "Unknown device was disconnected, streaming stopped"
+        );
+        let blocked = NoticeMessage::MicrophoneBlocked {
+            source: String::new(),
+        };
+        assert_eq!(
+            notice_text(&app.strings(), &blocked),
+            "Windows is blocking microphone access for desktop apps, so AudioSync can't capture Unknown device. Open Privacy Settings and turn on “Let desktop apps access your microphone” and “Microphone access”."
+        );
+    }
+
+    // covers: S265
+    #[test]
+    fn a_recall_with_no_speaker_left_changes_nothing_and_says_so() {
+        let app = app_over(MockBackend::new());
+        app.update(|b| b.set_speaker_enabled("local:desk", true));
+        app.update(|b| b.set_speaker_enabled("airplay:kitchen", false));
+        app.update(|b| b.set_speaker_enabled("local:speakers", false));
+        app.save_preset("Desk");
+        app.update(|b| b.hide_speaker("local:desk", "USB"));
+        app.update(|b| b.set_master_volume(40.0));
+
+        app.recall_preset(&preset_ids(&app)[0]);
+        let notices = app.snapshot().notices;
+        assert_eq!(
+            notice_text(&app.strings(), &notices[0].message),
+            "Nothing changed: no speaker in “Desk” can play now. Desk Speaker (Hidden)."
+        );
+        assert_eq!(
+            notice_title(&app.strings(), &notices[0].message),
+            "nothing changed",
+            "no speaker stayed off where none went on"
+        );
+        assert_eq!(app.snapshot().master_volume, 40.0);
+    }
+
+    // covers: S269
+    #[test]
+    fn the_preset_texts_come_from_strings() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        assert_eq!(strings.get_presets(), "Presets");
+        assert_eq!(strings.get_save_preset(), "Save as Preset…");
+        assert_eq!(strings.get_no_presets(), "No Presets");
+        assert_eq!(strings.get_choose_preset(), "Choose a Preset");
+        assert_eq!(strings.get_update_preset(), "Update to Current Settings");
+        assert_eq!(strings.get_rename_preset(), "Rename…");
+        assert_eq!(strings.get_delete_preset(), "Delete");
+        assert_eq!(strings.invoke_numbered_preset(3), "Preset 3");
+        assert_eq!(strings.get_preset_busy(), "In use by another app");
+        assert_eq!(
+            preset_left_off(&strings, &PresetLeftOff::Offline),
+            "Not on the network"
+        );
+    }
+
+    #[test]
+    fn a_zone_menu_says_rename_as_a_speaker_menu_does() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        assert_eq!(strings.get_rename_zone(), "Rename…");
+        assert_eq!(strings.get_rename_zone(), strings.get_rename_speaker());
+    }
+
+    // covers: S261
+    #[test]
+    fn ctrl_and_a_digit_recalls_from_the_guide_and_the_flyout_too() {
+        let app = app_over(MockBackend::new());
+        app.save_preset("Evening");
+        app.update(|b| b.set_master_volume(30.0));
+        app.save_preset("Party");
+        app.update(|b| b.set_master_volume(55.0));
+
+        app.guide.show().expect("the guide shows headless");
+        app.guide.invoke_take_focus();
+        draw_frames();
+        ctrl(app.guide.window(), "1");
+        assert_eq!(preset_rows(&app)[0], ("Evening".into(), true));
+
+        app.flyout.show().expect("the flyout shows headless");
+        draw_frames();
+        app.flyout.invoke_take_focus();
+        draw_frames();
+        ctrl(app.flyout.window(), "2");
+        assert_eq!(preset_rows(&app)[1], ("Party".into(), true));
+    }
+
+    // covers: S251
+    #[test]
+    fn save_as_preset_is_off_at_the_most_presets_the_app_keeps() {
+        let mut backend = MockBackend::new();
+        for n in 0..MAX_PRESETS {
+            Backend::save_preset(&mut backend, &format!("P{n}")).expect("room");
+        }
+        let app = main_window_over(backend);
+        assert!(!app.main.get_can_save_preset());
+        app.ask_save_preset();
+        assert_eq!(*app.dialog_purpose.borrow(), DialogPurpose::Message);
+        assert_eq!(
+            app.zone_dialog.get_message(),
+            "AudioSync keeps 256 presets at most. Delete one to save another."
+        );
+
+        let first = preset_ids(&app)[0].clone();
+        app.zone_dialog.hide().unwrap();
+        app.delete_preset(&first);
+        assert!(app.main.get_can_save_preset());
+    }
+
+    // covers: S266
+    #[test]
+    fn a_recall_leaves_the_keyboard_focus_on_the_row_or_the_notice_that_had_it() {
+        let mut backend = MockBackend::new();
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        backend.post("start", NoticeMessage::NoSpeaker, "09.41");
+        Backend::save_preset(&mut backend, "Evening").expect("saved");
+        Backend::set_master_volume(&mut backend, 30.0);
+        Backend::save_preset(&mut backend, "Party").expect("saved");
+        let app = main_window_over(backend);
+        let window = app.main.window();
+        let ids = preset_ids(&app);
+
+        // The newest notice's dismiss button, as with no preset.
+        hold_clock();
+        tab(window, 3);
+        app.recall_preset(&ids[0]);
+        press(window, " ");
+        let_notice_close();
+        assert_eq!(app.snapshot().notices.len(), 1, "Space dismissed it");
+
+        app.main.set_focus_presets(true);
+        draw_frames();
+        app.recall_preset(&ids[0]);
+        press(window, " ");
+        draw_frames();
+        press(window, Key::DownArrow);
+        press(window, Key::DownArrow);
+        press(window, Key::Return);
+        assert_eq!(
+            preset_rows(&app)[1],
+            ("Party".into(), true),
+            "the Presets row kept the focus and opened its menu"
+        );
+    }
+
+    // covers: S267
+    #[test]
+    fn the_menu_key_and_shift_f10_open_the_presets_menu() {
+        let app = main_window_over(MockBackend::new());
+        app.save_preset("Evening");
+        draw_frames();
+        let window = app.main.window();
+
+        // Slint maps Shift+F10 to the menu on Windows only.
+        let opens: &[&[Key]] = if cfg!(windows) {
+            &[&[Key::Menu], &[Key::Shift, Key::F10]]
+        } else {
+            &[&[Key::Menu]]
+        };
+        for &open in opens {
+            app.update(|b| b.set_master_volume(12.0));
+            assert!(!preset_rows(&app)[0].1);
+            app.main.set_focus_presets(true);
+            draw_frames();
+            for key in open {
+                window.dispatch_event(WindowEvent::KeyPressed {
+                    text: (*key).into(),
+                });
+            }
+            for key in open.iter().rev() {
+                window.dispatch_event(WindowEvent::KeyReleased {
+                    text: (*key).into(),
+                });
+            }
+            draw_frames();
+            press(window, Key::DownArrow);
+            press(window, Key::Return);
+            assert_eq!(
+                preset_rows(&app)[0],
+                ("Evening".into(), true),
+                "{open:?}: the menu opened, and its first item recalls Evening"
+            );
+            app.update(|b| b.set_master_volume(40.0));
+        }
+    }
+
+    #[test]
+    fn the_main_window_focus_goes_where_the_removed_control_was() {
+        let notices = |ids: &[i32]| -> Vec<NoticeItem> {
+            ids.iter()
+                .map(|&id| NoticeItem {
+                    id,
+                    ..NoticeItem::default()
+                })
+                .collect()
+        };
+        let zones = |ids: &[&str]| -> Vec<ZoneRows> {
+            ids.iter()
+                .map(|&id| ZoneRows {
+                    id: id.into(),
+                    ..ZoneRows::default()
+                })
+                .collect()
+        };
+        let lists = |n: &[i32], g: &[&str]| MainLists {
+            notices: notices(n),
+            zones: zones(g),
+            ..MainLists::default()
+        };
+        let on_notice = |id| MainFocus {
+            notice: Some(id),
+            ..MainFocus::default()
+        };
+        assert_eq!(
+            on_notice(2).target(&lists(&[3, 2, 1], &[]), &lists(&[3, 1], &[])),
+            Some(MainFocusTarget::Notice(1)),
+            "the notice that took the dismissed one's place"
+        );
+        assert_eq!(
+            on_notice(1).target(&lists(&[2, 1], &[]), &lists(&[3, 2, 1], &[])),
+            Some(MainFocusTarget::Notice(2)),
+            "a new notice rebuilt the stack: the same notice"
+        );
+        assert_eq!(
+            on_notice(1).target(&lists(&[2, 1], &[]), &lists(&[2], &[])),
+            Some(MainFocusTarget::Notice(0)),
+            "the last one went: the one above"
+        );
+        assert_eq!(
+            on_notice(1).target(&lists(&[2, 1], &[]), &lists(&[2, 1], &[])),
+            None,
+            "updated in place, the focus stays"
+        );
+        let dismiss_all = MainFocus {
+            dismiss_all: true,
+            ..MainFocus::default()
+        };
+        assert_eq!(
+            dismiss_all.target(&lists(&[2, 1], &[]), &lists(&[], &[])),
+            Some(MainFocusTarget::StreamingSwitch)
+        );
+
+        let on_zone = |id: &str, part| MainFocus {
+            zone: Some((id.into(), part)),
+            ..MainFocus::default()
+        };
+        assert_eq!(
+            on_zone("a", RowPart::Volume).target(&lists(&[], &["a", "b"]), &lists(&[], &["a"])),
+            Some(MainFocusTarget::Zone("a".into(), RowPart::Volume)),
+            "the same zone, on the same part"
+        );
+        assert_eq!(
+            on_zone("b", RowPart::Toggle).target(&lists(&[], &["a", "b"]), &lists(&[], &["a"])),
+            Some(MainFocusTarget::Zone("a".into(), RowPart::Options)),
+            "a deleted zone: the options of the one before it"
+        );
+        assert_eq!(
+            on_zone("a", RowPart::Toggle).target(&lists(&[], &["a"]), &lists(&[], &[])),
+            Some(MainFocusTarget::StreamingSwitch),
+            "the last zone went"
+        );
+        assert_eq!(
+            MainFocus::default().target(&lists(&[1], &["a"]), &lists(&[], &[])),
+            None,
+            "nothing in the lists had the focus"
+        );
+    }
+
+    #[test]
+    fn an_in_zones_row_removed_from_its_zone_hands_the_focus_to_a_neighbour() {
+        let speakers = |ids: &[&str]| -> Vec<SpeakerItem> {
+            ids.iter()
+                .map(|&id| SpeakerItem {
+                    id: id.into(),
+                    ..SpeakerItem::default()
+                })
+                .collect()
+        };
+        let lists = |connected: &[&str], zoned: &[&str]| MainLists {
+            connected: speakers(connected),
+            connected_zoned: speakers(zoned),
+            ..MainLists::default()
+        };
+        let on = |id: &str, part| MainFocus {
+            in_zones: Some((id.into(), part)),
+            ..MainFocus::default()
+        };
+        let options = |id: &str| Some(MainFocusTarget::InZones(id.into(), RowPart::Options));
+        let before = lists(&["a"], &["x", "y", "z"]);
+        assert_eq!(
+            on("y", RowPart::Options).target(&before, &lists(&["a", "y"], &["x", "z"])),
+            options("z"),
+            "the next row"
+        );
+        assert_eq!(
+            on("z", RowPart::Options).target(&before, &lists(&["a", "z"], &["x", "y"])),
+            options("y"),
+            "the last row went: the one before it"
+        );
+        assert_eq!(
+            on("x", RowPart::Options).target(&lists(&["a"], &["x"]), &lists(&["a", "x"], &[])),
+            Some(MainFocusTarget::Speaker("a".into(), RowPart::Options)),
+            "no In zones row left: the list's first row"
+        );
+        assert_eq!(
+            on("x", RowPart::Toggle).target(&before, &lists(&["a"], &["w", "x", "y", "z"])),
+            Some(MainFocusTarget::InZones("x".into(), RowPart::Toggle)),
+            "a rebuilt row keeps the focus on its part"
+        );
+    }
+
+    #[test]
+    fn a_removed_speaker_row_hands_the_focus_to_a_neighbours_options() {
+        let speakers = |ids: &[&str]| -> Vec<SpeakerItem> {
+            ids.iter()
+                .map(|&id| SpeakerItem {
+                    id: id.into(),
+                    ..SpeakerItem::default()
+                })
+                .collect()
+        };
+        let lists = |this_pc: &[&str], connected: &[&str]| MainLists {
+            this_pc: speakers(this_pc),
+            connected: speakers(connected),
+            ..MainLists::default()
+        };
+        let on = |id: &str, part| MainFocus {
+            speaker: Some((id.into(), part)),
+            ..MainFocus::default()
+        };
+        let options = |id: &str| Some(MainFocusTarget::Speaker(id.into(), RowPart::Options));
+        let before = lists(&["pc"], &["a", "b", "c"]);
+        assert_eq!(
+            on("b", RowPart::Toggle).target(&before, &lists(&["pc"], &["a", "c"])),
+            options("c"),
+            "the next row"
+        );
+        let hiding = |id: &str| MainFocus {
+            hiding: Some(id.into()),
+            ..on(id, RowPart::Options)
+        };
+        assert_eq!(
+            hiding("b").target(&before, &lists(&["pc"], &["a", "c"])),
+            Some(MainFocusTarget::Speaker("c".into(), RowPart::Toggle)),
+            "Hide Speaker: the next row's switch"
+        );
+        assert_eq!(
+            hiding("c").target(&before, &lists(&["pc"], &["a", "b"])),
+            Some(MainFocusTarget::Speaker("b".into(), RowPart::Toggle)),
+            "Hide Speaker on the last row: the previous row's switch"
+        );
+        assert_eq!(
+            on("c", RowPart::Volume).target(&before, &lists(&["pc"], &["a", "b"])),
+            options("b"),
+            "the last row went: the one before it"
+        );
+        assert_eq!(
+            on("b", RowPart::Toggle).target(&before, &lists(&["pc"], &["a", "b", "c", "d"])),
+            Some(MainFocusTarget::Speaker("b".into(), RowPart::Toggle)),
+            "a rebuilt row keeps the focus on its part"
+        );
+        assert_eq!(
+            on("b", RowPart::Sync).target(&before, &lists(&["pc"], &["a", "c"])),
+            options("c"),
+            "the sync controls went with their row"
+        );
+        assert_eq!(
+            on("b", RowPart::Sync).target(&before, &lists(&["pc", "x"], &["a", "b", "c"])),
+            None,
+            "only the other list changed"
+        );
+        assert_eq!(
+            on("pc", RowPart::Toggle).target(&before, &lists(&[], &["a", "b", "c"])),
+            options("a"),
+            "its list is empty now: the other list's first row"
+        );
+        assert_eq!(
+            on("a", RowPart::Toggle).target(&lists(&["pc"], &["a"]), &lists(&["pc"], &[])),
+            options("pc"),
+            "the same from the other list"
+        );
+        let with_zone = |this_pc: &[&str], connected: &[&str], members: &[&str]| MainLists {
+            zones: vec![ZoneRows {
+                id: "g".into(),
+                rows: speakers(members),
+            }],
+            ..lists(this_pc, connected)
+        };
+        assert_eq!(
+            on("pc", RowPart::Volume)
+                .target(&with_zone(&["pc"], &[], &[]), &with_zone(&[], &[], &[])),
+            Some(MainFocusTarget::Zone("g".into(), RowPart::Options)),
+            "no speaker row left: the first zone's options"
+        );
+        assert_eq!(
+            on("b", RowPart::Options).target(
+                &with_zone(&["pc"], &["a", "b"], &[]),
+                &with_zone(&["pc"], &["a"], &["b"])
+            ),
+            Some(MainFocusTarget::Speaker("b".into(), RowPart::Options)),
+            "moved into a zone, the row there takes the focus"
+        );
+        assert_eq!(
+            on("b", RowPart::Toggle).target(
+                &with_zone(&["pc"], &["a"], &["b"]),
+                &with_zone(&["pc"], &["a"], &[])
+            ),
+            Some(MainFocusTarget::Zone("g".into(), RowPart::Options)),
+            "a collapsed zone: its header"
+        );
+        assert_eq!(
+            on("pc", RowPart::Toggle).target(&lists(&["pc"], &[]), &lists(&[], &[])),
+            Some(MainFocusTarget::StreamingSwitch),
+            "no row left at all"
+        );
+    }
+
+    #[test]
+    fn the_last_row_of_a_list_hands_the_focus_to_the_other_lists_first_row() {
+        // This PC's two outputs, and under Connected Speakers only a
+        // virtual output that is off, listed while Show Virtual Devices is
+        // on.
+        let mut backend = MockBackend::new();
+        backend.retain_speakers(|s| s.kind.is_this_pc());
+        let mut cable = backend
+            .snapshot()
+            .speaker("local:headphones")
+            .unwrap()
+            .clone();
+        cable.id = "local:cable".into();
+        cable.name = "Cable Input".into();
+        cable.kind = ui_model::SpeakerKind::Virtual;
+        cable.enabled = false;
+        backend.add_speaker(cable);
+        let app = app_over(backend);
+        app.main.invoke_show_virtual_devices_toggled(true);
+        app.main.show().expect("the main window shows headless");
+        draw_frames();
+        let window = app.main.window();
+        // As in the example's order without Bedroom's row:
+        // the cable row's toggle.
+        tab(window, 17);
+        press(window, " ");
+        assert!(enabled(&app, "local:cable"), "the cable row has the focus");
+        press(window, " ");
+        assert!(!enabled(&app, "local:cable"));
+
+        // Off and no longer shown, Connected Speakers is empty: the focus
+        // goes to This PC's first row's options. Three Tabs on: its volume,
+        // its device volume fix (the mock's speaker device sits at 13 %),
+        // then the headphones' toggle, not the source after the streaming
+        // switch.
+        app.main.invoke_show_virtual_devices_toggled(false);
+        draw_frames();
+        let headphones = enabled(&app, "local:headphones");
+        tab(window, 3);
+        press(window, " ");
+        assert_ne!(
+            enabled(&app, "local:headphones"),
+            headphones,
+            "after the speakers' volume and its fix, the headphones' toggle"
+        );
+    }
+
+    /// What the announcer makes of `notices`, given as (id, subject, title).
+    fn announce_for(announcer: &mut NoticeAnnouncer, notices: &[(u64, &str, &str)]) -> String {
+        let listed: Vec<Listed> = notices
+            .iter()
+            .map(|&(id, subject, title)| Listed {
+                id,
+                subject: subject.into(),
+                title: title.into(),
+                post: 0,
+            })
+            .collect();
+        match announcer.next(&listed) {
+            Announcement::Say(title) => format!("say {title}"),
+            Announcement::Clear => "clear".into(),
+            Announcement::Keep => "keep".into(),
+        }
+    }
+
+    /// Only a notice posted after launch is news, once: the newest one when
+    /// several arrive together, and again after the list was emptied.
+    // covers: S153
+    #[test]
+    fn the_announcer_picks_each_new_notice_once() {
+        let mut a = NoticeAnnouncer::default();
+        let launch = [(2, "b", "B"), (1, "a", "A")];
+        assert_eq!(announce_for(&mut a, &launch), "keep", "there at launch");
+        assert_eq!(announce_for(&mut a, &launch), "keep");
+        let three = [(3, "c", "C"), (2, "b", "B"), (1, "a", "A")];
+        assert_eq!(announce_for(&mut a, &three), "say C", "a new one");
+        assert_eq!(announce_for(&mut a, &three), "keep", "said once");
+        let two = [(5, "e", "E"), (4, "d", "D"), (3, "c", "C")];
+        assert_eq!(announce_for(&mut a, &two), "say E", "the newest of two");
+        assert_eq!(announce_for(&mut a, &[]), "clear", "all dismissed");
+        assert_eq!(announce_for(&mut a, &[(6, "f", "F")]), "say F");
+    }
+
+    /// A notice posted again for the same subject with the same title (an
+    /// AirPlay speaker that keeps retrying) is not news; a new title for
+    /// that subject is, and so is the same notice after it was dismissed.
+    // covers: S153
+    #[test]
+    fn a_repost_of_the_same_notice_is_not_announced_again() {
+        let mut a = NoticeAnnouncer::default();
+        assert_eq!(announce_for(&mut a, &[]), "keep");
+        let retrying = |id| [(id, "airplay:kitchen", "Kitchen reconnecting")];
+        assert_eq!(
+            announce_for(&mut a, &retrying(1)),
+            "say Kitchen reconnecting"
+        );
+        assert_eq!(announce_for(&mut a, &retrying(2)), "keep", "a retry");
+        assert_eq!(announce_for(&mut a, &retrying(3)), "keep", "another");
+        let cant = |id| [(id, "airplay:kitchen", "Kitchen can't play")];
+        assert_eq!(announce_for(&mut a, &cant(4)), "say Kitchen can't play");
+        assert_eq!(announce_for(&mut a, &[]), "clear", "dismissed");
+        assert_eq!(announce_for(&mut a, &cant(5)), "say Kitchen can't play");
+    }
+
+    /// The view's own notices have fixed ids far above the backend's, so an
+    /// id says nothing about when a notice was posted: a backend notice
+    /// after one is news, and so is the fixed one coming back after it left.
+    // covers: S153
+    #[test]
+    fn a_notice_after_a_fixed_id_notice_is_still_announced() {
+        let mut a = NoticeAnnouncer::default();
+        assert_eq!(announce_for(&mut a, &[]), "keep");
+        let update = (UPDATER_NOTICE_ID, "update", "Update");
+        assert_eq!(announce_for(&mut a, &[update]), "say Update");
+        let capture = (1, "source", "Capture lost");
+        assert_eq!(announce_for(&mut a, &[capture, update]), "say Capture lost");
+        assert_eq!(announce_for(&mut a, &[capture]), "keep", "update left");
+        assert_eq!(
+            announce_for(&mut a, &[capture, update]),
+            "say Update",
+            "and came back"
+        );
+    }
+
+    /// A view notice and a backend notice new in the same refresh: the
+    /// higher id is announced.
+    #[test]
+    fn a_tie_between_a_view_and_a_backend_notice_announces_the_higher_id() {
+        let mut a = NoticeAnnouncer::default();
+        assert_eq!(announce_for(&mut a, &[]), "keep");
+        let both = [
+            (1, "source", "Capture lost"),
+            (UPDATER_NOTICE_ID, "update", "Update"),
+        ];
+        assert_eq!(announce_for(&mut a, &both), "say Update");
+    }
+
+    /// The tray tooltip once the notices were listed as `history` shows,
+    /// one refresh each.
+    fn tooltip_after(strings: &Strings<'_>, history: &[&[ui_model::Notice]]) -> String {
+        let mut announcer = NoticeAnnouncer::default();
+        let mut state = MockBackend::new().snapshot();
+        for notices in history {
+            let listed: Vec<Listed> = notices
+                .iter()
+                .map(|n| Listed {
+                    id: n.id,
+                    subject: n.subject.clone(),
+                    title: notice_title(strings, &n.message),
+                    post: n.post,
+                })
+                .collect();
+            announcer.next(&listed);
+            state.notices = notices.to_vec();
+        }
+        tray_tooltip(strings, &state, announcer.posted())
+    }
+
+    /// The tooltip names the notice posted last, also when an older one has
+    /// a fixed id far above the backend's.
+    // covers: S153
+    #[test]
+    fn the_tray_tooltip_names_a_notice_posted_after_a_fixed_id_one() {
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let notice = |id, subject: &str, message| ui_model::Notice {
+            id,
+            subject: subject.into(),
+            message,
+            time: "09.40".into(),
+            post: 0,
+        };
+        let dialog = notice(
+            DIALOG_NOTICE_ID,
+            "dialog",
+            NoticeMessage::DialogMessage {
+                title: "Rename".to_owned(),
+                text: "Taken".to_owned(),
+            },
+        );
+        let capture = notice(1, "source", NoticeMessage::CaptureLost);
+        let title = notice_title(&strings, &NoticeMessage::CaptureLost);
+        let tooltip = tooltip_after(
+            &strings,
+            &[
+                &[],
+                std::slice::from_ref(&dialog),
+                &[capture, dialog.clone()],
+            ],
+        );
+        assert!(tooltip.ends_with(&format!("Notice: {title}")), "{tooltip}");
+    }
+
+    /// The live region empties as soon as the notice it names is gone, so
+    /// Narrator's scan mode finds no stray announcement; other notices
+    /// leaving keep it.
+    #[test]
+    fn the_announcement_clears_when_its_notice_leaves() {
+        let mut a = NoticeAnnouncer::default();
+        assert_eq!(announce_for(&mut a, &[(1, "a", "A")]), "keep");
+        let both = [(2, "b", "B"), (1, "a", "A")];
+        assert_eq!(announce_for(&mut a, &both), "say B");
+        assert_eq!(announce_for(&mut a, &[(2, "b", "B")]), "keep", "A left");
+        assert_eq!(announce_for(&mut a, &[]), "clear", "B left");
+        assert_eq!(announce_for(&mut a, &[]), "keep");
+    }
+
+    /// A new notice is announced by its title in the window Narrator can
+    /// hear: the open flyout, else the main window; never in both. It goes
+    /// once the notice is dismissed.
+    #[test]
+    fn a_new_notice_is_announced_in_the_flyout_or_the_main_window() {
+        let mut backend = MockBackend::new();
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        backend.post("start", NoticeMessage::NoSpeaker, "09.41");
+        let app = app_over(backend);
+        assert_eq!(app.main.get_notice_announcement(), "", "not at launch");
+        assert_eq!(app.flyout.get_notice_announcement(), "");
+
+        let strings = app.strings();
+        let title = notice_title(&strings, &NoticeMessage::NoSpeaker);
+        let said = strings.invoke_notice_announcement(title);
+        // As if only the first notice had been there at launch.
+        let only_the_first = || NoticeAnnouncer {
+            posted: Some(vec![1]),
+            ..NoticeAnnouncer::default()
+        };
+        *app.notice_announcer.borrow_mut() = only_the_first();
+        app.refresh();
+        assert_eq!(app.main.get_notice_announcement(), said);
+        assert_eq!(app.flyout.get_notice_announcement(), "");
+
+        app.clear_announcement();
+        assert_eq!(app.main.get_notice_announcement(), "");
+        app.flyout.show().expect("the flyout shows headless");
+        *app.notice_announcer.borrow_mut() = only_the_first();
+        app.refresh();
+        assert_eq!(app.flyout.get_notice_announcement(), said);
+        assert_eq!(app.main.get_notice_announcement(), "", "not twice");
+
+        app.update(|backend| backend.dismiss_all_notices());
+        assert_eq!(app.flyout.get_notice_announcement(), "", "dismissed");
+    }
+
+    /// The window's own notices sit in one list with the backend's, newest
+    /// posted first, so one posted after four others is listed in the main
+    /// window and is the flyout's newest.
+    // covers: S153
+    #[test]
+    fn a_window_notice_posted_after_four_others_is_listed_first() {
+        let mut backend = MockBackend::new();
+        for subject in ["a", "b", "c", "d"] {
+            backend.post(subject, NoticeMessage::CaptureLost, "09.40");
+        }
+        let app = app_over(backend);
+        app.ui.borrow_mut().dialog_notice = Some(ui_model::Notice {
+            id: DIALOG_NOTICE_ID,
+            subject: "dialog".to_owned(),
+            message: NoticeMessage::DialogMessage {
+                title: "Rename".to_owned(),
+                text: "Taken".to_owned(),
+            },
+            time: "09.41".to_owned(),
+            post: 0,
+        });
+        app.refresh();
+        let id = |item: Option<NoticeItem>| item.map(|n| n.id as u64);
+        assert_eq!(
+            id(app.main.get_notices().row_data(0)),
+            Some(DIALOG_NOTICE_ID)
+        );
+        assert_eq!(app.main.get_notices().row_count(), MAIN_NOTICE_LIMIT);
+        assert_eq!(
+            id(app.flyout.get_notices().row_data(0)),
+            Some(DIALOG_NOTICE_ID)
+        );
+    }
+
+    /// The notice the main window and the flyout list first after a window
+    /// notice posted at `times[0]`, a backend notice posted after it and the
+    /// first one posted again at `times[1]`.
+    fn first_after_a_window_repost(times: [&str; 2]) -> (Option<u64>, Option<u64>) {
+        let app = app_over(MockBackend::new());
+        app.update(|b| b.set_speaker_enabled("local:desk", true));
+        app.save_preset("Evening");
+        app.update(|b| b.hide_speaker("local:desk", "USB"));
+        let dialog = |time: &str| ui_model::Notice {
+            id: DIALOG_NOTICE_ID,
+            subject: "dialog".to_owned(),
+            message: NoticeMessage::DialogMessage {
+                title: "Rename".to_owned(),
+                text: "Taken".to_owned(),
+            },
+            time: time.to_owned(),
+            post: ui_model::next_post(),
+        };
+        app.ui.borrow_mut().dialog_notice = Some(dialog(times[0]));
+        app.refresh();
+        app.recall_preset(&preset_ids(&app)[0]);
+        app.refresh();
+        app.ui.borrow_mut().dialog_notice = Some(dialog(times[1]));
+        app.refresh();
+        let id = |item: Option<NoticeItem>| item.map(|n| n.id as u64);
+        (
+            id(app.main.get_notices().row_data(0)),
+            id(app.flyout.get_notices().row_data(0)),
+        )
+    }
+
+    /// A window notice keeps its fixed id when it is posted again, so its
+    /// repost mark is what moves it above the notices posted since.
+    // covers: S153
+    #[test]
+    fn a_window_notice_reposted_after_another_moves_to_the_top() {
+        let first = Some(DIALOG_NOTICE_ID);
+        assert_eq!(
+            first_after_a_window_repost(["09.40", "09.42"]),
+            (first, first)
+        );
+    }
+
+    /// The notice time counts minutes, so a repost in the same minute moves
+    /// up too.
+    // covers: S153
+    #[test]
+    fn a_window_notice_reposted_in_the_same_minute_moves_to_the_top() {
+        let first = Some(DIALOG_NOTICE_ID);
+        assert_eq!(
+            first_after_a_window_repost(["09.41", "09.41"]),
+            (first, first)
+        );
+    }
+
+    /// Past the capacity the oldest notice is in no list, so the flyout's
+    /// count is what the main window lists.
+    // covers: S423
+    #[test]
+    fn the_flyout_counts_only_the_notices_the_main_window_lists() {
+        let mut backend = MockBackend::new();
+        for subject in ["a", "b", "c", "d"] {
+            backend.post(subject, NoticeMessage::CaptureLost, "09.40");
+        }
+        let app = app_over(backend);
+        let oldest = app.snapshot().notices.last().map(|n| n.id);
+        app.ui.borrow_mut().dialog_notice = Some(ui_model::Notice {
+            id: DIALOG_NOTICE_ID,
+            subject: "dialog".to_owned(),
+            message: NoticeMessage::DialogMessage {
+                title: "Rename".to_owned(),
+                text: "Taken".to_owned(),
+            },
+            time: "09.41".to_owned(),
+            post: 0,
+        });
+        app.refresh();
+        let listed: Vec<u64> = app.main.get_notices().iter().map(|n| n.id as u64).collect();
+        assert_eq!(listed.first(), Some(&DIALOG_NOTICE_ID), "the newest stays");
+        assert!(!listed.contains(&oldest.unwrap()), "the oldest dropped off");
+        assert_eq!(app.main.get_notices().row_count(), MAIN_NOTICE_LIMIT);
+        assert_eq!(
+            usize::try_from(app.flyout.get_notice_count()).ok(),
+            Some(app.main.get_notices().row_count())
+        );
+    }
+
+    /// Dismiss All closes only the listed notices: a running download
+    /// whose notice dropped off goes on.
+    // covers: S423
+    #[cfg(windows)]
+    #[test]
+    fn dismiss_all_leaves_a_download_whose_notice_dropped_off() {
+        let mut backend = MockBackend::new();
+        for subject in ["a", "b", "c", "d"] {
+            backend.post(subject, NoticeMessage::CaptureLost, "09.40");
+        }
+        let app = app_over(backend);
+        let oldest_first: Vec<u64> = app.snapshot().notices.iter().rev().map(|n| n.id).collect();
+        *app.updater.borrow_mut() = Some(crate::updater::tests::downloading(
+            "dismiss-all-dropped-off",
+        ));
+        // As if the download started before the four were posted.
+        *app.notice_announcer.borrow_mut() = NoticeAnnouncer {
+            posted: Some(
+                std::iter::once(UPDATER_NOTICE_ID)
+                    .chain(oldest_first)
+                    .collect(),
+            ),
+            ..NoticeAnnouncer::default()
+        };
+        app.refresh();
+        app.main.invoke_notices_dismissed_all();
+        assert!(
+            matches!(
+                app.updater.borrow().as_ref().and_then(|u| u.notice()),
+                Some(ui_model::UpdaterNotice::Downloading { .. })
+            ),
+            "the download runs on"
+        );
+    }
+
+    /// A backend notice posted after a window notice is listed above it,
+    /// though the window notice's fixed id is higher.
+    // covers: S153
+    #[test]
+    fn a_backend_notice_posted_after_a_window_notice_is_listed_first() {
+        let app = app_over(MockBackend::new());
+        app.update(|b| b.set_speaker_enabled("local:desk", true));
+        app.save_preset("Evening");
+        app.update(|b| b.hide_speaker("local:desk", "USB"));
+        app.ui.borrow_mut().dialog_notice = Some(ui_model::Notice {
+            id: DIALOG_NOTICE_ID,
+            subject: "dialog".to_owned(),
+            message: NoticeMessage::DialogMessage {
+                title: "Rename".to_owned(),
+                text: "Taken".to_owned(),
+            },
+            time: "09.40".to_owned(),
+            post: 0,
+        });
+        app.refresh();
+        let id = |item: Option<NoticeItem>| item.map(|n| n.id as u64);
+        assert_eq!(
+            id(app.main.get_notices().row_data(0)),
+            Some(DIALOG_NOTICE_ID)
+        );
+
+        app.recall_preset(&preset_ids(&app)[0]);
+        app.refresh();
+        let presets = app
+            .snapshot()
+            .notices
+            .iter()
+            .find(|n| n.id != DIALOG_NOTICE_ID)
+            .map(|n| n.id);
+        assert!(presets.is_some(), "the recall posts a notice");
+        assert_eq!(id(app.main.get_notices().row_data(0)), presets);
+        assert_eq!(app.main.get_notices().row_count(), 2);
+        assert_eq!(id(app.flyout.get_notices().row_data(0)), presets);
+    }
+
+    /// A character outside the Basic Multilingual Plane (two UTF-16 units)
+    /// across the cut is left out whole, never split.
+    #[test]
+    fn the_tooltip_cut_never_splits_a_surrogate_pair() {
+        // The emoji takes units 126 and 127 (1-based); 126 fit before "…".
+        let text = format!("{}\u{1F50A}{}", "a".repeat(125), "b".repeat(10));
+        let cut = fit_tooltip(&text);
+        assert_eq!(cut, format!("{}…", "a".repeat(125)));
+        assert_eq!(cut.encode_utf16().count(), 126);
+        // One unit earlier, it fits whole.
+        let text = format!("{}\u{1F50A}{}", "a".repeat(124), "b".repeat(10));
+        let cut = fit_tooltip(&text);
+        assert_eq!(cut, format!("{}\u{1F50A}…", "a".repeat(124)));
+        assert_eq!(cut.encode_utf16().count(), 127);
+    }
+
+    /// The tray icon's tooltip names the newest notice on a second line while
+    /// there is one, and fits the 127 characters Windows shows.
+    // covers: S153
+    #[test]
+    fn the_tray_tooltip_follows_the_newest_notice() {
+        let mut backend = MockBackend::new();
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let on = count(backend.snapshot().active_speakers());
+        let plain = strings.invoke_tray_tooltip(false, on, 0).to_string();
+        assert_eq!(tray_tooltip(&strings, &backend.snapshot(), &[]), plain);
+        let one = strings.invoke_tray_tooltip(false, on, 1).to_string();
+        let two = strings.invoke_tray_tooltip(false, on, 2).to_string();
+
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        backend.post("start", NoticeMessage::NoSpeaker, "09.41");
+        let title = notice_title(&strings, &NoticeMessage::NoSpeaker);
+        assert_eq!(
+            tray_tooltip(&strings, &backend.snapshot(), &[]),
+            format!("{two}\nNotice: {title}")
+        );
+
+        backend.dismiss_all_notices();
+        assert_eq!(tray_tooltip(&strings, &backend.snapshot(), &[]), plain);
+
+        backend.post(
+            "speaker",
+            NoticeMessage::SpeakerFailed {
+                speaker: "Kitchen ".repeat(30),
+            },
+            "09.42",
+        );
+        let long = tray_tooltip(&strings, &backend.snapshot(), &[]);
+        assert!(long.encode_utf16().count() <= 127, "{long}");
+        assert!(long.ends_with('…'), "{long}");
+        assert!(long.starts_with(&format!("{one}\nNotice: Kitchen")));
+
+        // The tray shows this tooltip, not the plain one.
+        let tray = include_str!("tray.rs");
+        assert!(!tray.contains("invoke_tray_tooltip("));
+        assert_eq!(tray.matches("view::tray_tooltip(").count(), 2);
+    }
+
+    /// The tray icon's tooltip reads what VoiceOver reads on the Mac's menu
+    /// bar icon: streaming on or off, the speakers on, then the notices.
+    // covers: S153
+    #[test]
+    fn the_tray_tooltip_reads_streaming_speakers_and_notices_as_on_the_mac() {
+        let mut backend = MockBackend::new();
+        let app = app_over(MockBackend::new());
+        let strings = app.strings();
+        let tooltip = |state: &AppState| tray_tooltip(&strings, state, &[]);
+        let mut state = backend.snapshot();
+        for speaker in &mut state.speakers {
+            speaker.enabled = false;
+        }
+        assert_eq!(tooltip(&state), "AudioSync: Streaming off, no speaker on");
+        state.speakers[0].enabled = true;
+        assert_eq!(tooltip(&state), "AudioSync: Streaming off, 1 speaker on");
+        state.running = true;
+        state.speakers[1].enabled = true;
+        assert_eq!(tooltip(&state), "AudioSync: Streaming on, 2 speakers on");
+
+        backend.post("source", NoticeMessage::CaptureLost, "09.40");
+        state.notices = backend.snapshot().notices;
+        let title = notice_title(&strings, &NoticeMessage::CaptureLost);
+        assert_eq!(
+            tooltip(&state),
+            format!("AudioSync: Streaming on, 2 speakers on, 1 notice\nNotice: {title}")
+        );
+        backend.post("start", NoticeMessage::NoSpeaker, "09.41");
+        state.notices = backend.snapshot().notices;
+        assert!(tooltip(&state).starts_with("AudioSync: Streaming on, 2 speakers on, 2 notices\n"));
+    }
+
+    /// A speaker that asks for a code and is reconnecting says both, its
+    /// state first, as on the Mac (S442).
+    // covers: S442
+    #[test]
+    fn a_row_shows_its_state_note_before_its_code_note() {
+        let app = app_over(MockBackend::new());
+        app.refresh();
+        let mut item = app
+            .models
+            .flyout_connected
+            .iter()
+            .find(|s| s.id == "airplay:living")
+            .expect("listed");
+        item.state = RowState::Reconnecting;
+        item.availability = Availability::NeedsCode;
+        let note = app.strings().invoke_speaker_note(item.clone()).to_string();
+        assert_eq!(note, "Reconnecting\u{2026} \u{b7} Asks for a code");
+
+        item.state = RowState::Off;
+        let note = app.strings().invoke_speaker_note(item).to_string();
+        assert_eq!(note, "Asks for a code", "off, the code note alone");
+    }
+
+    /// Add by Address… sits under Connected Speakers whenever a Google Cast
+    /// sender runs, with Cast speakers listed or not, as on the Mac (S443).
+    // covers: S443
+    #[test]
+    fn add_by_address_shows_whenever_cast_runs() {
+        use i_slint_backend_testing::ElementHandle;
+        for list in [ui_model::CastList::Quiet, ui_model::CastList::Searching] {
+            let mut backend = MockBackend::new();
+            backend.set_cast_list(list);
+            let app = app_over(backend);
+            app.main.show().unwrap();
+            draw_frames();
+            // Tall enough that the whole list is in view, where the search looks.
+            app.main
+                .window()
+                .set_size(slint::LogicalSize::new(1000.0, 2400.0));
+            let label = app.strings().get_cast_add_address();
+            assert!(
+                ElementHandle::find_by_accessible_label(&app.main, &label)
+                    .next()
+                    .is_some(),
+                "{list:?}: {label}"
+            );
+        }
+    }
+
+    /// Connected Speakers reads as on the Mac: its rows, the AirPlay delay,
+    /// the In zones rows, then Add by Address… (S444).
+    // covers: S444
+    #[test]
+    fn connected_speakers_order_their_parts_as_on_the_mac() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        backend.add_zone("zone:up", "Upstairs", &["airplay:bedroom"]);
+        backend.set_cast_list(ui_model::CastList::NoneFound);
+        let app = app_over(backend);
+        app.main.show().unwrap();
+        draw_frames();
+        // Tall enough that the whole list is in view, where the search looks.
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(1000.0, 2400.0));
+        let strings = app.strings();
+        let top = |label: &str| {
+            ElementHandle::find_by_accessible_label(&app.main, label)
+                .map(|e| e.absolute_position().y)
+                .reduce(f32::min)
+                .unwrap_or_else(|| panic!("{label} is shown"))
+        };
+        let last_row = ElementHandle::find_by_element_type_name(&app.main, "SpeakerRow")
+            .map(|e| e.absolute_position().y)
+            .reduce(f32::max)
+            .expect("speaker rows");
+        let order = [
+            last_row,
+            top(&strings.get_airplay_delay_title()),
+            top(&strings.get_in_zones()),
+            top(&strings.get_cast_add_address()),
+        ];
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "rows, AirPlay Delay, In zones, Add by Address: {order:?}"
+        );
+    }
+
+    /// The AirPlay Delay row shows while an AirPlay speaker is listed, and
+    /// goes with the last one even though the sender still runs (S445).
+    // covers: S445
+    #[test]
+    fn the_airplay_delay_row_shows_only_with_an_airplay_speaker() {
+        let app = app_over(MockBackend::new());
+        app.refresh();
+        assert!(
+            app.main.get_airplay_delay_shown(),
+            "the mock lists AirPlay speakers"
+        );
+
+        let mut backend = MockBackend::new();
+        backend.retain_speakers(|s| {
+            !matches!(
+                s.kind,
+                ui_model::SpeakerKind::AirPlay | ui_model::SpeakerKind::AirPlay2
+            )
+        });
+        assert!(
+            backend.snapshot().airplay_delay_ms.is_some(),
+            "the sender runs"
+        );
+        let app = app_over(backend);
+        app.refresh();
+        assert!(!app.main.get_airplay_delay_shown());
+    }
+
+    /// An In zones row's "In <zone>" link cut to "…" shows the whole zone
+    /// name in a tooltip while the pointer rests on it (S446).
+    // covers: S446
+    #[test]
+    fn a_cut_in_zones_link_shows_the_zone_name_in_a_tooltip() {
+        use i_slint_backend_testing::ElementHandle;
+        let mut backend = MockBackend::new();
+        let den = long_named_speaker(&backend, "airplay:den");
+        backend.add_speaker(den);
+        let zone = "The long living room zone by the window and the bookshelf";
+        backend.add_zone("zone:den", zone, &["airplay:den"]);
+        let app = narrow_app(backend);
+        let list = element(&app, "MainWindow::scroll").expect("the speaker list");
+        let (at, size) = (list.absolute_position(), list.size());
+        scroll(
+            app.main.window(),
+            at.x + size.width / 2.0,
+            at.y + size.height / 2.0,
+            -3000.0,
+        );
+        app.main
+            .window()
+            .set_size(slint::LogicalSize::new(776.0, 680.0));
+        let label = app.strings().invoke_go_to_zone_label(zone.into());
+        let link = ElementHandle::find_by_accessible_label(&app.main, &label)
+            .next()
+            .expect("the In zones link");
+        let (at, size) = (link.absolute_position(), link.size());
+        let position =
+            slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
+        app.main
+            .window()
+            .dispatch_event(WindowEvent::PointerMoved { position });
+        advance_clock(Duration::from_secs(2));
+        slint::platform::update_timers_and_animations();
+        let tip = element(&app, "LinkButton::link-tip").expect("a tooltip on the In zones link");
+        assert!(
+            tip.size().width > size.width,
+            "tip {} wide, link {}",
+            tip.size().width,
+            size.width
+        );
+    }
+
+    /// While a speaker row's round switch has the keyboard focus, its name
+    /// tooltip shows, so a keyboard user can read a cut name; it goes with
+    /// the focus (S447).
+    // covers: S447
+    #[test]
+    fn a_speaker_name_tooltip_shows_while_its_switch_has_the_keyboard_focus() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        let focus = |part: RowPart| {
+            app.main.set_focus_speaker_part(part);
+            app.main.set_focus_speaker_id("airplay:kitchen".into());
+            draw_frames();
+        };
+        focus(RowPart::Toggle);
+        assert_eq!(
+            app.main_focus.borrow().speaker,
+            Some(("airplay:kitchen".into(), RowPart::Toggle))
+        );
+        assert!(
+            element(&app, "SpeakerRow::focus-tip").is_some(),
+            "the name tip shows with the switch focused"
+        );
+        focus(RowPart::Options);
+        assert!(element(&app, "SpeakerRow::focus-tip").is_none());
+    }
+
+    /// With an input device chosen as the source, the source picker carries
+    /// a microphone marker, as the Mac's does; with an app or the whole
+    /// system it carries none (S448).
+    // covers: S448
+    #[test]
+    fn the_source_picker_marks_a_chosen_input() {
+        let app = app_over(MockBackend::new());
+        app.main.show().unwrap();
+        draw_frames();
+        assert!(element(&app, "MainWindow::input-marker").is_none());
+        let line_in = app
+            .snapshot()
+            .sources
+            .iter()
+            .position(|s| s.id == "input:line")
+            .expect("the mock's input");
+        app.main.invoke_source_selected(line_in as i32);
+        app.refresh();
+        draw_frames();
+        assert!(element(&app, "MainWindow::input-marker").is_some());
+    }
+
+    /// Web Remote… sits under View, right after Presets, with the other
+    /// items that open a window, not under File (S449).
+    // covers: S449
+    #[test]
+    fn web_remote_sits_under_view_below_presets() {
+        let source = include_str!("../ui/main.slint");
+        let at = |text: &str| {
+            source
+                .find(text)
+                .unwrap_or_else(|| panic!("{text} in main.slint"))
+        };
+        let view = at("title: Strings.menu-view;");
+        let help = at("title: Strings.menu-help;");
+        let remote = at("title: Strings.menu-remote;");
+        let presets = view
+            + source[view..]
+                .find("title: Strings.presets;")
+                .expect("View > Presets");
+        let virtual_devices = at("title: Strings.show-virtual-devices;");
+        assert!(view < remote && remote < help, "under View");
+        assert!(
+            presets < remote && remote < virtual_devices,
+            "right after Presets"
+        );
+    }
+}

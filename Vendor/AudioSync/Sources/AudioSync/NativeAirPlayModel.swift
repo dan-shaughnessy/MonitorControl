@@ -1,0 +1,1817 @@
+import CAudioSyncCore
+import Foundation
+
+// What AudioSync's own AirPlay sender lists and plays, and the decisions the
+// app makes from it, kept free of the C interface and the UI so they can be
+// tested (`NativeAirPlay` feeds it, `AppDelegate+NativeAirPlay` acts on it).
+
+/// The app's ID for a receiver AudioSync's AirPlay sender lists: its
+/// receiver ID behind a "native:" prefix. The speaker list, the switches,
+/// the volumes, groups and auto-connect key AirPlay speakers by these IDs.
+/// What older versions saved under another ID for a receiver moves to its
+/// native ID once discovery reports that receiver (`SpeakerIDMigration`,
+/// S204).
+enum NativeAirPlayID {
+    static let prefix = "native:"
+
+    static func app(_ receiverID: String) -> String { prefix + receiverID }
+
+    /// The receiver ID behind an app ID; nil for an ID older versions saved.
+    static func receiver(_ appID: String) -> String? {
+        appID.hasPrefix(prefix) ? String(appID.dropFirst(prefix.count)) : nil
+    }
+
+    /// The switched-on AirPlay speakers the sender can play to. One saved
+    /// under an older version's ID that discovery hasn't moved yet stays
+    /// saved but neither starts nor holds up streaming.
+    static func playable(_ enabled: Set<String>) -> Set<String> {
+        enabled.filter { receiver($0) != nil }
+    }
+
+    /// The receiver IDs in AUDIOSYNC_AIRPLAY_PCM's value, read as the core
+    /// reads them: trimmed, empty ones skipped, `aa:bb:cc:dd:ee:ff` as
+    /// `AABBCCDDEEFF`.
+    static func pcmDebugIDs(_ value: String?) -> Set<String> {
+        let ids = (value ?? "").split(separator: ",").map { entry -> String in
+            let id = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hex = id.filter { $0 != ":" }
+            return hex.count == 12 && hex.allSatisfy(\.isHexDigit) ? hex.uppercased() : id
+        }
+        return Set(ids.filter { !$0.isEmpty })
+    }
+}
+
+/// The IDs the sender gives a stereo pair ("pair:<tsid>") or a home theater
+/// group ("theater:<group>") it lists as one target (P176). A receiver's own
+/// ID never starts this way.
+enum NativeTarget {
+    static func kind(_ id: String) -> AirPlayTargetRow.Kind? {
+        if id.hasPrefix("pair:") { return .stereoPair }
+        if id.hasPrefix("theater:") { return .homeTheater }
+        return nil
+    }
+}
+
+/// What a stereo pair or home theater group row says about its members
+/// (P176, P181).
+/// The speakers (app IDs) the user switched on by hand in this stream, kept
+/// apart from the sender's model so they outlive a sender Retry: one that
+/// asks for a code every time stays on when it appears again.
+struct EveryTimeGuard: Equatable {
+    private(set) var byHand: Set<String> = []
+    /// Marks kept past a stream end for a pairing or prompt still open.
+    private(set) var outlived: Set<String> = []
+    /// Speakers the phone switched on: they began no attempt, so a PIN or
+    /// password they ask for can be entered only at the Mac.
+    private(set) var byPhone: Set<String> = []
+
+    mutating func turnedOnByHand(_ ids: [String]) {
+        byHand.formUnion(ids)
+        byPhone.subtract(ids)
+        outlived.subtract(ids)   // a new attempt
+    }
+
+    mutating func turnedOnByPhone(_ ids: [String]) {
+        byPhone.formUnion(ids)
+    }
+
+    /// The speaker `id` was switched off, by anyone.
+    mutating func switchedOff(_ id: String) {
+        byPhone.remove(id)
+    }
+
+    /// Of `asking` (rows asking for a code every time,
+    /// `NativeAirPlayModel.askingEveryTime`), the ones that go off: on, not
+    /// switched on by hand. A speaker no longer on is forgotten first.
+    mutating func turnsOff(_ asking: [String], enabled: Set<String>) -> [String] {
+        byHand.formIntersection(enabled)
+        outlived.formIntersection(byHand)
+        return asking.filter { enabled.contains($0) && !byHand.contains($0) }
+    }
+
+    /// When `cause` ends a stream that ran, it ends the PIN session each
+    /// click bought, so every mark goes (a retry or a source change inside
+    /// the stream keeps them, S223), except for a speaker in `awaitingUser`
+    /// (`NativeAirPlayModel.awaitingUser`), whose pairing turns it on, as on
+    /// Windows. Of `everyTime`, the speakers still on go off with the notice
+    /// that they need a PIN.
+    mutating func streamEnded(_ cause: StreamEnd, streaming: Bool, midRebuild: Bool = false,
+                              everyTime: [String], enabled: Set<String>,
+                              awaitingUser: Set<String> = []) -> [NativeAirPlayPlan.TurnOff] {
+        guard cause.endsStream(streaming: streaming, midRebuild: midRebuild) else {
+            // After the stream ended, a failed sender still takes the pairings that outlived it.
+            guard cause == .senderFailed else { return [] }
+            let off = outlived.intersection(enabled).sorted()
+            byHand.subtract(outlived)
+            outlived.removeAll()
+            return off.map { NativeAirPlayPlan.TurnOff(id: $0, reason: .needsCode) }
+        }
+        // A failed sender took its pairings and prompts with it.
+        byHand.formIntersection(cause == .senderFailed ? Set<String>() : awaitingUser)
+        outlived = byHand
+        return turnsOff(everyTime, enabled: enabled).map { NativeAirPlayPlan.TurnOff(id: $0, reason: .needsCode) }
+    }
+
+    /// The same for `model`'s rows that ask for a code every time, also one
+    /// that still plays: its PIN session ends at a stream end too (S223).
+    /// A failed sender also turns off, with the needs-a-password notice,
+    /// each other row whose password prompt it took with it, as on Windows.
+    mutating func streamEnded(_ cause: StreamEnd, streaming: Bool, midRebuild: Bool = false,
+                              model: NativeAirPlayModel, enabled: Set<String>) -> [NativeAirPlayPlan.TurnOff] {
+        let rows = model.rows(enabled: enabled)
+        let everyTime = rows.filter { id in
+            NativeAirPlayID.receiver(id).map(model.asksEveryTime) == true
+        }
+        let off = streamEnded(cause, streaming: streaming, midRebuild: midRebuild, everyTime: everyTime, enabled: enabled,
+                              awaitingUser: model.awaitingUser)
+        guard cause == .senderFailed else { return off }
+        // It never played under that sender, so nothing would rejoin; left on, it would wait for a password nothing asks for.
+        let asked = rows.filter { id in
+            enabled.contains(id) && !everyTime.contains(id)
+                && NativeAirPlayID.receiver(id).flatMap(model.codeWait) == .password
+        }
+        return off + asked.map { NativeAirPlayPlan.TurnOff(id: $0, reason: .needsPassword) }
+    }
+
+    /// A new stream started: a pairing that outlived the last one now
+    /// belongs to it, so its failure says what it says while streaming.
+    mutating func streamStarted() {
+        outlived.removeAll()
+    }
+
+    /// The speaker `id` paired: a later failure is its own again.
+    mutating func paired(_ id: String) {
+        outlived.remove(id)
+    }
+
+    /// The speaker `id` goes off for `reason`, and its mark with it. A
+    /// pairing that outlived the stream and fails says the speaker needs a
+    /// PIN, since no stream waits for it; the user's Cancel stays a cancel.
+    mutating func turnedOff(_ id: String, reason: NativeTurnOff) -> NativeTurnOff {
+        byHand.remove(id)
+        guard outlived.remove(id) != nil, reason != .cancelled else { return reason }
+        return .needsCode
+    }
+}
+
+/// What the native model learned that lasts for the run, not for one
+/// sender, so a sender Retry keeps it, as Windows keeps it across its
+/// sender's replacement (S223, S349).
+struct NativeRunMarks: Equatable {
+    /// The receivers given a password this run.
+    var passwords: Set<String> = []
+    /// The receivers off for a refused pairing until the user turns them on
+    /// (`NativeAirPlayModel.refusedOff`).
+    var refusedOff: Set<String> = []
+    /// The receivers whose stored credentials an answer turned down, as last
+    /// listed, kept while they are gone (P154).
+    var credentialsTurnedDown: Set<String> = []
+}
+
+/// What may end the stream for `EveryTimeGuard`.
+enum StreamEnd: Equatable {
+    case stopped(SessionStop)
+    /// The sender stopped after an internal error; Retry starts a new stream.
+    case senderFailed
+    /// The Mac goes to sleep, which counts as streaming stopping.
+    case sleep
+
+    /// `midRebuild`: a rebuild stopped the engine and has not started it
+    /// again, so a stop now ends the stream that ran before it.
+    func endsStream(streaming: Bool, midRebuild: Bool) -> Bool {
+        guard streaming || midRebuild else { return false }
+        guard case .stopped(let reason) = self else { return true }
+        // A quit leaves the switches for the next launch, which turns such a speaker off anyway.
+        return !reason.restarts && reason != .quitting
+    }
+}
+
+/// What a new listing does to the AirPlay switches (`adoptNativeRows`).
+struct NativeRowsAdoption: Equatable {
+    /// The rows (app IDs), as `NativeAirPlayModel.rows` orders them.
+    let rows: [String]
+    /// The new rows auto-connect may switch on (`NativeAirPlayModel.joinable`).
+    let joinable: [String]
+    /// The rows that go off, as they ask for a code every time
+    /// (`EveryTimeGuard.turnsOff`).
+    let turnOff: [String]
+    /// The new rows asking for a PIN or a password, then the receivers that
+    /// appeared unable to play, by receiver ID (`NativeAirPlayModel.appearedAsking`,
+    /// `appearedCantPlay`).
+    let asking: [NativeAirPlayPlan.TurnOff]
+}
+
+extension NativeAirPlayModel {
+    /// The listing's rows against the switches `enabled` and the rows shown
+    /// before, `known`; `stopped` as for `joinable`.
+    func adopt(enabled: Set<String>, known: [String], stopped: Bool,
+               everyTime: inout EveryTimeGuard) -> NativeRowsAdoption {
+        let rows = self.rows(enabled: enabled)
+        return NativeRowsAdoption(rows: rows,
+                                  joinable: joinable(rows, after: Set(known), stopped: stopped),
+                                  turnOff: everyTime.turnsOff(askingEveryTime(rows), enabled: enabled),
+                                  asking: appearedAsking(rows, after: Set(known), stopped: stopped)
+                                      + appearedCantPlay())
+    }
+}
+
+struct AirPlayTargetRow: Equatable {
+    enum Kind: Equatable { case stereoPair, homeTheater }
+    let kind: Kind
+    /// Every member's name, in view or not, by name.
+    let members: [String]
+    /// The members out of view or playing nothing, by name.
+    let missing: [String]
+    /// A member is out of view, plays nothing, or reports its partner
+    /// unreachable, even when no name is known for it.
+    let incomplete: Bool
+    /// A member in view asks for a password this run hasn't had.
+    var asksPassword = false
+}
+
+/// Something the native sender reported about a speaker, or about the stream
+/// (`asc_airplay_next_event`). IDs are receiver IDs.
+enum NativeSpeakerEvent: Equatable {
+    enum State: String {
+        case connecting, playing, retrying, failed, stopped
+        /// Out of view on the network; the sender starts it as soon as it
+        /// is announced again, with no retry schedule meanwhile (P215).
+        case unannounced
+
+        /// An `ASC_AIRPLAY_STATE_*` code; nil for one this side doesn't know.
+        init?(code: Int32) {
+            switch code {
+            case ASC_AIRPLAY_STATE_CONNECTING: self = .connecting
+            case ASC_AIRPLAY_STATE_PLAYING: self = .playing
+            case ASC_AIRPLAY_STATE_RETRYING: self = .retrying
+            case ASC_AIRPLAY_STATE_FAILED: self = .failed
+            case ASC_AIRPLAY_STATE_STOPPED: self = .stopped
+            case ASC_AIRPLAY_STATE_UNANNOUNCED: self = .unannounced
+            default: return nil
+            }
+        }
+    }
+
+    /// What ended a session (the sender's user reasons).
+    enum Problem: String {
+        case notResponding = "not responding"
+        case connectionLost = "connection lost"
+        case busy
+        case refused
+        case incompatible
+        case passwordRequired = "password required"
+        case wrongPassword = "wrong password"
+        case pairingRequired = "pairing required"
+        case unsupported
+        case timingUnavailable = "timing unavailable"
+        case tooManyAirPlay2 = "too many AirPlay 2 speakers"
+        /// The receiver takes only PTP, which runs for speakers on another
+        /// network (P205).
+        case ptpOtherNetwork = "PTP in use on another network"
+        /// The receiver plays only AirPlay 2, and this launch runs without it.
+        case airPlay2Only = "AirPlay 2 only"
+        /// An Apple TV whose home theater group plays, or a group whose
+        /// Apple TV plays by itself (P177).
+        case playsThroughSpeakers = "plays through its speakers"
+        /// A paired receiver didn't prove it is the one that was paired; its
+        /// stored pairing stays (P56).
+        case receiverUnverified = "receiver unverified"
+
+        /// The sender tries again by itself, so the speaker stays on; any
+        /// other problem turns it off, except a speaker that waits, which
+        /// stays on (`NativeAirPlayModel.apply`).
+        var retried: Bool {
+            switch self {
+            case .notResponding, .connectionLost, .busy, .refused, .incompatible: return true
+            default: return false
+            }
+        }
+
+        /// The sender keeps the speaker and starts it once it lets it (S285).
+        var waits: Bool { self == .tooManyAirPlay2 || self == .ptpOtherNetwork }
+
+        /// Why a speaker it turns off is off.
+        var turnOff: NativeTurnOff {
+            switch self {
+            case .notResponding, .connectionLost: return .unreachable
+            case .busy: return .busy
+            case .refused: return .refused
+            case .passwordRequired, .wrongPassword: return .needsPassword
+            case .pairingRequired: return .needsCode
+            // A waiting speaker never goes off; a pairing that ends with a
+            // wait can't play, as with `unsupported`.
+            case .incompatible, .unsupported, .tooManyAirPlay2, .ptpOtherNetwork: return .cantPlay
+            case .airPlay2Only: return .needsAirPlay2
+            case .timingUnavailable: return .timingUnavailable
+            case .playsThroughSpeakers: return .playsThroughSpeakers
+            case .receiverUnverified: return .receiverUnverified
+            }
+        }
+    }
+
+    /// `retryMs`: when a retrying speaker's next session starts.
+    case state(id: String, State, retryMs: Int64?)
+    /// `retryMs`: when its next session starts, nil when the user must act;
+    /// `detail`: the error, for the debug log.
+    case error(id: String, Problem, retryMs: Int64?, detail: String)
+    /// L + d_s, the receiver's own latency in frames when it sent one, and
+    /// R_s in microseconds with the `ASC_AIRPLAY_LATENCY_SOURCE_*` bits of
+    /// the reports that gave it (0 and 0 when none did).
+    case latency(id: String, ms: Double, receiverFrames: Int64?, reportedUs: Int64 = 0, sources: UInt32 = 0)
+    /// The sender holds an Lf set while a speaker sounds (`ms`: that Lf)
+    /// until the stream is empty or the timeline restarts (P201).
+    case latencyHeld(ms: Double)
+    /// The app set a new Lf or E (S282), as its debug line says.
+    case estimate(detail: String)
+    /// The base latency L, after a start, a change or a restart.
+    case timeline(latencyMs: Double, restarted: Bool)
+    /// The sender stopped working after an internal error (a panic in it):
+    /// it lists, plays and reports nothing more. `detail`: where the panic
+    /// happened ("panic at <file>:<line>", or "latest panic at
+    /// <file>:<line>" when one of its own threads ended), or empty, for the
+    /// debug log (S205).
+    case failed(detail: String)
+    /// A pairing's Apple TV shows a PIN.
+    case pinNeeded(id: String)
+    /// A pairing needs the receiver's password; `wrong`: it turned down the
+    /// one given, which the sender forgot.
+    case passwordNeeded(id: String, wrong: Bool)
+    /// A pairing ended without credentials: the PIN was turned down
+    /// (`wrongPin`, a new pairing shows a PIN again), or `problem`.
+    case pairingFailed(id: String, wrongPin: Bool, Problem, detail: String)
+    /// A pairing succeeded and its credentials are stored; `storeNote` is
+    /// empty, or why they last only until AudioSync quits. `forSession`: it
+    /// paired for this session only and nothing was stored.
+    case paired(id: String, storeNote: String, forSession: Bool = false)
+    /// A PIN pairing whose verify failed stored its credentials; the
+    /// pairing failure that follows ends it (P153). `storeNote` as above.
+    case stored(id: String, storeNote: String)
+    /// Someone changed its volume on the speaker itself: the own volume
+    /// (0 to 100) behind it and the device level D (0 to 100) the row shows
+    /// (S290), which the sender already counts as the speaker's (P122, P180).
+    case volume(id: String, position: Double, level: Double)
+    /// Something about its session for the debug log; the session goes on.
+    /// `ptpPortsTaken`: PTP port 319 or 320 is taken, so speakers that need
+    /// PTP timing can't play (P158).
+    case warning(id: String, ptpPortsTaken: Bool, detail: String)
+    /// Its session bound the PTP ports after the sender reported them
+    /// taken: they are free again (P158).
+    case ptpFree(id: String)
+
+    /// Whether the pairings' write worked, for an event that wrote them (S224).
+    var pairingsSaved: Bool? {
+        switch self {
+        case .paired(_, let storeNote, false), .stored(_, let storeNote): return storeNote.isEmpty
+        default: return nil
+        }
+    }
+
+    /// The event as a debug log line; `name` gives a speaker's name. Never
+    /// holds a PIN, password or credential (none crosses into the app).
+    func logLine(name: (String) -> String?) -> String {
+        func label(_ id: String) -> String { name(id).map { "\($0) (\(id))" } ?? id }
+        func retry(_ ms: Int64?) -> String {
+            ms.map { String(format: "trying again in %.1f s", Double($0) / 1000) } ?? "it needs the user"
+        }
+        let line: String
+        switch self {
+        case .state(let id, let state, let retryMs):
+            line = "\(label(id)): \(state.rawValue)" + (state == .retrying ? ", " + retry(retryMs) : "")
+                + (state == .unannounced ? ", waiting until it is announced again" : "")
+        case .error(let id, let problem, let retryMs, let detail):
+            line = "\(label(id)) error: \(problem.rawValue) (\(detail)); "
+                + (problem.waits && retryMs == nil ? "waiting for the sender to start it" : retry(retryMs))
+        case .latency(let id, let ms, let frames, let reportedUs, let sources):
+            line = "\(label(id)) latency: L + d_s = \(String(format: "%.0f", ms)) ms, the receiver reports "
+                + (frames.map { "\($0) frames" } ?? "nothing") + "; "
+                + NativeReceiverLatency.reportText(us: reportedUs, sources: sources)
+        case .latencyHeld(let ms):
+            line = String(format: "Lf %.0f ms held while a speaker sounds, until the stream is empty or restarts", ms)
+        case .estimate(let detail):
+            line = detail
+        case .timeline(let ms, let restarted):
+            line = String(format: "timeline: L = %.0f ms", ms) + (restarted ? ", restarted" : "")
+        case .failed(let detail):
+            line = "the sender stopped after an internal error" + (detail.isEmpty ? "" : " (\(detail))")
+        case .pinNeeded(let id):
+            line = "\(label(id)): pairing, it shows a PIN"
+        case .passwordNeeded(let id, let wrong):
+            line = "\(label(id)): pairing needs the password" + (wrong ? " (the one given was turned down)" : "")
+        case .pairingFailed(let id, let wrongPin, let problem, let detail):
+            line = "\(label(id)): pairing failed: " + (wrongPin ? "wrong PIN" : problem.rawValue) + " (\(detail))"
+        case .paired(let id, _, true):
+            line = "\(label(id)): paired for this session, nothing stored (it asks for a code every time)"
+        case .paired(let id, let note, false):
+            line = "\(label(id)): paired, credentials stored" + (note.isEmpty ? "" : " for this run only (\(note))")
+        case .stored(let id, let note):
+            line = "\(label(id)): the pairing's credentials stored before its verify failed"
+                + (note.isEmpty ? "" : " for this run only (\(note))")
+        case .volume(let id, let position, let level):
+            let shown = String(format: "%.1f", level)
+            line = "\(label(id)) volume changed on the speaker: device level \(shown), own volume \(Int(position.rounded()))"
+        case .warning(let id, _, let detail):
+            line = "\(label(id)) warning: \(detail)"
+        case .ptpFree(let id):
+            line = "\(label(id)) bound the PTP ports, which are free again"
+        }
+        return "[AudioSync] native AirPlay: " + line
+    }
+}
+
+/// Why the app turns a native speaker off.
+enum NativeTurnOff: Equatable {
+    /// It asks for a PIN and wasn't turned on by the user just now (only a
+    /// click starts a pairing; auto-connect and a restored switch never do).
+    case needsCode
+    /// It asks for a password AudioSync doesn't have, and wasn't turned on
+    /// by the user just now.
+    case needsPassword
+    /// It didn't answer, or lost the connection, and the sender gave up.
+    case unreachable
+    /// It answered busy, and the sender gave up.
+    case busy
+    /// It turned the session down, and the sender gave up.
+    case refused
+    /// This sender can't play to it.
+    case cantPlay
+    /// It plays only AirPlay 2, which this launch runs without.
+    case needsAirPlay2
+    /// It turned NTP timing down, and PTP timing isn't available.
+    case timingUnavailable
+    /// An Apple TV and its home theater group never play at once (P177).
+    case playsThroughSpeakers
+    /// It didn't prove it is the receiver that was paired (P56).
+    case receiverUnverified
+    /// A member of the target (its receiver ID) asks for a password
+    /// AudioSync doesn't have, outside the user's attempt (P176).
+    case memberNeedsPassword(String)
+    /// The user cancelled its PIN or password prompt.
+    case cancelled
+    /// Its pairing ended without credentials (not for a wrong PIN, which
+    /// asks again).
+    case pairingFailed
+    /// It paired, then turned the new credentials down too.
+    case stillNeedsCode
+}
+
+/// Where a native receiver's PIN pairing or password stands, while the
+/// user's attempt to turn it on is under way.
+enum NativeAccessStage: Equatable {
+    /// A PIN pairing runs; the Apple TV is about to show a PIN.
+    /// `afterWrongPin`: it starts again after a PIN that didn't work.
+    case pairing(afterWrongPin: Bool)
+    /// The PIN prompt is queued or open; `wrong`: the last PIN didn't work.
+    case askingPin(wrong: Bool)
+    /// The PIN went to the Apple TV; its answer is awaited.
+    case checkingPin
+    /// The password prompt is queued or open; `wrong`: the last one was
+    /// turned down.
+    case askingPassword(wrong: Bool)
+
+    /// A pairing runs in the sender, which a turn-off cancels.
+    var pairingRuns: Bool {
+        switch self {
+        case .pairing, .askingPin, .checkingPin: return true
+        case .askingPassword: return false
+        }
+    }
+}
+
+/// A PIN or password prompt for a native receiver (receiver ID).
+struct NativePrompt: Equatable {
+    let id: String
+    let password: Bool
+    /// The last PIN or password didn't work.
+    let wrong: Bool
+}
+
+/// What a speaker's row waits for while the user's attempt runs: its PIN or
+/// password prompt, queued or open (S223).
+enum NativeCodeWait: Equatable { case pin, password }
+
+/// What the app does with the user's answer to a `NativePrompt`.
+enum NativePromptAnswer: Equatable {
+    /// Hand the PIN to the pairing.
+    case submitPin
+    /// Hand the password to the sender, then start the pairing again
+    /// (`pair`) or start the speaker's session again.
+    case sendPassword(pair: Bool)
+    /// Not a PIN (digits only): the prompt comes again.
+    case askAgain
+    /// Cancelled: the speaker goes off.
+    case turnOff(NativeTurnOff)
+    /// The speaker was turned off meanwhile: nothing to do.
+    case ignore
+}
+
+/// What the sender's speakers must do to match the user's choice
+/// (`NativeAirPlayModel.plan`). Receiver IDs, sorted.
+struct NativeAirPlayPlan: Equatable {
+    struct TurnOff: Equatable {
+        let id: String
+        let reason: NativeTurnOff
+    }
+
+    /// Switched on, listed as able to play, and not in the sender yet.
+    var add: [String] = []
+    /// In the sender, but switched off, or streaming stopped.
+    var remove: [String] = []
+    /// Switched on but asking for what this sender can't give yet.
+    var turnOff: [TurnOff] = []
+    /// Switched-on members of a switched-on target: they play as part of
+    /// it, so their own switches go off without a notice (P176).
+    var release: [String] = []
+
+    var isEmpty: Bool { add.isEmpty && remove.isEmpty && turnOff.isEmpty && release.isEmpty }
+
+    /// Applying it changes the rows by itself: a target or lapsed receiver
+    /// shows only while in the sender, and its later Stopped event is passed over.
+    var changesRows: Bool { !remove.isEmpty }
+}
+
+/// What the app does about a speaker event (`NativeAirPlayModel.apply`).
+enum NativeAirPlayOutcome: Equatable {
+    /// The speaker started or stopped playing (app ID).
+    case playingChanged(String, playing: Bool)
+    /// The speaker can't play and goes off, with a notice (app ID).
+    case turnOff(String, NativeTurnOff)
+    /// L changed: local outputs line up again.
+    case latencyChanged
+    /// The sender stopped working: the app drops it and offers Retry.
+    case senderFailed
+    /// Start a PIN pairing with the receiver (receiver ID). A stored pairing
+    /// it turned down stays until the new one replaces it (P154).
+    case startPairing(String)
+    /// Stop the pairing with the receiver (receiver ID): nobody waits for it.
+    case cancelPairing(String)
+    /// A PIN or password prompt was queued: show the next one.
+    case prompt
+    /// The receiver paired (app ID): it joins with its new credentials.
+    case paired(String)
+    /// The speaker (app ID) started waiting, for an AirPlay 2 place or for
+    /// PTP, or stopped waiting (nil): it stays on, and the sender starts it
+    /// once it lets it (P169, S285).
+    case waiting(String, NativeSpeakerEvent.Problem?)
+    /// Someone changed the speaker's volume on the speaker itself (app ID):
+    /// its own volume and device level follow (S290), and nothing goes back
+    /// to the sender.
+    case volumeChanged(String, Double, Double)
+    /// PTP port 319 or 320 is taken, so speakers that need PTP timing
+    /// can't play (P158).
+    case ptpPortsTaken
+    /// A session bound the PTP ports: they are free again.
+    case ptpPortsFree
+    /// The speaker (app ID) went out of view on the network or came back
+    /// without its playing changing: its row's note follows (P215).
+    case unannouncedChanged(String)
+    /// The speaker (app ID) failed its second retry in a row and stays on
+    /// while the sender keeps trying, or its records lapsed meanwhile (nil):
+    /// its notice and row note follow (S222).
+    case reconnecting(String, NativeSpeakerEvent.Problem?)
+}
+
+/// The native sender's receivers and speakers as the app sees them (main
+/// queue). The receivers come from discovery; the speakers are the ones the
+/// app added to the sender, with the state their events last reported.
+struct NativeAirPlayModel {
+    /// The receivers discovery lists, by receiver ID.
+    private(set) var receivers: [String: NativeReceiver] = [:]
+    /// The speakers in the sender, by receiver ID.
+    private(set) var states: [String: NativeSpeakerEvent.State] = [:]
+    /// The base latency L_s in ms (P113); 0 until the sender reports it.
+    var latencyMs: Double = 0
+    /// The receivers' reported latencies and the Lf and E made of them
+    /// (S280, S283).
+    var receiverLatency = NativeReceiverLatency()
+    /// A speaker of the stream reached its first-sound time, as the last
+    /// poll found.
+    var sounding = false
+    /// From the Mac's sleep notice until its wake, a reconcile starts nothing
+    /// and a retried error doesn't count toward reconnecting (S412).
+    var asleep = false
+
+    /// The sessions a row in the sender plays: a target's members as last
+    /// listed, or the speaker itself.
+    func sessions(of row: String) -> [String] {
+        guard NativeTarget.kind(row) != nil else { return [row] }
+        let members = memberOf.filter { $0.value == row }.map(\.key).sorted()
+        return members.isEmpty ? [row] : members
+    }
+
+    /// The rows in the sender by ID and the sessions each plays, which Lf and
+    /// E are taken over: a target is one row (S280, S283, S284).
+    var latencyRows: (ids: [String], members: [[String]]) {
+        let ids = states.keys.sorted()
+        return (ids, ids.map { sessions(of: $0) })
+    }
+
+    /// The last name of every receiver seen, for rows and notices.
+    private(set) var names: [String: String] = [:]
+    /// This Mac's computer name: a receiver announced under it is this Mac's
+    /// own AirPlay Receiver, which is never listed (S222,
+    /// `NativeReceiver.isThisMac`). Nil hides nothing.
+    var computerName: String?
+    /// The target each member was last listed in (P176), kept while that
+    /// target is listed or in the sender, so a gone member is named missing
+    /// and a gone target that still plays holds its members.
+    private(set) var memberOf: [String: String] = [:]
+    /// The receivers last listed as reached over AirPlay 2, kept while they
+    /// are gone, so a row off the network keeps its kind.
+    private(set) var reachedOverAirPlay2Before: Set<String> = []
+    /// The receivers last listed with stored credentials an answer turned
+    /// down (P154), kept while they are gone, as for a Retry's new sender.
+    private(set) var credentialsTurnedDown: Set<String> = []
+    /// The receivers that appeared unable to play, until auto-connect saw
+    /// them (`appearedCantPlay`), so their notice comes once per appearance.
+    private(set) var cantPlayAppeared: Set<String> = []
+
+    mutating func apply(_ change: NativeReceiverChange) {
+        switch change {
+        case .appeared(let receiver), .changed(let receiver):
+            names[receiver.id] = receiver.name
+            if NativeReceiver.isThisMac(receiver.name, computerName: computerName) {
+                receivers.removeValue(forKey: receiver.id)
+            } else {
+                receivers[receiver.id] = receiver
+                if !receiver.target.isEmpty { memberOf[receiver.id] = receiver.target }
+                if receiver.overAirPlay2 {
+                    reachedOverAirPlay2Before.insert(receiver.id)
+                } else {
+                    reachedOverAirPlay2Before.remove(receiver.id)
+                }
+                if receiver.credentialsTurnedDown {
+                    credentialsTurnedDown.insert(receiver.id)
+                } else {
+                    credentialsTurnedDown.remove(receiver.id)
+                }
+            }
+            if receiver.isTarget ? targetCantPlay(receiver.id) == nil : receiver.access != nil {
+                cantPlayAppeared.remove(receiver.id)
+            } else if case .appeared = change {
+                cantPlayAppeared.insert(receiver.id)
+            }
+        case .gone(let id, _):
+            receivers.removeValue(forKey: id)
+            cantPlayAppeared.remove(id)
+            if states[id] == nil, memberOf[id].map({ states[$0] != nil }) != true { receiverLatency.forget(id) }
+        }
+        pruneMembers()
+    }
+
+    private mutating func pruneMembers() {
+        memberOf = memberOf.filter { member, target in
+            if states[target] != nil { return true }
+            if let receiver = receivers[member] { return receiver.target == target }
+            return receivers[target] != nil
+        }
+    }
+
+    /// The members of the target `id`, in view or not (receiver IDs).
+    func members(of id: String) -> [String] {
+        memberOf.filter { $0.value == id }.map(\.key).sorted()
+    }
+
+    /// The target that holds the member `id` (P176): one in the sender, or
+    /// a listed one while `id` is off (`on` false). A member left on by
+    /// itself before its target was listed still plays alone. The sender
+    /// lists the members just before their target, so a member that names
+    /// its target is held already.
+    func holdingTarget(_ id: String, on: Bool) -> String? {
+        guard let target = memberOf[id] else { return nil }
+        if states[target] != nil { return target }
+        return !on && (receivers[target] != nil || receivers[id]?.target == target) ? target : nil
+    }
+
+    /// Whether the receiver `id` stays off because the other side of its
+    /// home theater group, the Apple TV or the group, is on and can play or
+    /// plays: the two never play at once (P229). `enabled`: the switched-on
+    /// app IDs.
+    func homeTheaterConflict(_ id: String, enabled: Set<String>) -> Bool {
+        let control = receivers[id]?.control ?? ""
+        let others = (control.isEmpty ? [] : [control]) + receivers.values.filter { $0.control == id }.map(\.id)
+        func able(_ id: String) -> Bool {
+            switch receivers[id]?.availability {
+            case .available?: return true
+            case .needsPassword?: return passwords.contains(id)
+            default: return false
+            }
+        }
+        return others.contains { other in
+            guard enabled.contains(NativeAirPlayID.app(other)) else { return false }
+            guard receivers[other]?.isTarget == true else { return able(other) || isPlaying(other) }
+            // A group plays as a whole, as on Windows: a member whose password wasn't typed holds it back.
+            let inView = members(of: other).filter { receivers[$0] != nil }
+            let waiting = inView.contains { receivers[$0]?.availability == .needsPassword && !passwords.contains($0) }
+            return (!waiting && (inView.isEmpty || inView.contains(where: able))) || isPlaying(other)
+        }
+    }
+
+    /// What the row of the target `id` says about its members; nil for a
+    /// speaker's row. `renamed` gives a member's name the user gave it (S228).
+    func targetRow(_ id: String, renamed: (String) -> String? = { _ in nil }) -> AirPlayTargetRow? {
+        guard let kind = NativeTarget.kind(id) else { return nil }
+        let ids = members(of: id)
+        func named(_ ids: [String]) -> [String] {
+            ids.map { renamed($0) ?? names[$0] ?? $0 }.sorted { $0.lowercased() < $1.lowercased() }
+        }
+        let missing = (receivers[id]?.missing ?? []).sorted { $0.lowercased() < $1.lowercased() }
+        return AirPlayTargetRow(kind: kind, members: named(ids), missing: missing,
+                                incomplete: receivers[id]?.incomplete == true || !missing.isEmpty,
+                                asksPassword: ids.contains {
+                                    receivers[$0]?.availability == .needsPassword && !passwords.contains($0)
+                                })
+    }
+
+    func isPlaying(_ id: String) -> Bool { states[id] == .playing }
+
+    /// Whether the sender reaches the receiver `id` over AirPlay 2, as last
+    /// listed: its row then names AirPlay 2 as its kind.
+    /// A target counts when one of its members does.
+    func reachedOverAirPlay2(_ id: String) -> Bool {
+        if NativeTarget.kind(id) != nil { return members(of: id).contains { reachedOverAirPlay2($0) } }
+        return receivers[id].map(\.overAirPlay2) ?? reachedOverAirPlay2Before.contains(id)
+    }
+
+    /// Whether credentials no answer turned down are kept for the listed
+    /// receiver `id`.
+    func isPaired(_ id: String) -> Bool { receivers[id]?.paired == true }
+
+    /// Whether credentials are stored for the listed receiver `id`, also ones
+    /// it turned down (P154): its row offers Forget Pairing.
+    func keepsCredentials(_ id: String) -> Bool { receivers[id]?.credentialsKept == true }
+
+    /// Whether the listed receiver `id` asked for nothing: listed as able to
+    /// play, with no stored pairing, so a refused pairing from it came before
+    /// any pairing step and its `.needsCode` notice names no code.
+    func refusedUnasked(_ id: String) -> Bool {
+        // A target never pairs, listed or not, so its notice offers no pairing (P176).
+        if NativeTarget.kind(id) != nil { return true }
+        guard let receiver = receivers[id] else { return false }
+        return receiver.availability == .available && !receiver.paired && !receiver.credentialsKept
+    }
+
+    /// Whether the sender holds a password the user typed for the listed
+    /// receiver `id` this run: its row offers Forget Password.
+    func holdsPassword(_ id: String) -> Bool { passwords.contains(id) }
+
+    /// Forget Password: the next attempt asks for the password again.
+    mutating func forgetPassword(_ id: String) { passwords.remove(id) }
+
+    /// What a failed sender's model hands the one a Retry starts.
+    var runMarks: NativeRunMarks {
+        get { NativeRunMarks(passwords: passwords, refusedOff: refusedOff, credentialsTurnedDown: credentialsTurnedDown) }
+        set {
+            (passwords, refusedOff, credentialsTurnedDown)
+                = (newValue.passwords, newValue.refusedOff, newValue.credentialsTurnedDown)
+        }
+    }
+
+    /// The speaker list's rows, as app IDs: every receiver it shows
+    /// (`NativeReceiver.access`), and any in the sender whose announcement
+    /// lapsed; by name, then ID. A target in the sender stays
+    /// until switched off, and a member it holds shows as part of it
+    /// (P176). `enabled`: the switched-on app IDs.
+    func rows(enabled: Set<String>) -> [String] {
+        var ids = Set(receivers.keys.filter { access($0) != nil })
+        ids.formUnion(states.keys.filter { isPlaying($0) || receivers[$0] == nil || NativeTarget.kind($0) != nil })
+        ids = ids.filter { holdingTarget($0, on: enabled.contains(NativeAirPlayID.app($0))) == nil }
+        return ids.sorted { a, b in
+            let (x, y) = ((names[a] ?? a).lowercased(), (names[b] ?? b).lowercased())
+            return x != y ? x < y : a < b
+        }.map(NativeAirPlayID.app)
+    }
+
+    /// How a row shows the receiver; one that only plays on is open, and so
+    /// is a target that can't play, which its row says (`targetCantPlay`).
+    func access(_ id: String) -> AirPlayPairing.Access? {
+        if let receiver = receivers[id] {
+            return targetCantPlay(id) != nil ? .open : receiver.access
+        }
+        return isPlaying(id) ? .open : nil
+    }
+
+    /// The listed receiver's availability; a target's follows its members in
+    /// view, as on Windows (P176, P181): it can be switched on while one can
+    /// play or asks for a password, which is asked for by name. With none
+    /// that can, it reads as its first member, a PIN as needing pairing,
+    /// since a target never pairs.
+    func availability(_ id: String) -> NativeReceiver.Availability? {
+        guard let receiver = receivers[id] else { return nil }
+        guard receiver.isTarget else { return receiver.availability }
+        let inView = members(of: id).compactMap { receivers[$0]?.availability }
+        if inView.isEmpty || inView.contains(where: { $0 == .available || $0 == .needsPassword }) { return .available }
+        return inView[0] == .needsPin ? .needsPairing : inView[0]
+    }
+
+    /// A listed target with no member that can play, as `availability`
+    /// reads it: listed with that reason, and switched on it stays off, as on Windows (P176).
+    func targetCantPlay(_ id: String) -> NativeReceiver.Availability? {
+        guard receivers[id]?.isTarget == true, let shown = availability(id), shown != .available else { return nil }
+        return shown
+    }
+
+    /// The rows (app IDs) missing from `known` whose receiver is listed as
+    /// able to play, or asks for a password this run has had (S349): the
+    /// ones auto-connect may switch on. None for rows a stop rebuilt
+    /// (`stopped`), as auto-connect would restart streaming from inside the
+    /// stop, and never one that asks for a code every time.
+    func joinable(_ rows: [String], after known: Set<String>, stopped: Bool) -> [String] {
+        guard !stopped else { return [] }
+        return rows.filter { id in
+            guard !known.contains(id), let receiver = NativeAirPlayID.receiver(id),
+                  !refusedOff.contains(receiver), !asksEveryTime(receiver) else { return false }
+            let listed = availability(receiver)
+            return listed == .available || (listed == .needsPassword && passwords.contains(receiver))
+        }
+    }
+
+    /// The rows missing from `known` whose receiver asks for a PIN, or a
+    /// password this run hasn't had, with no attempt of the user's under
+    /// way: marked auto-connect, they go off with why (S349). None
+    /// for rows a stop rebuilt, as for `joinable`, nor one asking every time.
+    func appearedAsking(_ rows: [String], after known: Set<String>, stopped: Bool) -> [NativeAirPlayPlan.TurnOff] {
+        guard !stopped else { return [] }
+        return rows.compactMap { id -> NativeAirPlayPlan.TurnOff? in
+            guard !known.contains(id), let receiver = NativeAirPlayID.receiver(id),
+                  !asksEveryTime(receiver), stages[receiver] == nil else { return nil }
+            switch receivers[receiver]?.availability {
+            case .needsPin? where !pairedInAttempt.contains(receiver):
+                return .init(id: receiver, reason: .needsCode)
+            case .needsPassword? where !passwords.contains(receiver):
+                return .init(id: receiver, reason: .needsPassword)
+            default:
+                return nil
+            }
+        }
+    }
+
+    /// The receivers that appeared unable to play (`cantPlayAppeared`), by
+    /// ID: marked auto-connect, they stay off with the can't-play notice, as
+    /// on Windows (S349), also in rows a stop rebuilt: a turn-off starts
+    /// no stream, and Windows says so whether or not it streams.
+    func appearedCantPlay() -> [NativeAirPlayPlan.TurnOff] {
+        cantPlayAppeared.sorted().compactMap(cantPlayTurnOff)
+    }
+
+    /// The turn-off of the listed receiver `id`, a target as `availability`
+    /// reads it, when it can't play; nil when it can or asks for a code.
+    func cantPlayTurnOff(_ id: String) -> NativeAirPlayPlan.TurnOff? {
+        switch availability(id) {
+        case .airPlay2Only?: return .init(id: id, reason: .needsAirPlay2)
+        case .unsupported?, .needsPairing?: return .init(id: id, reason: .cantPlay)
+        default: return nil
+        }
+    }
+
+    /// Auto-connect saw the receivers `ids` appear: no notice comes again
+    /// until they leave and appear again.
+    mutating func appearanceSeen(_ ids: [String]) { cantPlayAppeared.subtract(ids) }
+
+    /// Whether the listed receiver asks for a code every time it connects.
+    func asksEveryTime(_ receiver: String) -> Bool {
+        receivers[receiver]?.codeEveryTime == true
+    }
+
+    /// The rows (app IDs) whose receiver asks for a code every time and
+    /// doesn't play: they go off unless switched on by hand, also when they
+    /// were on from the last run or start asking once listed (a late TXT
+    /// update), so no code request comes by itself. One that plays keeps
+    /// its session.
+    func askingEveryTime(_ rows: [String]) -> [String] {
+        rows.filter { id in
+            guard let receiver = NativeAirPlayID.receiver(id) else { return false }
+            return asksEveryTime(receiver) && !isPlaying(receiver)
+        }
+    }
+
+    /// The app IDs local outputs line up with when switched on (S79 under
+    /// this sender, as in the Windows app): listed as able to play or as
+    /// asking for a password given this run, or playing. A receiver listed
+    /// as unable to play and not playing, or one that is gone, doesn't hold
+    /// local outputs back.
+    var soundingIDs: [String] {
+        let ids = Set(receivers.keys.filter {
+            availability($0) == .available || (availability($0) == .needsPassword && passwords.contains($0))
+        })
+            .union(states.keys.filter { isPlaying($0) })
+        return ids.sorted().map(NativeAirPlayID.app)
+    }
+
+    // MARK: Pairing and passwords
+
+    /// Where each receiver's pairing or password prompt stands, while the
+    /// user's attempt to turn it on is under way.
+    private(set) var stages: [String: NativeAccessStage] = [:]
+    /// The receivers the app handed a password this run (the sender keeps
+    /// it, in memory only; the app keeps nothing but this mark).
+    private(set) var passwords: Set<String> = []
+    /// The receivers the user turned on themselves that haven't played
+    /// since: only these may prompt or pair. Auto-connect and switches
+    /// restored at launch never do.
+    private(set) var attempts: Set<String> = []
+    /// Attempts that paired already: refused again, they go off instead of
+    /// pairing in a loop.
+    private(set) var pairedInAttempt: Set<String> = []
+    /// Receivers turned off because they refused a pairing: neither
+    /// auto-connect nor the plan adds them again until the user turns them
+    /// on, so a refusal never loops.
+    private(set) var refusedOff: Set<String> = []
+    /// The target each member's password prompt is for (P176): the prompt
+    /// names the member, and its answer restarts the target.
+    private(set) var promptTargets: [String: String] = [:]
+    /// Prompts waiting to be shown, oldest first (receiver IDs).
+    private(set) var queuedPrompts: [String] = []
+    /// The prompt that is open, until it is answered or taken back; the
+    /// next waits for it.
+    private(set) var openPrompt: NativePrompt?
+
+    /// The targets (app IDs) whose pairing runs or whose PIN or password
+    /// prompt is queued or open: the user's attempt still waits on them.
+    var awaitingUser: Set<String> {
+        Set(stages.keys.filter { promptTargets[$0] == nil }.map(NativeAirPlayID.app))
+            .union(promptTargets.values.map(NativeAirPlayID.app))
+    }
+
+    /// What the row of the receiver or target `id` waits for, if anything.
+    func codeWait(_ id: String) -> NativeCodeWait? {
+        if promptTargets.values.contains(id) { return .password }
+        switch stages[id] {
+        case .askingPassword?: return .password
+        case .askingPin?: return .pin
+        case .pairing?, .checkingPin?, nil: return nil
+        }
+    }
+
+    /// A PIN as the Apple TV shows it: four ASCII digits.
+    static func isPin(_ code: String) -> Bool {
+        code.unicodeScalars.count == 4 && code.unicodeScalars.allSatisfy { ("0"..."9").contains($0) }
+    }
+
+    /// The user turned the receiver `id` on: a new attempt. One that asks
+    /// for a PIN starts a pairing, and one that asks for a password this
+    /// run hasn't had prompts for it; any other just joins.
+    mutating func turnedOnByUser(_ id: String) -> NativeAirPlayOutcome? {
+        endAttempt(id)
+        attempts.insert(id)
+        refusedOff.remove(id)
+        if NativeTarget.kind(id) != nil {
+            var outcome: NativeAirPlayOutcome?
+            for member in members(of: id)
+            where receivers[member]?.availability == .needsPassword && !passwords.contains(member) {
+                promptTargets[member] = id
+                outcome = ask(member, .askingPassword(wrong: false))
+            }
+            return outcome
+        }
+        switch receivers[id]?.availability {
+        case .needsPin?:
+            stages[id] = .pairing(afterWrongPin: false)
+            return .startPairing(id)
+        case .needsPassword? where !passwords.contains(id):
+            return ask(id, .askingPassword(wrong: false))
+        default:
+            return nil
+        }
+    }
+
+    /// The receiver `id` was turned off (by the user or the app): its
+    /// attempt ends and its prompt is dropped. True when a pairing runs in
+    /// the sender, which the app then cancels.
+    mutating func turnedOff(_ id: String) -> Bool {
+        let running = stages[id]?.pairingRuns ?? false
+        endAttempt(id)
+        return running
+    }
+
+    /// The members of the target `id` whose pairing runs for its attempt
+    /// (P235), which the app cancels when the target goes off.
+    func membersPairing(for id: String) -> [String] {
+        promptTargets.filter { $0.value == id && stages[$0.key]?.pairingRuns == true }.map(\.key)
+    }
+
+    private mutating func endAttempt(_ id: String) {
+        stages[id] = nil
+        attempts.remove(id)
+        pairedInAttempt.remove(id)
+        queuedPrompts.removeAll { $0 == id }
+        for (member, target) in promptTargets where target == id {
+            promptTargets[member] = nil
+            stages[member] = nil
+            queuedPrompts.removeAll { $0 == member }
+        }
+    }
+
+    /// Queues the prompt of `stage` for `id`.
+    private mutating func ask(_ id: String, _ stage: NativeAccessStage) -> NativeAirPlayOutcome {
+        stages[id] = stage
+        if !queuedPrompts.contains(id) { queuedPrompts.append(id) }
+        return .prompt
+    }
+
+    /// The next prompt to show, unless one is open: the oldest queued one
+    /// whose receiver still waits for it.
+    mutating func nextPrompt() -> NativePrompt? {
+        guard openPrompt == nil else { return nil }
+        while !queuedPrompts.isEmpty {
+            let id = queuedPrompts.removeFirst()
+            let prompt: NativePrompt
+            switch stages[id] {
+            case .askingPin(let wrong)?: prompt = NativePrompt(id: id, password: false, wrong: wrong)
+            case .askingPassword(let wrong)?: prompt = NativePrompt(id: id, password: true, wrong: wrong)
+            default: continue
+            }
+            openPrompt = prompt
+            return prompt
+        }
+        return nil
+    }
+
+    /// Whether `stage` still waits for the answer to `prompt`.
+    private static func waits(_ stage: NativeAccessStage?, for prompt: NativePrompt) -> Bool {
+        switch (stage, prompt.password) {
+        case (.askingPin?, false), (.askingPassword?, true): return true
+        default: return false
+        }
+    }
+
+    /// Takes the open prompt back once its receiver no longer waits for
+    /// its answer: its pairing failed or ended underneath, or the attempt
+    /// ended (the speaker was switched off, or plays). The app closes it,
+    /// and whatever it returns then is no answer (`answered` ignores it):
+    /// the user sees it go, with the notice that says why if the speaker
+    /// went off, instead of typing a PIN nothing waits for. Nil while the
+    /// open prompt is still waited for, or none is open.
+    mutating func withdrawPrompt() -> NativePrompt? {
+        guard let prompt = openPrompt, !Self.waits(stages[prompt.id], for: prompt) else { return nil }
+        openPrompt = nil
+        return prompt
+    }
+
+    /// The user answered `prompt` with `code`, nil for Cancel.
+    /// A prompt that isn't the open one (taken back meanwhile) is ignored.
+    mutating func answered(_ prompt: NativePrompt, code: String?) -> NativePromptAnswer {
+        guard openPrompt == prompt else { return .ignore }
+        openPrompt = nil
+        let id = prompt.id
+        guard Self.waits(stages[id], for: prompt) else { return .ignore }
+        // The stage stays: turning the speaker off cancels a waiting pairing.
+        guard let code, !code.isEmpty else { return .turnOff(.cancelled) }
+        if prompt.password {
+            passwords.insert(id)
+            if promptTargets.removeValue(forKey: id) != nil {
+                stages[id] = nil
+                return .sendPassword(pair: false)
+            }
+            if receivers[id]?.availability == .needsPin {
+                stages[id] = .pairing(afterWrongPin: false)
+                return .sendPassword(pair: true)
+            }
+            stages[id] = nil
+            return .sendPassword(pair: false)
+        }
+        guard Self.isPin(code) else {
+            _ = ask(id, .askingPin(wrong: true))
+            return .askAgain
+        }
+        stages[id] = .checkingPin
+        return .submitPin
+    }
+
+    /// The sender didn't take the PIN for `id` (its pairing ended
+    /// meanwhile): the speaker goes off.
+    mutating func pinNotTaken(_ id: String) -> NativeAirPlayOutcome? {
+        guard stages[id] == .checkingPin else { return nil }
+        return .turnOff(NativeAirPlayID.app(id), .pairingFailed)
+    }
+
+    /// The sender couldn't start the pairing for `id` (no longer listed).
+    mutating func pairingNotStarted(_ id: String) -> NativeAirPlayOutcome? {
+        guard case .pairing? = stages[id] else { return nil }
+        return .turnOff(NativeAirPlayID.app(promptTargets.removeValue(forKey: id) ?? id), .unreachable)
+    }
+
+    /// A speaker's session asked for a password or a pairing (`problem`):
+    /// within the user's attempt, a password is asked for (again) and a
+    /// receiver that turned its stored pairing down pairs again, once,
+    /// whatever its listing still says; otherwise it goes off
+    /// with why, and one refused pairing stays off (`refusedOff`).
+    private mutating func accessNeeded(_ id: String, _ problem: NativeSpeakerEvent.Problem) -> NativeAirPlayOutcome? {
+        let app = NativeAirPlayID.app(id)
+        let typed = problem == .wrongPassword || problem == .passwordRequired ? passwords.remove(id) != nil : false
+        if problem == .pairingRequired && (!attempts.contains(id) || pairedInAttempt.contains(id)) {
+            refusedOff.insert(id)
+        }
+        guard attempts.contains(id) else { return .turnOff(app, problem.turnOff) }
+        // Its pairing runs, maybe with the PIN prompt open: a second one
+        // would make the receiver show a new code.
+        if problem == .pairingRequired && stages[id]?.pairingRuns == true { return nil }
+        switch problem {
+        case .passwordRequired, .wrongPassword:
+            return ask(id, .askingPassword(wrong: typed || problem == .wrongPassword))
+        case .pairingRequired where pairedInAttempt.contains(id):
+            return .turnOff(app, .stillNeedsCode)
+        case .pairingRequired where NativeTarget.kind(id) != nil:
+            // The sender pairs only listed receivers, never a target (P176).
+            return .turnOff(app, .needsCode)
+        case .pairingRequired:
+            stages[id] = .pairing(afterWrongPin: false)
+            return .startPairing(id)
+        default:
+            return .turnOff(app, problem.turnOff)
+        }
+    }
+
+    /// A member of a target in the sender turned its session down for a
+    /// password: within the target's attempt it is asked for by name;
+    /// otherwise (auto-connect, or after another member played) the target
+    /// goes off naming it, and asks for it when turned on again (P176).
+    private mutating func memberError(_ id: String, _ problem: NativeSpeakerEvent.Problem) -> NativeAirPlayOutcome? {
+        guard problem == .passwordRequired || problem == .wrongPassword || problem == .pairingRequired && asksPasswordOnly(id),
+              let target = memberOf[id], states[target] != nil else { return nil }
+        // Its stored pairing turned down, it pairs again with the password it holds, as a speaker does (P235).
+        if problem == .pairingRequired && keepsCredentials(id) && attempts.contains(target) && !pairedInAttempt.contains(id) {
+            promptTargets[id] = target
+            stages[id] = .pairing(afterWrongPin: false)
+            return .startPairing(id)
+        }
+        let typed = passwords.remove(id) != nil
+        guard attempts.contains(target) else {
+            return .turnOff(NativeAirPlayID.app(target), .memberNeedsPassword(id))
+        }
+        promptTargets[id] = target
+        return ask(id, .askingPassword(wrong: typed || problem == .wrongPassword))
+    }
+
+    /// Whether the member `id`, reached over AirPlay 2, asks for a password
+    /// and no pairing: its PairingRequired asks for the password (P176).
+    private func asksPasswordOnly(_ id: String) -> Bool {
+        reachedOverAirPlay2(id) && receivers[id]?.availability == .needsPassword
+    }
+
+    /// Takes a pairing event in.
+    private mutating func pairingEvent(_ event: NativeSpeakerEvent) -> NativeAirPlayOutcome? {
+        switch event {
+        case .pinNeeded(let id):
+            // An AirPlay 2 receiver that turned the PIN down asks again on
+            // the same connection, with the same code (P150).
+            if stages[id] == .checkingPin { return ask(id, .askingPin(wrong: true)) }
+            guard case .pairing(let afterWrongPin)? = stages[id] else { return .cancelPairing(id) }
+            return ask(id, .askingPin(wrong: afterWrongPin))
+        case .passwordNeeded(let id, let wrong):
+            guard stages[id]?.pairingRuns == true else { return nil }
+            passwords.remove(id)
+            return ask(id, .askingPassword(wrong: wrong))
+        case .pairingFailed(let id, let wrongPin, let problem, _):
+            guard stages[id]?.pairingRuns == true else { return nil }
+            if wrongPin {
+                // An AirPlay 1 pairing ends at a wrong PIN and starts again
+                // from `/pair-pin-start` (P52).
+                stages[id] = .pairing(afterWrongPin: true)
+                return .startPairing(id)
+            }
+            stages[id] = nil
+            let reason: NativeTurnOff
+            switch problem {
+            case .notResponding, .connectionLost: reason = .unreachable
+            case .unsupported, .incompatible: reason = .cantPlay
+            case .airPlay2Only: reason = .needsAirPlay2
+            default: reason = .pairingFailed
+            }
+            return .turnOff(NativeAirPlayID.app(promptTargets.removeValue(forKey: id) ?? id), reason)
+        case .paired(let id, _, _):
+            // Turned off meanwhile: the credentials stay stored, the speaker off.
+            guard stages[id]?.pairingRuns == true else { return nil }
+            stages[id] = nil
+            promptTargets[id] = nil   // a member's target joins again
+            pairedInAttempt.insert(id)
+            return .paired(NativeAirPlayID.app(id))
+        default:
+            return nil
+        }
+    }
+
+    // MARK: The sender's speakers
+
+    /// What makes the sender's speakers match `enabled` (app IDs): while
+    /// streaming, every switched-on receiver listed as able to play joins,
+    /// as does one that asks for a password this run has; one that asks for
+    /// a PIN or a password waits while the user's attempt pairs or prompts,
+    /// and is turned off otherwise (auto-connect and restored switches never
+    /// pair or prompt); a speaker in the sender stays while it is on and
+    /// listed or not, as the sender keeps trying to reach it or waits until
+    /// it is announced again (P215); everything leaves when streaming
+    /// stops. A switched-on receiver that isn't listed, or is listed as
+    /// unable to play in another way (which can be a moment's flicker
+    /// while its records lapse), waits, and so does one that just
+    /// paired while the sender's new listing of it is still on its way.
+    /// While the Mac sleeps speakers only leave; the wake's reconcile starts
+    /// what waited (S412).
+    func plan(streaming: Bool, enabled: Set<String>) -> NativeAirPlayPlan {
+        let wanted = Set(enabled.compactMap(NativeAirPlayID.receiver))
+        var plan = NativeAirPlayPlan()
+        let released = wanted.filter { id in
+            memberOf[id].map { wanted.contains($0) && (receivers[$0] != nil || states[$0] != nil) } ?? false
+        }
+        plan.release = released.sorted()
+        plan.remove = states.keys.filter { !streaming || !wanted.contains($0) || released.contains($0) }.sorted()
+        guard streaming, !asleep else { return plan }
+        for id in wanted.sorted() where states[id] == nil && !released.contains(id) {
+            // A target waits while a member's password prompt is open.
+            if promptTargets.values.contains(id) { continue }
+            switch availability(id) {
+            case .available? where refusedOff.contains(id):
+                // Switched on without a new attempt (a recalled preset): off again, once.
+                plan.turnOff.append(.init(id: id, reason: .needsCode))
+            case .available? where stages[id]?.pairingRuns == true:
+                // A session would pair anew, and the receiver would show a new code.
+                break
+            case .available?:
+                plan.add.append(id)
+            case .needsPin? where stages[id] == nil && !pairedInAttempt.contains(id):
+                plan.turnOff.append(.init(id: id, reason: .needsCode))
+            case .needsPassword? where passwords.contains(id):
+                plan.add.append(id)
+            case .needsPassword? where stages[id] == nil:
+                plan.turnOff.append(.init(id: id, reason: .needsPassword))
+            case _? where targetCantPlay(id) != nil:
+                // Left on from the last run: off with why, its row still listed (P176).
+                if let off = cantPlayTurnOff(id) { plan.turnOff.append(off) }
+            default:
+                break
+            }
+        }
+        return plan
+    }
+
+    /// The plan a reconcile carries out: none from the sleep notice until
+    /// the wake, whose reconcile starts what waited (S412).
+    func reconcilePlan(streaming: Bool, enabled: Set<String>) -> NativeAirPlayPlan {
+        asleep ? NativeAirPlayPlan() : plan(streaming: streaming, enabled: enabled)
+    }
+
+    /// The own volume of AirPlay speaker `appID`: its stored one, else the
+    /// 60 a local output starts at (S399).
+    static func ownVolume(_ appID: String, stored: [String: Double]) -> Double {
+        stored[appID] ?? AppSettings.defaultVolume
+    }
+
+    /// The app added a speaker to the sender.
+    mutating func added(_ id: String) { states[id] = .connecting }
+
+    /// The app removed a speaker from the sender; its later events are
+    /// passed over.
+    mutating func removed(_ id: String) {
+        states.removeValue(forKey: id)
+        waiting.removeValue(forKey: id)
+        retriedErrors.removeValue(forKey: id)
+        for left in [id] + members(of: id) where receivers[left] == nil { receiverLatency.forget(left) }
+        pruneMembers()
+    }
+
+    /// The speakers in the sender that wait, and why (P169, S285).
+    private(set) var waiting: [String: NativeSpeakerEvent.Problem] = [:]
+
+    func isWaiting(_ id: String) -> Bool { waiting[id] != nil }
+
+    func waitReason(_ id: String) -> NativeSpeakerEvent.Problem? { waiting[id] }
+
+    /// The speaker in the sender is out of view on the network (P215).
+    func isUnannounced(_ id: String) -> Bool { states[id] == .unannounced }
+
+    /// Retried errors in a row since the speaker last played or went out of
+    /// view: the loss, then each failed retry.
+    private var retriedErrors: [String: Int] = [:]
+
+    /// From the second failed retry, about 3 s in, so a blip its first retry
+    /// heals never shows (S222).
+    func isReconnecting(_ id: String) -> Bool { retriedErrors[id, default: 0] >= 3 }
+
+    /// Its notice says it waits or reconnects, which ends once it leaves the sender.
+    func clearsNoticeOnRemoval(_ id: String) -> Bool { isWaiting(id) || isReconnecting(id) }
+
+    /// Takes a sender event in, and says what the app does about it.
+    mutating func apply(_ event: NativeSpeakerEvent) -> NativeAirPlayOutcome? {
+        switch event {
+        case .state(let id, let state, _):
+            guard let before = states[id] else { return nil }
+            states[id] = state
+            let reconnected = isReconnecting(id)
+            if state == .playing || state == .unannounced { retriedErrors.removeValue(forKey: id) }
+            if state == .playing { endAttempt(id) }   // it plays: the user's attempt worked
+            // The refusal's failed state keeps it waiting; any other state
+            // means the sender started it again.
+            let waited = state != .failed && waiting.removeValue(forKey: id) != nil
+            let (was, now) = (before == .playing, state == .playing)
+            if was != now { return .playingChanged(NativeAirPlayID.app(id), playing: now) }
+            if waited { return .waiting(NativeAirPlayID.app(id), nil) }
+            if reconnected && state == .unannounced { return .reconnecting(NativeAirPlayID.app(id), nil) }
+            return (before == .unannounced) != (state == .unannounced) ? .unannouncedChanged(NativeAirPlayID.app(id)) : nil
+        case .error(let id, let problem, let retryMs, _):
+            guard states[id] != nil else { return memberError(id, problem) }
+            // The member's own error follows and names it (`memberError`).
+            if NativeTarget.kind(id) != nil, problem == .passwordRequired || problem == .wrongPassword
+                || problem == .pairingRequired && !members(of: id).isEmpty && members(of: id).allSatisfy({ asksPasswordOnly($0) }) {
+                return nil
+            }
+            if problem.waits {
+                return waiting.updateValue(problem, forKey: id) != problem
+                    ? .waiting(NativeAirPlayID.app(id), problem) : nil
+            }
+            waiting.removeValue(forKey: id)
+            if retryMs != nil && problem.retried {
+                // A retrying state event follows.
+                guard !asleep else { return nil }
+                retriedErrors[id, default: 0] += 1
+                return retriedErrors[id] == 3 ? .reconnecting(NativeAirPlayID.app(id), problem) : nil
+            }
+            // Its removal would otherwise clear the notice that says why it went off.
+            retriedErrors.removeValue(forKey: id)
+            switch problem {
+            case .passwordRequired, .wrongPassword, .pairingRequired:
+                return accessNeeded(id, problem)
+            default:
+                return .turnOff(NativeAirPlayID.app(id), problem.turnOff)
+            }
+        case .latency(let id, _, _, let reportedUs, _):
+            receiverLatency.report(id, us: reportedUs)
+            return nil
+        case .latencyHeld, .estimate:
+            return nil
+        case .timeline(let ms, _):
+            receiverLatency.timeline(ms: ms)
+            guard ms != latencyMs else { return nil }
+            latencyMs = ms
+            return .latencyChanged
+        case .failed:
+            return .senderFailed
+        case .pinNeeded, .passwordNeeded, .pairingFailed, .paired:
+            return pairingEvent(event)
+        case .stored:
+            return nil
+        case .volume(let id, let position, let level):
+            guard states[id] != nil else { return nil }
+            return .volumeChanged(NativeAirPlayID.app(id), position, level)
+        case .warning(_, let ptpPortsTaken, _):
+            return ptpPortsTaken ? .ptpPortsTaken : nil
+        case .ptpFree:
+            return .ptpPortsFree
+        }
+    }
+}
+
+/// The pairings notice as the pairings file's writes go (S224, main queue):
+/// a write that fails posts it once while the writes keep failing, and the
+/// next one that works clears it, unless the sender opened a store that
+/// keeps nothing, whose notice stays. It outlives a sender, as the core
+/// hands a store whose last write failed to the next one.
+struct PairingsWriteNotice: Equatable {
+    enum Change: Equatable { case post, clear }
+
+    private(set) var failing = false
+
+    /// The notice once a new sender has opened its store: posted for a store
+    /// that keeps nothing, left as it is while the last write failed (posted
+    /// then; one dismissed stays dismissed), cleared otherwise.
+    func atStart(openedUnsaved: Bool) -> Change? {
+        openedUnsaved ? .post : (failing ? nil : .clear)
+    }
+
+    mutating func written(_ saved: Bool, openedUnsaved: Bool) -> Change? {
+        guard saved == failing else { return nil }
+        failing = !saved
+        return saved ? (openedUnsaved ? nil : .clear) : .post
+    }
+}
+
+/// Whether the PTP port notice shows (P158, main queue). The sender reports
+/// the clash once, so the notice follows the rows instead: it stays while a
+/// row is off because it needs PTP timing, and comes back when one goes off
+/// for it. A speaker that plays clears it only when no row is, since a
+/// session on NTP timing binds no PTP port and proves nothing about them.
+/// A taken episode runs from the sender's report, which it sends again only
+/// after the ports were bound in between, to a session binding them; in it,
+/// each speaker refused for PTP timing raises the notice once, so a notice
+/// cleared or dismissed meanwhile comes back.
+struct PtpPortNotice: Equatable {
+    /// The sender reported port 319 or 320 taken, and no session bound them since.
+    private(set) var portsTaken = false
+    /// A speaker played since that report.
+    private(set) var played = false
+    /// The rows (app IDs) off because they need PTP timing.
+    private(set) var timingOff: Set<String> = []
+    /// The rows whose refusal raised the notice in this episode.
+    private(set) var raisedFor: Set<String> = []
+    /// How often the notice was raised; the host posts it anew when this grows.
+    private(set) var raises = 0
+
+    var shown: Bool { Self.shown(portsTaken: portsTaken, played: played, timingRows: timingOff.count) }
+
+    /// With no row off for PTP timing, the report alone shows the notice
+    /// until a speaker plays.
+    static func shown(portsTaken: Bool, played: Bool, timingRows: Int) -> Bool {
+        portsTaken && (timingRows > 0 || !played)
+    }
+
+    mutating func reported() {
+        portsTaken = true
+        played = false
+        raisedFor = []
+        raises += 1
+    }
+
+    mutating func portsFree() {
+        portsTaken = false
+        raisedFor = []
+    }
+
+    /// The row `id` went off; `timing`: because it needs PTP timing.
+    mutating func turnedOff(_ id: String, timing: Bool) {
+        guard timing else {
+            timingOff.remove(id)
+            return
+        }
+        timingOff.insert(id)
+        if portsTaken && raisedFor.insert(id).inserted { raises += 1 }
+    }
+
+    mutating func playing(_ id: String) {
+        timingOff.remove(id)
+        played = true
+    }
+
+    /// The rows the list shows now; one that left takes its reason along.
+    mutating func listed(_ rows: [String]) { timingOff.formIntersection(rows) }
+}
+
+/// When the app starts AudioSync's own sender again after a start failed
+/// or after it stopped, and when the user hears about it (main queue). A
+/// failed start leaves nothing running; the AirPlay reconcile the host runs
+/// once `retrySpacing` has passed (`restartAt`) starts it again, and no
+/// reconcile starts it sooner. Only the first failure in a row posts a
+/// notice, which a start that works clears. A sender that
+/// stopped after an internal error (`NativeSpeakerEvent.failed`) starts
+/// again only on Retry, since the same bug could stop it again; until then
+/// the AirPlay section shows it as failed.
+struct NativeSenderStarts {
+    /// The least time between two starts after a failure.
+    static let retrySpacing: TimeInterval = 10
+
+    /// When the last start failed, while no start has worked since.
+    private(set) var failedAt: Date?
+    /// The sender stopped after an internal error, and Retry wasn't clicked yet.
+    private(set) var stopped = false
+    /// The last start worked and the sender hasn't stopped since: it and its
+    /// discovery run, which is what the Local Network hint needs to know
+    /// (`LocalNetworkHint.decide`).
+    private(set) var isUp = false
+
+    /// Whether a reconcile at `now` starts the sender (none runs).
+    func mayStart(at now: Date) -> Bool {
+        guard !stopped else { return false }
+        return failedAt.map { now.timeIntervalSince($0) >= Self.retrySpacing } ?? true
+    }
+
+    /// When a reconcile may start the sender again after a failed start; the
+    /// host reconciles then (`AppLifecycle.nextDueReconcile`). Nil when no
+    /// start failed, or when the sender stopped and waits for Retry.
+    var restartAt: Date? {
+        guard !stopped, let failedAt else { return nil }
+        return failedAt.addingTimeInterval(Self.retrySpacing)
+    }
+
+    /// The sender stopped after an internal error.
+    mutating func senderFailed() {
+        stopped = true
+        isUp = false
+    }
+
+    /// The user clicked Retry: the next reconcile starts a new sender.
+    mutating func retry() {
+        stopped = false
+        failedAt = nil
+    }
+
+    /// A start finished at `now`; true when its failure is news for the user
+    /// (the first in a row).
+    mutating func finished(started: Bool, at now: Date) -> Bool {
+        let news = !started && failedAt == nil
+        failedAt = started ? nil : now
+        isUp = started
+        return news
+    }
+}
+
+/// What AudioSync's own sender hands the receivers that show it as playing
+/// (P123 to P127): the track and the artwork set last, which go out together
+/// whenever either is set (`NativeAirPlay.setTrack`, `setArtwork`; the
+/// sender's queue). A new track (another title, artist or album) drops the
+/// last one's artwork, so the wrong cover never goes out with it: until this
+/// track's artwork, or AudioSync's icon, is set (the app sends one after every
+/// new track, `SentTrackInfo`), the track goes out without artwork, which
+/// sends none. A receiver already playing may keep the last cover until then;
+/// only one that starts in that gap shows no cover. The same track set again,
+/// as on a resend, keeps its artwork.
+struct NativeNowPlaying: Equatable {
+    /// The track's title, artist and album, once one was set.
+    private(set) var fields: TrackMetadata.Fields?
+    /// The artwork in both sizes, once one was set for this track.
+    private(set) var artwork: TrackMetadata.Artwork?
+    /// Bumped by every cover asked for and every new track, so a cover encoded
+    /// off the sender's queue that ends after either is dropped.
+    private(set) var artworkTurn = 0
+
+    mutating func setTrack(_ track: TrackMetadata.Fields) {
+        if track != fields {
+            artwork = nil
+            artworkTurn += 1
+        }
+        fields = track
+    }
+
+    /// The turn a cover asked for now must come back with to be set.
+    mutating func artworkAsked() -> Int {
+        artworkTurn += 1
+        return artworkTurn
+    }
+
+    /// False, setting nothing, when a new track or another cover came after `turn`.
+    @discardableResult
+    mutating func setArtwork(_ artwork: TrackMetadata.Artwork, turn: Int) -> Bool {
+        guard turn == artworkTurn else { return false }
+        self.artwork = artwork
+        return true
+    }
+}
+
+/// Where the native sender keeps the credentials of paired Apple TVs:
+/// `airplay-pairings.dat` in a folder of its own, `Pairings` in AudioSync's
+/// folder in Application Support, mode 0600 and written by the core, not
+/// the Keychain (which would ask again after every locally signed rebuild).
+/// The file is plaintext by design, so its folder stays out of Time Machine
+/// backups, which can be unencrypted. The folder rather than the file: the
+/// core writes every change to a new file renamed over the old one, which
+/// would drop a mark set on the file itself, while the folder's mark covers
+/// every file in it. Only that folder: AudioSync's own folder must stay in
+/// backups, since on a Mac that signs builds it also holds
+/// `signing-keychain.pass` (`make-local-cert.sh`), the password of a
+/// keychain that is backed up, and a restore without it would make a new
+/// signing identity. Not `AirPlay` either: versions up to 0.4.1 kept the
+/// bundled engine's files there, a folder users are told they can delete.
+enum NativeAirPlayPairings {
+    static let fileName = "airplay-pairings.dat"
+
+    /// AudioSync's folder in `applicationSupport`, where builds before the
+    /// pairing store had a folder of its own kept the file.
+    static func appFolder(in applicationSupport: URL) -> URL {
+        applicationSupport.appendingPathComponent("AudioSync", isDirectory: true)
+    }
+
+    /// The pairing store's own folder, inside `appFolder(in:)`.
+    static func folder(in applicationSupport: URL) -> URL {
+        appFolder(in: applicationSupport).appendingPathComponent("Pairings", isDirectory: true)
+    }
+
+    /// The pairing store's file, inside `folder(in:)`.
+    static func file(in applicationSupport: URL) -> URL {
+        folder(in: applicationSupport).appendingPathComponent(fileName)
+    }
+
+    /// The AirPlay 2 device ID and HomeKit credentials, next to the pairings.
+    static func airPlay2File(in applicationSupport: URL) -> URL {
+        folder(in: applicationSupport).appendingPathComponent("airplay2-identity.dat")
+    }
+
+    /// Where builds before the folder kept the file: in `appFolder(in:)`.
+    static func olderFile(in applicationSupport: URL) -> URL {
+        appFolder(in: applicationSupport).appendingPathComponent(fileName)
+    }
+
+    /// What the folder is marked with: excluded from backups.
+    static var folderValues: URLResourceValues {
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        return values
+    }
+
+    /// Creates the folder when missing, for its owner only as the core
+    /// would, and marks it with `folderValues`. Off the main thread is fine;
+    /// never on an audio thread.
+    static func prepareFolder(in applicationSupport: URL) throws {
+        var url = Self.folder(in: applicationSupport)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try url.setResourceValues(folderValues)
+    }
+
+    /// What `moveOlderFile(in:)` did, for the debug log.
+    enum Move: Equatable {
+        /// No file where older builds kept it.
+        case nothing
+        /// The older builds' file moved into the folder, unchanged.
+        case moved
+        /// The folder already holds a file, which is the one used; the older
+        /// builds' file is left where it is.
+        case keptNewer
+        /// The older builds' file couldn't be moved and is left where it is.
+        case failed
+    }
+
+    /// Moves the file older builds kept in `appFolder(in:)` into `folder(in:)`,
+    /// once: a file already in the folder wins and is never replaced. Call
+    /// it after `prepareFolder(in:)`, so the file lands in a folder that is
+    /// already kept out of backups. The move is a rename within the same
+    /// folder tree, so the file keeps its contents and its mode 0600.
+    static func moveOlderFile(in applicationSupport: URL) -> Move {
+        let fm = FileManager.default
+        let older = olderFile(in: applicationSupport)
+        guard fm.fileExists(atPath: older.path) else { return .nothing }
+        let current = file(in: applicationSupport)
+        guard !fm.fileExists(atPath: current.path) else { return .keptNewer }
+        // moveItem never replaces a file that appeared meanwhile.
+        return (try? fm.moveItem(at: older, to: current)) != nil ? .moved : .failed
+    }
+
+    /// The debug log's line for `move`, or nil when there is nothing to say.
+    static func moveLogLine(_ move: Move) -> String? {
+        switch move {
+        case .nothing:
+            return nil
+        case .moved:
+            return "the pairings file moved into its own folder, which is kept out of backups"
+        case .keptNewer:
+            return "an older pairings file was left in AudioSync's folder; the one in its own folder is used"
+        case .failed:
+            return "the pairings file couldn't be moved into its own folder; its Apple TVs pair again"
+        }
+    }
+}
+
+/// A speaker's counters as the sender copies them (P144,
+/// `asc_airplay_speaker_counters`): one session's, or a target's summed over
+/// its `sessions` members.
+struct NativeSpeakerCounters: Equatable {
+    var packetsSent: UInt64 = 0
+    var latePackets: UInt64 = 0
+    var resendRequests: UInt64 = 0
+    var packetsResent: UInt64 = 0
+    /// Requested packets not resent: no longer held, or resent three times.
+    var notHeld: UInt64 = 0
+    var timingReplies: UInt64 = 0
+    var foreignDatagrams: UInt64 = 0
+    var sessions: UInt32 = 1
+}
+
+/// The stream's counters (P144, `asc_airplay_stream_counters`).
+struct NativeStreamCounters: Equatable {
+    var rateHz: Double = 0
+    var packetsEncoded: UInt64 = 0
+    var silentFrames: UInt64 = 0
+    var inputFramesDropped: UInt64 = 0
+}
+
+/// The debug log's periodic AirPlay status: the stream's counters and each
+/// added speaker's, with the field names the Windows app's log uses, so the
+/// two logs read alike.
+enum NativeAirPlayStatus {
+    /// How often the line is logged while speakers are added, as on Windows.
+    static let interval: TimeInterval = 5
+
+    struct Speaker: Equatable {
+        let id: String
+        let name: String?
+        let state: NativeSpeakerEvent.State?
+        /// Nil when the sender no longer has the speaker.
+        let counters: NativeSpeakerCounters?
+    }
+
+    static func logLine(latencyMs: Double, stream: NativeStreamCounters?, speakers: [Speaker]) -> String {
+        var text = "[AudioSync] native AirPlay: L = \(latencyMs.isFinite ? Int(max(latencyMs, 0)) : 0) ms"
+        if let stream {
+            text += String(format: ", input rate %.1f Hz", stream.rateHz)
+                + ", \(stream.packetsEncoded) packets encoded, \(stream.silentFrames) silent frames"
+                + ", \(stream.inputFramesDropped) input frames dropped"
+        }
+        for speaker in speakers {
+            let label = speaker.name.map { "\($0) (\(speaker.id))" } ?? speaker.id
+            text += "\n  AirPlay speaker \(label): \(speaker.state?.rawValue ?? "added")"
+            guard let counters = speaker.counters else { continue }
+            if counters.sessions > 1 { text += ", \(counters.sessions) members summed" }
+            text += "; \(counters.packetsSent) packets sent, \(counters.latePackets) late"
+                + ", \(counters.resendRequests) resend requests, \(counters.packetsResent) resent"
+                + ", \(counters.notHeld) not held"
+                + ", \(counters.timingReplies) timing replies"
+                + ", \(counters.foreignDatagrams) datagrams from other addresses dropped"
+        }
+        return text
+    }
+}
+
+/// Each AirPlay speaker's reported latency R_s and what the app makes of it
+/// (engine spec S280, S283): the stream's Lf from the core's rule, E (the
+/// largest R_s among the speakers in the stream, held while one sounds) and
+/// each row's offset E - e_s on top of the hold-back. Main queue.
+struct NativeReceiverLatency {
+    /// The sender's Lf until the app sets another: 0.1 s at 44.1 kHz.
+    static let defaultFrames: UInt32 = 4_410
+    /// The `ASC_AIRPLAY_LATENCY_SOURCE_*` bits, as the debug log names them.
+    static let sourceNames: [(bit: UInt32, name: String)] = [
+        (1, "Audio-Latency"), (2, "audioLatencies"), (4, "arrivalToRender"),
+    ]
+
+    enum EstimateChange: Equatable {
+        case unchanged
+        /// E took a new value: every row's offset and L move.
+        case applied
+        /// A new E waits until no speaker sounds; once per value.
+        case held
+    }
+
+    /// R_s in microseconds by receiver ID, from this run's latency events;
+    /// never stored, and dropped once the receiver is out of both discovery and the sender.
+    private(set) var reportedUs: [String: Int64] = [:]
+    /// The Lf last given to the sender.
+    private(set) var frames: UInt32 = defaultFrames
+    /// The Lf the sender's timeline has now: the one set last or a step.
+    private(set) var current: UInt32 = defaultFrames
+    /// E in ms, as it applies now.
+    private(set) var estimateMs: Double = 0
+    /// The E waiting while a speaker sounds.
+    private(set) var heldMs: Double?
+
+    mutating func report(_ id: String, us: Int64) { reportedUs[id] = max(0, us) }
+
+    mutating func forget(_ id: String) { reportedUs.removeValue(forKey: id) }
+
+    /// R_s of a receiver in ms, 0 when it reported nothing.
+    func reportedMs(_ id: String) -> Double { Double(reportedUs[id] ?? 0) / 1000 }
+
+    /// e_s of a row whose sessions are `members`: the largest R_s among
+    /// them, since a target plays its members at one offset.
+    func estimateMs(of members: [String]) -> Double { members.map(reportedMs).max() ?? 0 }
+
+    /// The Lf `rule` gives over `members` (the core's
+    /// `asc_airplay_session_latency_frames`), or nil when the timeline has it already.
+    mutating func newFrames(over members: [String], rule: ([Int64]) -> UInt32) -> UInt32? {
+        let next = rule(members.map { reportedUs[$0] ?? 0 })
+        guard next != current else { return nil }
+        frames = next
+        current = next
+        return next
+    }
+
+    /// The sender's timeline L in ms, which may be the sender's own step (P200).
+    mutating func timeline(ms: Double) {
+        current = UInt32((ms * 44.1).rounded())
+    }
+
+    /// E over `rows` (each row's members): applied when `canChange` (no
+    /// speaker sounds or the stream is empty),
+    /// otherwise held (P201).
+    mutating func updateEstimate(rows: [[String]], canChange: Bool) -> EstimateChange {
+        let wanted = rows.map { estimateMs(of: $0) }.max() ?? 0
+        guard wanted != estimateMs else {
+            heldMs = nil
+            return .unchanged
+        }
+        guard canChange else {
+            guard heldMs != wanted else { return .unchanged }
+            heldMs = wanted
+            return .held
+        }
+        estimateMs = wanted
+        heldMs = nil
+        return .applied
+    }
+
+    /// A row's offset on top of the hold-back, E - e_s; 0 for one that
+    /// reports more than E, which plays late until E may change.
+    func offsetMs(of members: [String]) -> Double { max(0, estimateMs - estimateMs(of: members)) }
+
+    /// e_s of each target as its offset uses it, by row ID.
+    private(set) var targetEstimates: [String: Double] = [:]
+
+    /// Takes each target's e_s (its members by row ID) when `canChange`;
+    /// otherwise keeps the one it had, so a member joining or leaving while
+    /// a speaker sounds moves no offset (S284).
+    mutating func holdTargets(_ targets: [String: [String]], canChange: Bool) {
+        targetEstimates = targets.reduce(into: [:]) { held, target in
+            held[target.key] = canChange ? estimateMs(of: target.value)
+                                         : targetEstimates[target.key] ?? estimateMs(of: target.value)
+        }
+    }
+
+    /// `offsetMs(of:)` with a target's e_s as `holdTargets` keeps it.
+    func offsetMs(row: String, of members: [String]) -> Double {
+        max(0, estimateMs - (targetEstimates[row] ?? estimateMs(of: members)))
+    }
+
+    /// How much later than E a row plays while E is held, in ms.
+    func lateMs(of members: [String]) -> Double { max(0, estimateMs(of: members) - estimateMs) }
+
+    /// What a receiver reported, as the debug log says it (S282).
+    static func reportText(us: Int64, sources: UInt32) -> String {
+        let names = sourceNames.filter { sources & $0.bit != 0 }.map(\.name)
+        guard !names.isEmpty else { return "reports nothing" }
+        return String(format: "reports %.0f ms (", Double(max(0, us)) / 1000) + names.joined(separator: ", ") + ")"
+    }
+}

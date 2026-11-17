@@ -101,6 +101,12 @@ class InputSourceMenu: NSMenu, NSMenuDelegate {
           let source = display.inputSourceProtocol.sources.first(where: { Int($0.value) == sender.tag }) else { return }
     self.currentValue = nil
     display.requestInputSource(source) { [weak self] sent in
+      if sent, display.inputSourceProtocol != .standard {
+        let owner = source.value == 0x90 ? "resml" : (source.value == 0xD1 ? "personal" : "")
+        if !owner.isEmpty {
+          NotificationCenter.default.post(name: Notification.Name("desk.manualInputRequested"), object: display, userInfo: ["source": owner])
+        }
+      }
       self?.status = sent ? NSLocalizedString("Command sent; input change unverified", comment: "Input source status")
         : NSLocalizedString("Command failed — check connection or input protocol", comment: "Input source status")
       self?.rebuild()

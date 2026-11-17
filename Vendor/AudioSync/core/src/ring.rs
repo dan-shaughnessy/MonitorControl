@@ -1,0 +1,1006 @@
+//! Shared delay ring buffer (spec section 4: S35-S40, with S133 and S135).
+//!
+//! One ring per engine holds interleaved stereo float32 frames. Exactly one
+//! writer (the capture thread) stores frames and publishes `framesWritten`
+//! (W); any number of readers copy frames out at their own delay (see
+//! `reader.rs`). The writer never waits for, or looks at, a reader: once the
+//! ring is full each write overwrites the oldest frames.
+//!
+//! Samples are stored as relaxed atomic 32-bit words holding the float bit
+//! patterns (S135), so a reader racing an overwrite is a detected stale read,
+//! never undefined behavior. Ordering comes from the W release/acquire pair,
+//! the writer's release fence after each publish (S37) and the reader's
+//! acquire fence before its post-copy check (S40).
+
+#![forbid(unsafe_code)]
+
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
+
+use crate::lead::SessionLeads;
+
+/// Smallest safety margin M, in frames (S40).
+pub const MIN_MARGIN_FRAMES: usize = 8192;
+
+/// Seconds of audio a ring holds at its capture rate (S36).
+pub const RING_SECONDS: u32 = 24;
+
+/// Lowest capture rate the engine accepts, in Hz (S16).
+pub const MIN_CAPTURE_RATE: u32 = 8_000;
+
+/// Highest capture rate the engine accepts, in Hz (S16).
+pub const MAX_CAPTURE_RATE: u32 = 384_000;
+
+/// The writer's blocks that [`Ring::block_frames`] looks back over (S206).
+pub const BLOCK_WINDOW: usize = 8;
+
+/// The stamp time that means no stamp (S207).
+const NO_STAMP: u64 = u64::MAX;
+
+/// The newest stamp of the capture's blocks (S207): W at the end of a block
+/// and the time the writer closed that block at, on the host's monotonic
+/// clock ([`crate::clock`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    /// W once the block was written.
+    pub written: u64,
+    /// When the writer closed the block, in nanoseconds.
+    pub time_ns: u64,
+}
+
+/// A move of the network speakers' timeline the outputs follow (S281):
+/// from ring frame `frame` on, they play `frames` frames later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingMove {
+    pub frame: u64,
+    pub frames: i64,
+}
+
+impl RingMove {
+    /// A move of `frames` frames at `rate` Hz whose first frame comes
+    /// `ahead` frames at that rate after ring frame `end`, on a ring at
+    /// `ring_rate` Hz.
+    pub fn after(end: u64, ahead: i64, frames: i64, rate: u32, ring_rate: u32) -> RingMove {
+        let scale = |n: i64| (n as f64 * f64::from(ring_rate) / f64::from(rate)).round() as i64;
+        RingMove {
+            frame: (end as i64).saturating_add(scale(ahead)).max(0) as u64,
+            frames: scale(frames),
+        }
+    }
+}
+
+/// Why a ring could not be created or used at a rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingError {
+    /// The margin is below [`MIN_MARGIN_FRAMES`].
+    MarginTooSmall,
+    /// The capacity is below twice the margin.
+    CapacityTooSmall,
+    /// The rate is outside [`MIN_CAPTURE_RATE`]..=[`MAX_CAPTURE_RATE`].
+    UnsupportedRate,
+}
+
+impl fmt::Display for RingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            RingError::MarginTooSmall => "ring margin is below 8192 frames",
+            RingError::CapacityTooSmall => "ring capacity is below twice its margin",
+            RingError::UnsupportedRate => "capture rate is outside 8000..=384000 Hz",
+        };
+        f.write_str(text)
+    }
+}
+
+impl std::error::Error for RingError {}
+
+/// Capacity, in frames, of a ring that holds [`RING_SECONDS`] at `rate` (S36).
+pub fn capacity_for_rate(rate: u32) -> usize {
+    RING_SECONDS as usize * rate as usize
+}
+
+/// Whether `rate` is a capture rate the engine accepts (S16).
+pub fn is_supported_rate(rate: u32) -> bool {
+    (MIN_CAPTURE_RATE..=MAX_CAPTURE_RATE).contains(&rate)
+}
+
+/// The shared delay ring (S35).
+///
+/// Created once, before any audio thread starts (S128); shared with readers
+/// through `Arc`. The single writer is obtained with [`Ring::writer`].
+pub struct Ring {
+    /// Two words (L, R) per frame, float bit patterns (S135).
+    words: Box<[AtomicU32]>,
+    /// C, in frames.
+    capacity: u64,
+    /// M, in frames.
+    margin: u64,
+    /// W: frames written since the last reset (S37).
+    written: AtomicU64,
+    /// The largest of the writer's last [`BLOCK_WINDOW`] blocks, the open
+    /// one included, in frames; 0 before the first write and after a reset
+    /// (S206).
+    block_frames: AtomicU64,
+    /// The newest stamp (S207), published as a sequence lock: odd while
+    /// the writer stores `stamp_written` and `stamp_time`, even once they
+    /// are stored. `stamp_time` is [`NO_STAMP`] while there is none.
+    stamp_sequence: AtomicU64,
+    stamp_written: AtomicU64,
+    stamp_time: AtomicU64,
+    /// The largest sample magnitude written since [`Ring::take_peak`] last
+    /// ran, as float bits: for non-negative floats the bit order is the
+    /// numeric order, so the writer raises it with one `fetch_max`.
+    peak: AtomicU32,
+    /// Set by the first write holding a finite sample other than zero, and never
+    /// cleared, so a meter taking [`Ring::take_peak`] can't hide it.
+    heard: AtomicBool,
+    /// Set while a [`RingWriter`] exists.
+    writer_taken: AtomicBool,
+    /// The start leads and hold-backs of the renderers reading it (S208).
+    leads: SessionLeads,
+    /// The newest [`RingMove`] under a sequence lock: odd while the writer
+    /// stores it, 0 before the first.
+    move_sequence: AtomicU64,
+    move_frame: AtomicU64,
+    move_frames: AtomicI64,
+}
+
+impl fmt::Debug for Ring {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ring")
+            .field("capacity", &self.capacity)
+            .field("margin", &self.margin)
+            .field("written", &self.frames_written())
+            .finish()
+    }
+}
+
+impl Ring {
+    /// Creates a ring of `capacity` frames with a safety margin of `margin`
+    /// frames. The margin must be at least [`MIN_MARGIN_FRAMES`] and the
+    /// capacity at least twice the margin.
+    pub fn new(capacity: usize, margin: usize) -> Result<Arc<Ring>, RingError> {
+        if margin < MIN_MARGIN_FRAMES {
+            return Err(RingError::MarginTooSmall);
+        }
+        if capacity < margin.saturating_mul(2) {
+            return Err(RingError::CapacityTooSmall);
+        }
+        let words: Box<[AtomicU32]> = (0..capacity * 2).map(|_| AtomicU32::new(0)).collect();
+        // The clock's origin is set here, before any audio thread stamps
+        // with it (S207).
+        crate::clock::now_ns();
+        Ok(Arc::new(Ring {
+            words,
+            capacity: capacity as u64,
+            margin: margin as u64,
+            written: AtomicU64::new(0),
+            block_frames: AtomicU64::new(0),
+            stamp_sequence: AtomicU64::new(0),
+            stamp_written: AtomicU64::new(0),
+            stamp_time: AtomicU64::new(NO_STAMP),
+            peak: AtomicU32::new(0),
+            heard: AtomicBool::new(false),
+            writer_taken: AtomicBool::new(false),
+            leads: SessionLeads::new(),
+            move_sequence: AtomicU64::new(0),
+            move_frame: AtomicU64::new(0),
+            move_frames: AtomicI64::new(0),
+        }))
+    }
+
+    /// Creates a ring that holds [`RING_SECONDS`] of audio at `rate`, with the
+    /// minimum margin (S36).
+    pub fn for_rate(rate: u32) -> Result<Arc<Ring>, RingError> {
+        if !is_supported_rate(rate) {
+            return Err(RingError::UnsupportedRate);
+        }
+        Ring::new(capacity_for_rate(rate), MIN_MARGIN_FRAMES)
+    }
+
+    /// Whether this ring can serve a session at capture rate `rate`: the rate
+    /// is supported and the ring holds at least [`RING_SECONDS`] of it (S36).
+    /// A ring sized for the highest rate it serves rejects higher rates.
+    pub fn supports_rate(&self, rate: u32) -> bool {
+        is_supported_rate(rate) && self.capacity >= capacity_for_rate(rate) as u64
+    }
+
+    /// C, in frames.
+    pub fn capacity(&self) -> usize {
+        self.capacity as usize
+    }
+
+    /// M, in frames.
+    pub fn margin(&self) -> usize {
+        self.margin as usize
+    }
+
+    /// The slots its renderers publish their start leads and hold-backs
+    /// in, for the session lead (S208).
+    pub fn session_leads(&self) -> &SessionLeads {
+        &self.leads
+    }
+
+    /// W, the frames written since the last reset, loaded with acquire
+    /// ordering (S37). This is also the engine's `framesCaptured` (S133).
+    pub fn frames_written(&self) -> u64 {
+        self.written.load(Ordering::Acquire)
+    }
+
+    /// The capture's block, in frames: the largest of the writer's last
+    /// [`BLOCK_WINDOW`] blocks, the one it is writing included, so a short
+    /// block (a gap fill's tail) never hides the size of the others; 0
+    /// before the first write and after a reset. It bounds how far W may be
+    /// from the capture's own timeline, which a converting renderer's lead
+    /// covers (S206). A relaxed load; the writer stores it with each write.
+    pub fn block_frames(&self) -> usize {
+        self.block_frames.load(Ordering::Relaxed) as usize
+    }
+
+    /// The largest sample magnitude written since the last call, 0 to 1 for
+    /// a signal inside full scale, and starts the next span at 0: the level
+    /// meter's reading, for one caller polling at its own pace. Non-finite
+    /// samples don't count. A relaxed swap, safe on any thread.
+    pub fn take_peak(&self) -> f32 {
+        f32::from_bits(self.peak.swap(0, Ordering::Relaxed))
+    }
+
+    /// Whether any write so far held a finite sample other than zero,
+    /// whoever took the peak since (S350). A relaxed load.
+    pub fn heard(&self) -> bool {
+        self.heard.load(Ordering::Relaxed)
+    }
+
+    /// The newest stamp of the capture's blocks (S207), or `None` while
+    /// there is none (no block was stamped since the ring was made or
+    /// reset) or the writer is storing a new one right now. One try, never
+    /// waiting: the sequence number is loaded with acquire ordering, so the
+    /// pair stored before its even value is seen, and again after an
+    /// acquire fence, so a pair the writer stored into since (after its
+    /// release fence) is never taken; the pair's own loads are relaxed.
+    pub fn stamp(&self) -> Option<Stamp> {
+        let before = self.stamp_sequence.load(Ordering::Acquire);
+        let written = self.stamp_written.load(Ordering::Relaxed);
+        let time_ns = self.stamp_time.load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        let after = self.stamp_sequence.load(Ordering::Relaxed);
+        if before % 2 == 1 || before != after || time_ns == NO_STAMP {
+            return None;
+        }
+        Some(Stamp { written, time_ns })
+    }
+
+    /// The newest move announced (S281) and its sequence number, which
+    /// changes with each announcement; `None` before the first and while
+    /// the writer stores one. Never waits.
+    pub fn latest_move(&self) -> Option<(u64, RingMove)> {
+        let before = self.move_sequence.load(Ordering::Acquire);
+        let moved = RingMove {
+            frame: self.move_frame.load(Ordering::Relaxed),
+            frames: self.move_frames.load(Ordering::Relaxed),
+        };
+        fence(Ordering::Acquire);
+        let after = self.move_sequence.load(Ordering::Relaxed);
+        (before != 0 && before % 2 == 0 && before == after).then_some((before, moved))
+    }
+
+    /// The sequence number of the newest move, 0 before the first.
+    pub fn move_sequence(&self) -> u64 {
+        self.move_sequence.load(Ordering::Acquire)
+    }
+
+    /// The readable index range `[max(0, W - C + M), W)` for the current W
+    /// (S40).
+    pub fn readable(&self) -> (u64, u64) {
+        let w = self.frames_written();
+        (self.oldest_readable(w), w)
+    }
+
+    /// `max(0, w - C + M)`: the oldest readable index when W is `w` (S40).
+    pub fn oldest_readable(&self, w: u64) -> u64 {
+        (w + self.margin).saturating_sub(self.capacity)
+    }
+
+    /// Takes the ring's only writer, or returns `None` while another
+    /// [`RingWriter`] exists (S35).
+    pub fn writer(self: &Arc<Self>) -> Option<RingWriter> {
+        self.writer_taken
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        Some(RingWriter {
+            ring: Arc::clone(self),
+            open: 0,
+            blocks: [0; BLOCK_WINDOW],
+            next: 0,
+        })
+    }
+
+    /// Copies `dst.len() / 2` frames, starting at frame index `first`, into
+    /// `dst` with relaxed loads. The caller validates the copy afterwards with
+    /// [`Ring::copy_still_valid`] (S40).
+    pub(crate) fn load_frames(&self, first: u64, dst: &mut [f32]) {
+        let frames = (dst.len() / 2).min(self.capacity as usize);
+        let start = (first % self.capacity) as usize;
+        let head = frames.min(self.capacity as usize - start);
+        let (dst_head, dst_tail) = dst[..frames * 2].split_at_mut(head * 2);
+        load_words(&self.words[start * 2..(start + head) * 2], dst_head);
+        load_words(&self.words[..(frames - head) * 2], dst_tail);
+    }
+
+    /// The post-copy check of S40: after an acquire fence, re-loads W as W2
+    /// and returns whether `lowest`, the lowest copied index, is still at
+    /// least `W2 - C + M`. When it returns false, the copy may hold frames of
+    /// a later block and must not be played.
+    pub(crate) fn copy_still_valid(&self, lowest: u64) -> bool {
+        fence(Ordering::Acquire);
+        let w2 = self.written.load(Ordering::Relaxed);
+        lowest + self.capacity >= w2 + self.margin
+    }
+}
+
+/// The ring's single writer (S35), used by the capture thread.
+///
+/// It also counts the capture's blocks (S206): what one capture callback or
+/// packet writes, which [`RingWriter::write`] takes as a whole and
+/// [`RingWriter::write_part`] in pieces that [`RingWriter::end_block`]
+/// closes.
+///
+/// Dropping it lets [`Ring::writer`] hand out a new one.
+pub struct RingWriter {
+    ring: Arc<Ring>,
+    /// Frames written in the open block so far.
+    open: u64,
+    /// The last [`BLOCK_WINDOW`] closed blocks, in frames.
+    blocks: [u64; BLOCK_WINDOW],
+    /// Where in `blocks` the next closed block goes.
+    next: usize,
+}
+
+impl fmt::Debug for RingWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RingWriter")
+            .field("ring", &self.ring)
+            .finish()
+    }
+}
+
+impl RingWriter {
+    /// The ring this writer writes to.
+    pub fn ring(&self) -> &Arc<Ring> {
+        &self.ring
+    }
+
+    /// Writes `frames` interleaved stereo frames from `interleaved` (at most
+    /// `interleaved.len() / 2`) as one block of their own, and advances W by
+    /// that count (S38): [`RingWriter::write_part`], then
+    /// [`RingWriter::end_block`]. Never waits, allocates or locks.
+    pub fn write(&mut self, interleaved: &[f32], frames: usize) {
+        self.write_part(interleaved, frames);
+        self.end_block();
+    }
+
+    /// Writes `frames` interleaved stereo frames from `interleaved` (at most
+    /// `interleaved.len() / 2`) as part of the open block, and advances W by
+    /// that count (S38). Any count is accepted; when it exceeds C only the
+    /// last C frames remain.
+    ///
+    /// The frames are stored in chunks of at most M frames. After each chunk
+    /// W is published with release ordering and a release fence follows, so
+    /// the writer only ever stores into the slots of frames
+    /// `[W - C, W - C + M)` (S37, S40). Never waits, allocates or locks.
+    pub fn write_part(&mut self, interleaved: &[f32], frames: usize) {
+        let frames = frames.min(interleaved.len() / 2);
+        let samples = &interleaved[..frames * 2];
+        self.store(samples);
+        let peak = samples
+            .iter()
+            .map(|sample| sample.abs())
+            .filter(|magnitude| magnitude.is_finite())
+            .fold(0.0_f32, f32::max);
+        if peak > 0.0 {
+            self.ring.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
+            self.ring.heard.store(true, Ordering::Relaxed);
+        }
+        if frames > 0 {
+            self.open += frames as u64;
+            self.publish_block();
+        }
+    }
+
+    /// Closes the open block (S206): the next write starts a new one. Does
+    /// nothing when the open block is empty. Never waits, allocates or
+    /// locks.
+    pub fn end_block(&mut self) {
+        if self.open == 0 {
+            return;
+        }
+        self.blocks[self.next] = self.open;
+        self.next = (self.next + 1) % BLOCK_WINDOW;
+        self.open = 0;
+        self.publish_block();
+    }
+
+    /// [`RingWriter::write`], with the block's end stamped at `time_ns`
+    /// ([`RingWriter::end_block_at`]).
+    pub fn write_at(&mut self, interleaved: &[f32], frames: usize, time_ns: u64) {
+        self.write_part(interleaved, frames);
+        self.end_block_at(time_ns);
+    }
+
+    /// [`RingWriter::end_block`], stamping the block with `time_ns` on the
+    /// host's monotonic clock, the time it is closed at (S207): the ring
+    /// publishes the stamp with W. An empty open block gets no stamp, and
+    /// [`u64::MAX`] is taken as `u64::MAX - 1`. Never waits, allocates or
+    /// locks.
+    pub fn end_block_at(&mut self, time_ns: u64) {
+        if self.open == 0 {
+            return;
+        }
+        self.end_block();
+        let written = self.ring.written.load(Ordering::Relaxed);
+        self.publish_stamp(written, time_ns.min(NO_STAMP - 1));
+    }
+
+    /// Publishes a stamp under the sequence lock (S207). Only this writer
+    /// stores the sequence number, so its own last store is the current
+    /// one. The odd number is stored before a release fence, so a reader
+    /// whose relaxed loads see any of the new pair sees at least that
+    /// number after its acquire fence; the even number is a release store,
+    /// so a reader that loads it with acquire sees the whole pair.
+    fn publish_stamp(&self, written: u64, time_ns: u64) {
+        let ring = &*self.ring;
+        let sequence = ring.stamp_sequence.load(Ordering::Relaxed);
+        ring.stamp_sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        ring.stamp_written.store(written, Ordering::Relaxed);
+        ring.stamp_time.store(time_ns, Ordering::Relaxed);
+        ring.stamp_sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Announces a move to the renderers (S281). Never waits, allocates or
+    /// locks.
+    pub fn announce_move(&mut self, moved: RingMove) {
+        let ring = &*self.ring;
+        let sequence = ring.move_sequence.load(Ordering::Relaxed);
+        ring.move_sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        ring.move_frame.store(moved.frame, Ordering::Relaxed);
+        ring.move_frames.store(moved.frames, Ordering::Relaxed);
+        ring.move_sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Publishes the largest of the last blocks and the open one.
+    fn publish_block(&self) {
+        let largest = self.blocks.iter().copied().fold(self.open, u64::max);
+        self.ring.block_frames.store(largest, Ordering::Relaxed);
+    }
+
+    /// Stores the frames of `interleaved` and advances W, chunk by chunk.
+    fn store(&self, interleaved: &[f32]) {
+        let ring = &*self.ring;
+        let capacity = ring.capacity as usize;
+        let margin = ring.margin as usize;
+        // Only this writer stores W, so its own last store is the current W.
+        let mut w = ring.written.load(Ordering::Relaxed);
+        let mut src = interleaved;
+        while !src.is_empty() {
+            let n = (src.len() / 2).min(margin);
+            let (chunk, rest) = src.split_at(n * 2);
+            let start = (w % ring.capacity) as usize;
+            let head = n.min(capacity - start);
+            store_words(
+                &ring.words[start * 2..(start + head) * 2],
+                &chunk[..head * 2],
+            );
+            store_words(&ring.words[..(n - head) * 2], &chunk[head * 2..]);
+            w += n as u64;
+            // S37: publish W only after the frames it counts are stored ...
+            ring.written.store(w, Ordering::Release);
+            // ... and fence before any sample of the next chunk is stored.
+            fence(Ordering::Release);
+            src = rest;
+        }
+    }
+
+    /// Sets W to 0, which makes all history unreadable (S39). Call it only
+    /// while no capture callback runs and no reader exists.
+    pub fn reset(&mut self) {
+        self.open = 0;
+        self.blocks = [0; BLOCK_WINDOW];
+        self.next = 0;
+        self.ring.block_frames.store(0, Ordering::Relaxed);
+        self.publish_stamp(0, NO_STAMP);
+        self.ring.written.store(0, Ordering::Release);
+        fence(Ordering::Release);
+    }
+}
+
+impl Drop for RingWriter {
+    fn drop(&mut self) {
+        self.ring.writer_taken.store(false, Ordering::Release);
+    }
+}
+
+fn store_words(dst: &[AtomicU32], src: &[f32]) {
+    for (word, sample) in dst.iter().zip(src) {
+        word.store(sample.to_bits(), Ordering::Relaxed);
+    }
+}
+
+fn load_words(src: &[AtomicU32], dst: &mut [f32]) {
+    for (sample, word) in dst.iter_mut().zip(src) {
+        *sample = f32::from_bits(word.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(i: u64) -> [f32; 2] {
+        let tag = (i + 1) as u32;
+        [f32::from_bits(tag), f32::from_bits(!tag)]
+    }
+
+    fn block(first: u64, frames: usize) -> Vec<f32> {
+        (first..first + frames as u64).flat_map(frame).collect()
+    }
+
+    fn index_of(l: f32, r: f32) -> Option<u64> {
+        let (a, b) = (l.to_bits(), r.to_bits());
+        (a != 0 && b == !a).then(|| u64::from(a) - 1)
+    }
+
+    fn read_raw(ring: &Ring, first: u64, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0; frames * 2];
+        ring.load_frames(first, &mut out);
+        out
+    }
+
+    // covers: S35, S2
+    #[test]
+    fn one_writer_interleaved_stereo_fixed_capacity() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        assert_eq!(ring.capacity(), 16_384);
+        assert_eq!(ring.margin(), 8192);
+        let writer = ring.writer().expect("first writer");
+        assert!(ring.writer().is_none(), "a second writer must be refused");
+        drop(writer);
+        assert!(
+            ring.writer().is_some(),
+            "dropping the writer frees the slot"
+        );
+        let mut writer = ring.writer().unwrap();
+        writer.write(&[0.25, -0.5, 0.75, -1.0], 2);
+        assert_eq!(read_raw(&ring, 0, 2), vec![0.25, -0.5, 0.75, -1.0]);
+    }
+
+    #[test]
+    fn the_peak_is_the_largest_magnitude_since_it_was_last_taken() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        assert_eq!(ring.take_peak(), 0.0);
+        writer.write(&[0.25, -0.5, 0.125, 0.0], 2);
+        writer.write(&[0.1, -0.2], 1);
+        assert_eq!(
+            ring.take_peak(),
+            0.5,
+            "the larger block wins, its sign aside"
+        );
+        assert_eq!(ring.take_peak(), 0.0, "taking it starts a new span");
+        // A frame count below the slice's length counts only those frames.
+        writer.write(&[f32::NAN, f32::INFINITY, -0.75, 0.0, 0.9, 0.9], 2);
+        assert_eq!(ring.take_peak(), 0.75, "non-finite samples don't count");
+        writer.write(&[-1.5, 0.0], 1);
+        assert_eq!(ring.take_peak(), 1.5, "a clipped sample reads above 1");
+    }
+
+    #[test]
+    fn heard_stays_set_once_sound_was_written_whoever_took_the_peak() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        writer.write(&[0.0, 0.0, f32::NAN, 0.0], 2);
+        assert!(!ring.heard(), "zeros and non-finite samples are no sound");
+        writer.write(&[0.25, 0.0], 1);
+        ring.take_peak();
+        writer.write(&[0.0, 0.0], 1);
+        assert!(ring.heard());
+    }
+
+    // covers: S35
+    #[test]
+    fn full_ring_overwrites_oldest_without_waiting() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        // No reader exists and nobody drains the ring; writes never block.
+        for k in 0..10u64 {
+            writer.write(&block(k * 4096, 4096), 4096);
+        }
+        let w = ring.frames_written();
+        assert_eq!(w, 40_960);
+        let newest = read_raw(&ring, w - 1, 1);
+        assert_eq!(index_of(newest[0], newest[1]), Some(w - 1));
+        let oldest_kept = read_raw(&ring, w - 16_384, 1);
+        assert_eq!(index_of(oldest_kept[0], oldest_kept[1]), Some(w - 16_384));
+        // Frame w - C - 1 shares its slot with frame w - 1, which overwrote it.
+        let overwritten = read_raw(&ring, w - 16_384 - 1, 1);
+        assert_eq!(index_of(overwritten[0], overwritten[1]), Some(w - 1));
+    }
+
+    // covers: S36, S16
+    #[test]
+    fn rings_are_sized_for_24_seconds() {
+        assert_eq!(capacity_for_rate(48_000), 1_152_000);
+        assert_eq!(capacity_for_rate(192_000), 4_608_000);
+        let ring = Ring::for_rate(48_000).unwrap();
+        assert_eq!(ring.capacity(), 1_152_000);
+        assert!(ring.supports_rate(48_000));
+        assert!(ring.supports_rate(44_100));
+        assert!(
+            !ring.supports_rate(96_000),
+            "a 48 kHz ring is too short for 96 kHz"
+        );
+        assert_eq!(
+            Ring::for_rate(7_999).unwrap_err(),
+            RingError::UnsupportedRate
+        );
+        assert_eq!(
+            Ring::for_rate(384_001).unwrap_err(),
+            RingError::UnsupportedRate
+        );
+        assert!(is_supported_rate(8_000) && is_supported_rate(384_000));
+        // A ring sized for 192 kHz serves every rate up to 192 kHz and rejects higher ones.
+        let big = Ring::new(capacity_for_rate(192_000), MIN_MARGIN_FRAMES).unwrap();
+        for rate in [8_000, 32_000, 44_100, 48_000, 96_000, 192_000] {
+            assert!(big.supports_rate(rate), "{rate}");
+        }
+        assert!(!big.supports_rate(384_000));
+        // The cap that leaves room for the 20 s maximum delay (S176) plus margin and a block.
+        assert!(capacity_for_rate(48_000) - MIN_MARGIN_FRAMES - 8192 >= 20 * 48_000);
+    }
+
+    // covers: S40
+    #[test]
+    fn margin_and_capacity_are_validated() {
+        assert_eq!(
+            Ring::new(65_536, 4096).unwrap_err(),
+            RingError::MarginTooSmall
+        );
+        assert_eq!(
+            Ring::new(16_000, 8192).unwrap_err(),
+            RingError::CapacityTooSmall
+        );
+        assert!(Ring::new(16_384, 8192).is_ok());
+    }
+
+    // covers: S37
+    #[test]
+    fn frames_written_is_a_monotonic_total() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        let mut expected = 0u64;
+        for frames in [1usize, 7, 512, 0, 8192, 3] {
+            writer.write(&block(expected, frames), frames);
+            expected += frames as u64;
+            assert_eq!(ring.frames_written(), expected);
+        }
+        // A frame count larger than the slice is clamped to the slice.
+        writer.write(&block(expected, 2), 10);
+        assert_eq!(ring.frames_written(), expected + 2);
+    }
+
+    // covers: S38
+    #[test]
+    fn oversized_write_keeps_the_last_capacity_frames() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        writer.write(&block(0, 100), 100);
+        let big = 3 * 16_384 + 1000;
+        writer.write(&block(100, big), big);
+        let w = ring.frames_written();
+        assert_eq!(w, 100 + big as u64, "W grows by the full count");
+        let kept = read_raw(&ring, w - 16_384, 16_384);
+        for (i, f) in kept.chunks_exact(2).enumerate() {
+            assert_eq!(index_of(f[0], f[1]), Some(w - 16_384 + i as u64));
+        }
+    }
+
+    // covers: S39, S17
+    #[test]
+    fn reset_clears_history() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        writer.write(&block(0, 5000), 5000);
+        assert_eq!(ring.readable(), (0, 5000));
+        writer.reset();
+        assert_eq!(ring.frames_written(), 0, "framesCaptured restarts at 0");
+        assert_eq!(ring.readable(), (0, 0), "nothing is readable after a reset");
+        writer.write(&block(1_000_000, 10), 10);
+        assert_eq!(ring.readable(), (0, 10));
+        let fresh = read_raw(&ring, 0, 10);
+        assert_eq!(index_of(fresh[0], fresh[1]), Some(1_000_000));
+    }
+
+    // covers: S38, S206
+    #[test]
+    fn the_largest_of_the_last_blocks_is_published() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        assert_eq!(ring.block_frames(), 0);
+        writer.write(&block(0, 480), 480);
+        assert_eq!(ring.block_frames(), 480);
+        writer.write(&block(480, 512), 512);
+        assert_eq!(ring.block_frames(), 512);
+        // A short block (a gap fill's tail) keeps the larger one in view,
+        // and so do the next ones until it is BLOCK_WINDOW blocks old.
+        let mut w = 992;
+        for _ in 0..BLOCK_WINDOW - 1 {
+            writer.write(&block(w, 37), 37);
+            w += 37;
+            assert_eq!(ring.block_frames(), 512);
+        }
+        writer.write(&block(w, 37), 37);
+        w += 37;
+        assert_eq!(ring.block_frames(), 37);
+        // A write longer than the margin is stored in chunks, but it is one
+        // block; a write of nothing leaves the blocks as they were.
+        writer.write(&block(w, 10_000), 10_000);
+        assert_eq!(ring.block_frames(), 10_000);
+        writer.write(&[], 0);
+        assert_eq!(ring.block_frames(), 10_000);
+        writer.reset();
+        assert_eq!(ring.block_frames(), 0);
+    }
+
+    // covers: S38, S206
+    #[test]
+    fn parts_of_one_block_count_together() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        writer.write(&block(0, 480), 480);
+        // A packet the capture writes in pieces: the open block counts at
+        // once, and closing it keeps it.
+        writer.write_part(&block(480, 300), 300);
+        assert_eq!(ring.block_frames(), 480);
+        writer.write_part(&block(780, 400), 400);
+        assert_eq!(ring.block_frames(), 700);
+        writer.end_block();
+        assert_eq!(ring.block_frames(), 700);
+        // A plain write after parts closes them with it; closing an empty
+        // block does nothing.
+        writer.write_part(&block(1180, 100), 100);
+        writer.write(&block(1280, 900), 900);
+        assert_eq!(ring.block_frames(), 1000);
+        writer.end_block();
+        assert_eq!(ring.frames_written(), 2180);
+        for i in 0..BLOCK_WINDOW as u64 {
+            writer.write(&block(2180 + i, 1), 1);
+        }
+        assert_eq!(ring.block_frames(), 1);
+    }
+
+    // covers: S207
+    #[test]
+    fn the_newest_stamp_is_published_with_w() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        assert_eq!(ring.stamp(), None);
+        // An unstamped block publishes none; an empty block gets none.
+        writer.write(&block(0, 480), 480);
+        writer.end_block_at(5);
+        assert_eq!(ring.stamp(), None);
+        writer.write_at(&block(480, 480), 480, 10_000_000);
+        let stamp = Stamp {
+            written: 960,
+            time_ns: 10_000_000,
+        };
+        assert_eq!(ring.stamp(), Some(stamp));
+        // A block written in parts is stamped as it closes, with W then.
+        writer.write_part(&block(960, 300), 300);
+        assert_eq!(ring.stamp(), Some(stamp));
+        writer.write_part(&block(1260, 180), 180);
+        writer.end_block_at(20_000_000);
+        assert_eq!(
+            ring.stamp(),
+            Some(Stamp {
+                written: 1440,
+                time_ns: 20_000_000,
+            })
+        );
+        // The time that means none is taken as the one before it.
+        writer.write_at(&block(1440, 1), 1, u64::MAX);
+        assert_eq!(ring.stamp().map(|s| s.time_ns), Some(u64::MAX - 1));
+        // A reset clears it.
+        writer.reset();
+        assert_eq!(ring.stamp(), None);
+    }
+
+    // covers: S207, S128
+    #[test]
+    fn a_stamp_is_never_loaded_half_written() {
+        // The writer publishes stamps whose time is always 1000 times their
+        // W; a reader on another thread never sees a pair that isn't.
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        let samples = vec![0.0f32; 64];
+        let seen = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (ring, seen, done) = (Arc::clone(&ring), Arc::clone(&seen), Arc::clone(&done));
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    if let Some(stamp) = ring.stamp() {
+                        assert_eq!(stamp.time_ns, stamp.written * 1000, "{stamp:?}");
+                        seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        // A loaded runner can start the reader only after a fixed number of
+        // writes is over, so the writer runs until the reader has read enough.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while ring.frames_written() < 200_000 || seen.load(Ordering::Relaxed) < 10_000 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader made fewer than 10,000 stamp loads in 20 s"
+            );
+            if reader.is_finished() {
+                break;
+            }
+            let w = ring.frames_written() + 1;
+            writer.write_at(&samples, 1, w * 1000);
+        }
+        done.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+    }
+
+    // covers: S40
+    #[test]
+    fn readable_window_is_w_minus_c_plus_m_to_w() {
+        let ring = Ring::new(20_000, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        assert_eq!(ring.readable(), (0, 0));
+        writer.write(&block(0, 11_000), 11_000);
+        assert_eq!(
+            ring.readable(),
+            (0, 11_000),
+            "max(0, W - C + M) is 0 early on"
+        );
+        writer.write(&block(11_000, 30_000), 30_000);
+        let w = 41_000;
+        assert_eq!(ring.readable(), (w - 20_000 + 8192, w));
+        assert_eq!(ring.oldest_readable(5), 0);
+    }
+
+    // covers: S40, S37
+    #[test]
+    fn post_copy_check_rejects_a_copy_overtaken_by_the_writer() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        writer.write(&block(0, 16_384), 16_384);
+        let (oldest, w) = ring.readable();
+        assert_eq!((oldest, w), (8192, 16_384));
+        let copy = read_raw(&ring, oldest, 100);
+        assert_eq!(index_of(copy[0], copy[1]), Some(oldest));
+        assert!(
+            ring.copy_still_valid(oldest),
+            "nothing moved: the copy is good"
+        );
+        // The writer advances by one more block while the reader is "paused".
+        writer.write(&block(16_384, 512), 512);
+        assert!(
+            !ring.copy_still_valid(oldest),
+            "frames below W2 - C + M may have been overwritten"
+        );
+        assert!(ring.copy_still_valid(oldest + 512));
+    }
+
+    // covers: S135, S123
+    #[test]
+    fn samples_round_trip_bit_exactly_including_nan_payloads() {
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        let odd = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fa0_0001), // signaling NaN payload
+            f32::from_bits(0xffc0_1234), // negative quiet NaN payload
+            -0.0,
+            f32::MIN_POSITIVE / 2.0, // subnormal
+            1.0e30,
+        ];
+        writer.write(&odd, 4);
+        let back = read_raw(&ring, 0, 4);
+        for (a, b) in odd.iter().zip(&back) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+        // covers: S35, S38, S40
+        #[test]
+        fn readable_frames_always_hold_their_own_index(
+            sizes in proptest::collection::vec(1usize..=20_000, 1..12),
+        ) {
+            let ring = Ring::new(16_384, 8192).unwrap();
+            let mut writer = ring.writer().unwrap();
+            let mut next = 0u64;
+            for n in sizes {
+                writer.write(&block(next, n), n);
+                next += n as u64;
+                let (oldest, w) = ring.readable();
+                proptest::prop_assert_eq!(w, next);
+                proptest::prop_assert_eq!(oldest, (w + 8192).saturating_sub(16_384));
+                let copy = read_raw(&ring, oldest, (w - oldest) as usize);
+                for (i, f) in copy.chunks_exact(2).enumerate() {
+                    proptest::prop_assert_eq!(index_of(f[0], f[1]), Some(oldest + i as u64));
+                }
+            }
+        }
+    }
+
+    // covers: S37, S40, S133, S135
+    #[test]
+    fn concurrent_reads_never_see_torn_or_stale_frames() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let ring = Ring::new(16_384, 8192).unwrap();
+        let mut writer = ring.writer().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let validated = Arc::new(AtomicU64::new(0));
+        let reader_ring = Arc::clone(&ring);
+        let reader_stop = Arc::clone(&stop);
+        let reader_validated = Arc::clone(&validated);
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0.0f32; 4096 * 2];
+            let (mut good, mut rejected) = (0u64, 0u64);
+            while !reader_stop.load(Ordering::Relaxed) {
+                let w = reader_ring.frames_written();
+                let oldest = reader_ring.oldest_readable(w);
+                if w - oldest < 4096 {
+                    continue;
+                }
+                // Read the oldest readable frames: the ones the writer reaches first.
+                reader_ring.load_frames(oldest, &mut buf);
+                if !reader_ring.copy_still_valid(oldest) {
+                    rejected += 1;
+                    continue;
+                }
+                for (i, f) in buf.chunks_exact(2).enumerate() {
+                    assert_eq!(
+                        index_of(f[0], f[1]),
+                        Some(oldest + i as u64),
+                        "torn or stale frame"
+                    );
+                }
+                good += 1;
+                reader_validated.store(good, Ordering::Relaxed);
+            }
+            (good, rejected)
+        });
+        let mut next = 0u64;
+        let sizes = [1usize, 64, 511, 512, 4096, 8192, 777];
+        // Race for 300 ms, and on a loaded machine until the reader got to
+        // validate a copy at all (bounded).
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(300)
+            || (validated.load(Ordering::Relaxed) == 0
+                && started.elapsed() < Duration::from_secs(20))
+        {
+            for &n in &sizes {
+                writer.write(&block(next, n), n);
+                next += n as u64;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (good, _rejected) = reader.join().unwrap();
+        assert!(good > 0, "the reader validated at least one copy");
+    }
+}

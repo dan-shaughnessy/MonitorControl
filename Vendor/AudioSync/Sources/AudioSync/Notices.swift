@@ -1,0 +1,123 @@
+import Foundation
+
+/// A problem worth telling the user about, shown in the main window and the
+/// menu bar panel. `subject` names what it is about: a speaker (its
+/// `SpeakerKey`) or one of the fixed subjects below. A newer notice about the
+/// same subject replaces the older one, and the notice is cleared once its
+/// cause is gone.
+struct Notice: Identifiable, Equatable {
+    let subject: String
+    let text: String
+    let date: Date
+    /// A few words above the text, for a notice about a state that lasts.
+    var title: String? = nil
+    /// Never drawn: the few words VoiceOver reads after "Dismiss:" on its
+    /// close button, Windows' title for the same notice.
+    var shortName: String? = nil
+    /// The System Settings pane that fixes the problem, offered as a button.
+    var settings: PrivacyPane? = nil
+    /// It reports a change AudioSync made rather than a problem, so it shows
+    /// the info glyph instead of the warning triangle.
+    var info = false
+    var id: String { subject }
+    /// AudioSync's own AirPlay sender stopped or couldn't start: the notice
+    /// offers Retry, which starts it again.
+    var retriesAirPlay: Bool { subject == Notice.airplaySender }
+
+    /// Its close button's VoiceOver label. A notice with neither name keeps the
+    /// plain label, so the button doesn't read the whole notice again.
+    func dismissLabel(_ text: UIStrings) -> String {
+        guard let name = [shortName, title].compactMap({ $0 }).first(where: { !$0.isEmpty }) else {
+            return text.dismissNotice
+        }
+        return text.dismissNotice(name)
+    }
+
+    /// Subjects that aren't a speaker.
+    static let source = "source"        // the audio source stopped or quit
+    static let start = "start"          // streaming couldn't start
+    static let capture = "capture"      // streaming started but no audio arrives
+    static let login = "login"          // Launch at Login
+    static let airplaySender = "airplay-sender"   // AudioSync's own AirPlay sender stopped or couldn't start
+    static let airplayPtp = "airplay-ptp"   // another app holds PTP port 319 or 320
+    static let pairings = "pairings"    // the AirPlay sender keeps pairings only until AudioSync quits
+    static let pairingsIgnored = "pairings-ignored"   // the pairings file was in the wrong format
+    static let zones = "zones"          // the groups became zones at this launch (S248)
+    static let presets = "presets"      // a preset recall left speakers off (S265)
+    /// A Google Cast speaker, by its device ID.
+    static func cast(_ device: String) -> String { CastID.app(device) }
+    static let castSender = "cast-sender"   // the Google Cast sender stopped working
+    /// The AirPlay speakers play ahead of this Google Cast speaker; apart
+    /// from `cast(_:)`, so it never replaces or clears a problem with it.
+    static func airPlayAhead(_ device: String) -> String { "airplay-ahead:" + device }
+    /// This Google Cast speaker didn't prove it's genuine (C131); apart from
+    /// `cast(_:)`, so its playing never clears the warning that came first.
+    static func castUnauthenticated(_ device: String) -> String { "cast-unauthenticated:" + device }
+    /// What Forget Pairing or Forget Password on an AirPlay speaker drops (S223).
+    static func forgotten(airPlay id: String) -> [String] { [SpeakerKey.make(id: id, airplay: true)] }
+    /// The subjects in `list` about a Google Cast speaker.
+    static func castSubjects(in list: NoticeList) -> [String] {
+        list.items.map(\.subject).filter {
+            $0.hasPrefix(CastID.prefix) || $0.hasPrefix(Notice.castUnauthenticated(""))
+        }
+    }
+    /// Now Playing may not control this player.
+    static func automation(_ bundleID: String) -> String { "automation:" + bundleID }
+    /// What the `login` notice says when macOS refuses to turn Launch at Login on or off (S388).
+    static func loginRefused(turningOn on: Bool, _ text: UIStrings) -> String {
+        on ? text.launchAtLoginFailed : text.launchAtLoginOffFailed
+    }
+    /// Whether the `login` notice in `list` is done now that macOS reports the item `enabled` (S388).
+    static func loginSettled(in list: NoticeList, enabled: Bool, _ text: UIStrings) -> Bool {
+        guard let notice = list.items.first(where: { $0.subject == login }) else { return false }
+        return (notice.text == text.launchAtLoginOffFailed) != enabled
+    }
+}
+
+/// A Privacy & Security pane in System Settings.
+enum PrivacyPane: String, Equatable {
+    case localNetwork = "Privacy_LocalNetwork"
+    case automation = "Privacy_Automation"
+    case microphone = "Privacy_Microphone"
+    case accessibility = "Privacy_Accessibility"
+    /// Screen & System Audio Recording, whose "System Audio Recording Only"
+    /// list holds the process tap permission.
+    case screenCapture = "Privacy_ScreenCapture"
+
+    var url: URL {
+        URL(string: "x-apple.systempreferences:com.apple.preference.security?\(rawValue)")!
+    }
+}
+
+/// The notices waiting for the user, newest first, at most `capacity` of them.
+struct NoticeList: Equatable {
+    static let capacity = 4
+
+    private(set) var items: [Notice] = []
+
+    var isEmpty: Bool { items.isEmpty }
+    var count: Int { items.count }
+    var newest: Notice? { items.first }
+
+    /// Adds `text` about `subject`, replacing an older notice about it. The
+    /// oldest notice drops off past `capacity`. `settings`: the pane that fixes it.
+    mutating func post(_ text: String, subject: String, at date: Date = Date(), title: String? = nil,
+                       shortName: String? = nil, settings: PrivacyPane? = nil, info: Bool = false) {
+        items.removeAll { $0.subject == subject }
+        items.insert(Notice(subject: subject, text: text, date: date, title: title, shortName: shortName,
+                            settings: settings, info: info),
+                     at: 0)
+        if items.count > Self.capacity { items.removeLast(items.count - Self.capacity) }
+    }
+
+    /// Removes the notices about any of `subjects`. True if one was removed.
+    @discardableResult
+    mutating func clear<S: Sequence>(_ subjects: S) -> Bool where S.Element == String {
+        let gone = Set(subjects)
+        let before = items.count
+        items.removeAll { gone.contains($0.subject) }
+        return items.count != before
+    }
+
+    mutating func clearAll() { items.removeAll() }
+}
